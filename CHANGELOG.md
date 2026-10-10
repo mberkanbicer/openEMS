@@ -13,6 +13,15 @@ there are unreleased changes. It becomes the next release entry.
 
 ## Unreleased
 
+### Added
+
+- **A GPU engine**, `--engine=gpu` (`engine='gpu'` from Python), with a Metal
+  backend on macOS and a HIP backend for AMD (ROCm) and NVIDIA (CUDA) GPUs. It
+  is selected like the other engines, runs Cartesian and cylindrical meshes
+  (including multi-grid) with the usual extensions on the device, and writes
+  the same probes and dumps. `--engine=gpu-reference` runs it on a CPU
+  reference backend, to check the device backends against.
+
 ### Fixed
 
 - Python: an option passed as `False` to `Run()`, e.g. `debug_PEC=False`, made
@@ -24,6 +33,9 @@ there are unreleased changes. It becomes the next release entry.
 
 ### Changed
 
+- Field dumps are written on background threads from a snapshot of the
+  fields, instead of stalling the timestepping, and a time-domain dump keeps
+  its HDF5 file open for the whole run.
 - The end criteria is checked every Nyquist period during the first minute of
   a simulation, and only after that with the progress report every few
   seconds. A short simulation used to run on until the first report, on a fast
@@ -39,6 +51,12 @@ there are unreleased changes. It becomes the next release entry.
   quadratic time. A far-field (NF2FF) calculation from a recording of 3200
   timesteps went from 79 s to 2.4 s per frequency.
 
+### Build
+
+- `ENABLE_METAL` (macOS, on by default) and `ENABLE_HIP` (on when a HIP
+  compiler is found) CMake options for the GPU backends. On Windows the HIP
+  sources are compiled as CUDA and need `HIP_INCLUDE_DIR`.
+
 ## 0.37.0 — 2026-10-09
 
 The version scheme changed with this release: the previous release was v0.0.36,
@@ -47,12 +65,6 @@ number moved up and patch releases now have somewhere to go.
 
 ### Added
 
-- **A GPU engine**, `--engine=gpu` (`engine='gpu'` from Python), with a Metal
-  backend on macOS and a HIP backend for AMD (ROCm) and NVIDIA (CUDA) GPUs. It
-  is selected like the other engines, runs Cartesian and cylindrical meshes
-  (including multi-grid) with the usual extensions on the device, and writes
-  the same probes and dumps. `--engine=gpu-reference` runs it on a CPU
-  reference backend, to check the device backends against.
 - **SAR calculation reworked**, following IEEE/IEC 62704-1: averaging is done
   once for all frequencies instead of per frequency, and is multi-threaded,
   together giving a large speedup. The new `--autorange` option restricts the
@@ -122,9 +134,6 @@ number moved up and patch releases now have somewhere to go.
 
 ### Changed
 
-- Field dumps are written on background threads from a snapshot of the
-  fields, instead of stalling the timestepping, and a time-domain dump keeps
-  its HDF5 file open for the whole run.
 - **The MPI engine was removed.** It had not compiled for years, as it used
   the C++ MPI bindings that MPI-3 dropped, it had no tests, and several
   extensions never supported it (#260). The multithreaded engine is
@@ -236,9 +245,6 @@ number moved up and patch releases now have somewhere to go.
   default path: debug builds compile with `-ffp-contract=off` on GCC and
   Clang, and the new `ENABLE_FLUSH_TO_ZERO` CMake option can be set to `OFF`
   to keep denormals in the engines.
-- `ENABLE_METAL` (macOS, on by default) and `ENABLE_HIP` (on when a HIP
-  compiler is found) CMake options for the GPU backends. On Windows the HIP
-  sources are compiled as CUDA and need `HIP_INCLUDE_DIR`.
 - The `WITH_MPI` CMake option and the `--with-MPI` option of
   `update_openEMS.sh` were removed.
 - CI covers Linux, macOS, FreeBSD and Windows, and compiles with warnings
