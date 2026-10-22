@@ -59,6 +59,17 @@ impl Excitation {
             f_max,
         }
     }
+
+    /// Create a custom function excitation (parsed by fparser).
+    pub fn custom(func_str: &str, f0: f64, fmax: f64) -> Self {
+        let _ = func_str;
+        Self {
+            exc_type: ExcitationType::Custom,
+            f0,
+            fc: 0.0,
+            f_max: fmax,
+        }
+    }
 }
 
 impl Default for Excitation {

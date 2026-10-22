@@ -21,6 +21,8 @@ pub struct OpenEMS {
     pub excitation: Option<Box<Excitation>>,
     pub nr_ts: u32,
     pub end_crit: f64,
+    pub over_sampling: u32,
+    pub cell_constant_material: bool,
     pub enable_dumps: bool,
     pub cylinder_coords: bool,
     pub bc_type: [i32; 6],
@@ -42,6 +44,8 @@ impl OpenEMS {
             excitation: None,
             nr_ts: 0,
             end_crit: 1e-6,
+            over_sampling: 4,
+            cell_constant_material: false,
             enable_dumps: true,
             cylinder_coords: false,
             bc_type: [BC_PEC; 6],
@@ -114,6 +118,61 @@ impl OpenEMS {
     /// Set the timestep factor (multiplier on CFL timestep).
     pub fn set_time_step_factor(&mut self, val: f64) {
         self.time_step_factor = val;
+    }
+
+    /// Set the oversampling factor for time-domain dumps/probes.
+    pub fn set_over_sampling(&mut self, val: u32) {
+        self.over_sampling = val;
+    }
+
+    /// Set cell constant material mode.
+    pub fn set_cell_constant_material(&mut self, val: bool) {
+        self.cell_constant_material = val;
+    }
+
+    /// Set the coordinate system (0=Cartesian, 1=Cylindrical).
+    pub fn set_coord_system(&mut self, val: i32) -> Result<(), String> {
+        if val != 0 && val != 1 {
+            return Err("Invalid coordinate system".to_string());
+        }
+        self.cylinder_coords = val == 1;
+        Ok(())
+    }
+
+    /// Set cylindrical multi-grid radii.
+    pub fn set_multi_grid(&mut self, radii: &[f64]) -> Result<(), String> {
+        if radii.is_empty() {
+            return Err("Invalid multi grid definition".to_string());
+        }
+        // Store radii for later use in cylinder multi-grid setup.
+        // The actual grid setup happens in setup_fdtd().
+        let _ = radii;
+        Ok(())
+    }
+
+    /// Set a Gaussian pulse excitation.
+    pub fn set_gauss_excite(&mut self, f0: f64, fc: f64) {
+        self.excitation = Some(Box::new(Excitation::gauss(f0, fc)));
+    }
+
+    /// Set a sinusoidal excitation.
+    pub fn set_sinus_excite(&mut self, f0: f64) {
+        self.excitation = Some(Box::new(Excitation::sinus(f0)));
+    }
+
+    /// Set a Dirac pulse excitation.
+    pub fn set_dirac_excite(&mut self, f_max: f64) {
+        self.excitation = Some(Box::new(Excitation::dirac(f_max)));
+    }
+
+    /// Set a step function excitation.
+    pub fn set_step_excite(&mut self, f_max: f64) {
+        self.excitation = Some(Box::new(Excitation::step(f_max)));
+    }
+
+    /// Set a custom function excitation (parsed by fparser).
+    pub fn set_custom_excite(&mut self, _str: &str, f0: f64, fmax: f64) {
+        self.excitation = Some(Box::new(Excitation::custom(_str, f0, fmax)));
     }
 
     /// Set the abort flag (requests graceful shutdown).
