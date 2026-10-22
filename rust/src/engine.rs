@@ -3,6 +3,7 @@
 
 use crate::array_nijk::FieldArray;
 use crate::constants::FDTD_FLOAT;
+use crate::extensions::EngineExtension;
 use crate::operator_base::OperatorBase;
 
 /// The basic FDTD engine.
@@ -13,6 +14,7 @@ pub struct Engine {
     pub curr_ptr: FieldArray,
     pub num_lines: [usize; 3],
     pub num_ts: u32,
+    pub extensions: Vec<Box<dyn EngineExtension>>,
 }
 
 impl Engine {
@@ -29,7 +31,13 @@ impl Engine {
             curr_ptr: FieldArray::new("curr", [num_lines[0], num_lines[1], num_lines[2]]),
             num_lines,
             num_ts: 0,
+            extensions: Vec::new(),
         }
+    }
+
+    /// Add a physics extension to the engine.
+    pub fn add_extension(&mut self, ext: Box<dyn EngineExtension>) {
+        self.extensions.push(ext);
     }
 
     /// Get the number of timesteps executed.
@@ -39,7 +47,11 @@ impl Engine {
 
     /// Execute pre-voltage extension updates (highest priority last).
     pub fn do_pre_voltage_updates(&mut self) {
-        // Placeholder: extensions not yet implemented
+        self.extensions
+            .sort_by_key(|a| std::cmp::Reverse(a.get_priority()));
+        for ext in self.extensions.iter_mut().rev() {
+            ext.do_pre_voltage_updates(&mut self.volt_ptr, &self.curr_ptr);
+        }
     }
 
     /// Main FDTD engine voltage updates (Yee E-field update).
@@ -96,17 +108,29 @@ impl Engine {
 
     /// Execute post-voltage extension updates (highest priority first).
     pub fn do_post_voltage_updates(&mut self) {
-        // Placeholder: extensions not yet implemented
+        self.extensions
+            .sort_by_key(|a| std::cmp::Reverse(a.get_priority()));
+        for ext in self.extensions.iter_mut() {
+            ext.do_post_voltage_updates(&mut self.volt_ptr, &self.curr_ptr);
+        }
     }
 
     /// Apply extension voltage changes.
     pub fn apply2_voltages(&mut self) {
-        // Placeholder: extensions not yet implemented
+        self.extensions
+            .sort_by_key(|a| std::cmp::Reverse(a.get_priority()));
+        for ext in self.extensions.iter_mut() {
+            ext.apply2_voltages(&mut self.volt_ptr, &self.curr_ptr);
+        }
     }
 
     /// Execute pre-current extension updates (highest priority last).
     pub fn do_pre_current_updates(&mut self) {
-        // Placeholder: extensions not yet implemented
+        self.extensions
+            .sort_by_key(|a| std::cmp::Reverse(a.get_priority()));
+        for ext in self.extensions.iter_mut().rev() {
+            ext.do_pre_current_updates(&self.volt_ptr, &mut self.curr_ptr);
+        }
     }
 
     /// Main FDTD engine current updates (Yee H-field update).
@@ -159,12 +183,20 @@ impl Engine {
 
     /// Execute post-current extension updates (highest priority first).
     pub fn do_post_current_updates(&mut self) {
-        // Placeholder: extensions not yet implemented
+        self.extensions
+            .sort_by_key(|a| std::cmp::Reverse(a.get_priority()));
+        for ext in self.extensions.iter_mut() {
+            ext.do_post_current_updates(&self.volt_ptr, &mut self.curr_ptr);
+        }
     }
 
     /// Apply extension current changes.
     pub fn apply2_current(&mut self) {
-        // Placeholder: extensions not yet implemented
+        self.extensions
+            .sort_by_key(|a| std::cmp::Reverse(a.get_priority()));
+        for ext in self.extensions.iter_mut() {
+            ext.apply2_current(&self.volt_ptr, &mut self.curr_ptr);
+        }
     }
 
     /// Iterate a number of timesteps.
