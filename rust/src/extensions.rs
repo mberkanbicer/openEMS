@@ -901,3 +901,527 @@ mod tfsf_tests {
         assert_eq!(ext.delay_lookup(150, 1, 0), 0);
     }
 }
+
+// ============================================================================
+// Dispersive materials extension (Debye / Lorentz)
+// ============================================================================
+
+// Priority constants for dispersive extensions
+pub const ENG_EXT_PRIO_DISPERSIVE_DEBYE: i32 = 75_000;
+pub const ENG_EXT_PRIO_DISPERSIVE_LORENTZ: i32 = 75_000;
+pub const ENG_EXT_PRIO_DISPERSIVE_APPLY2: i32 = 0;
+
+/// Engine extension for Debye dispersive materials.
+/// Implements the ADE (Auxiliary Differential Equation) method for Debye media.
+/// Mirrors C++ `Engine_Ext_DebyeMaterial`.
+///
+/// Algorithm (trapezoidal update of pole capacitor voltage):
+///   DoPreVoltageUpdates  (V is V^n, the only place it exists):
+///     h_k = c1_k * W_k + d_k * V^n
+///     g   += h_k - W_k
+///     W_k  = h_k
+///   main voltage update  (V becomes V_raw)
+///   DoPostVoltageUpdates (V_raw visible, V^n gone):
+///     V^(n+1) = inv * (V_raw - g)
+///     volt_ADE[0] = V_raw - V^(n+1)
+///     W_k += d_k * V^(n+1)
+///   Apply2Voltages:
+///     V -= volt_ADE[0]
+pub struct EngineExtDebyeMaterial {
+    /// Number of poles.
+    pub num_poles: usize,
+    /// Number of mesh positions with Debye material.
+    pub num_positions: usize,
+    /// Position list: [pos_idx] -> [i, j, k].
+    pub positions: Vec<[usize; 3]>,
+    /// Voltage ADE correction (order 0, joint correction): [component][pos_idx].
+    pub volt_ade: Vec<Vec<FDTD_FLOAT>>,
+    /// Pole state W_k = r_k * V_Ck: [pole][component][pos_idx].
+    pub volt_pole_ade: Vec<Vec<Vec<FDTD_FLOAT>>>,
+    /// Pre-computed correction summed over poles: [component][pos_idx].
+    pub volt_pre_ade: Vec<Vec<FDTD_FLOAT>>,
+    /// Pole relaxation coefficient: [pole][component][pos_idx].
+    pub v_relax_ade: Vec<Vec<Vec<FDTD_FLOAT>>>,
+    /// Pole drive coefficient: [pole][component][pos_idx].
+    pub v_drive_ade: Vec<Vec<Vec<FDTD_FLOAT>>>,
+    /// Solve coefficient for implicit update: [component][pos_idx].
+    pub v_solve_ade: Vec<Vec<FDTD_FLOAT>>,
+}
+
+impl EngineExtDebyeMaterial {
+    /// Create a new Debye extension with the given number of poles and positions.
+    pub fn new(num_poles: usize, num_positions: usize) -> Self {
+        let zero_vec = vec![FDTD_FLOAT::default(); num_positions];
+        let zero_mat = vec![zero_vec.clone(); 3];
+        let zero_cube = vec![zero_mat.clone(); num_poles];
+
+        Self {
+            num_poles,
+            num_positions,
+            positions: vec![[0, 0, 0]; num_positions],
+            volt_ade: vec![zero_vec.clone(); 3],
+            volt_pole_ade: zero_cube.clone(),
+            volt_pre_ade: vec![zero_vec.clone(); 3],
+            v_relax_ade: zero_cube.clone(),
+            v_drive_ade: zero_cube,
+            v_solve_ade: vec![zero_vec.clone(); 3],
+        }
+    }
+
+    /// Set a position with its Debye coefficients.
+    pub fn set_position(
+        &mut self,
+        pos_idx: usize,
+        pos: [usize; 3],
+        v_relax: &[FDTD_FLOAT],
+        v_drive: &[FDTD_FLOAT],
+        v_solve: FDTD_FLOAT,
+    ) {
+        self.positions[pos_idx] = pos;
+        for comp in 0..3 {
+            self.v_solve_ade[comp][pos_idx] = v_solve;
+        }
+        for o in 0..self.num_poles {
+            for comp in 0..3 {
+                self.v_relax_ade[o][comp][pos_idx] = v_relax[o];
+                self.v_drive_ade[o][comp][pos_idx] = v_drive[o];
+            }
+        }
+    }
+}
+
+impl Default for EngineExtDebyeMaterial {
+    fn default() -> Self {
+        Self::new(1, 1)
+    }
+}
+
+impl EngineExtension for EngineExtDebyeMaterial {
+    fn get_priority(&self) -> i32 {
+        ENG_EXT_PRIO_DISPERSIVE_DEBYE
+    }
+
+    fn get_extension_name(&self) -> &'static str {
+        "Debye Material"
+    }
+
+    fn do_pre_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        // Compute pole states from V^n (the only place V^n exists before the main update).
+        for pos_idx in 0..self.num_positions {
+            let [i, j, k] = self.positions[pos_idx];
+            for comp in 0..3 {
+                let volt_val = *volt.get(comp, i, j, k);
+                let mut pre = FDTD_FLOAT::default();
+                for o in 0..self.num_poles {
+                    let w = self.v_relax_ade[o][comp][pos_idx]
+                        * self.volt_pole_ade[o][comp][pos_idx]
+                        + self.v_drive_ade[o][comp][pos_idx] * volt_val;
+                    pre += w - self.volt_pole_ade[o][comp][pos_idx];
+                    self.volt_pole_ade[o][comp][pos_idx] = w;
+                }
+                self.volt_pre_ade[comp][pos_idx] = pre;
+            }
+        }
+    }
+
+    fn do_post_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        // Solve for V^(n+1) and finish pole state updates.
+        for pos_idx in 0..self.num_positions {
+            let [i, j, k] = self.positions[pos_idx];
+            for comp in 0..3 {
+                let v_raw = *volt.get(comp, i, j, k);
+                let volt_new =
+                    (v_raw - self.volt_pre_ade[comp][pos_idx]) * self.v_solve_ade[comp][pos_idx];
+                self.volt_ade[comp][pos_idx] = v_raw - volt_new;
+                for o in 0..self.num_poles {
+                    self.volt_pole_ade[o][comp][pos_idx] +=
+                        self.v_drive_ade[o][comp][pos_idx] * volt_new;
+                }
+            }
+        }
+    }
+
+    fn apply2_voltages(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        // Subtract the joint Debye correction from voltage fields.
+        for pos_idx in 0..self.num_positions {
+            let [i, j, k] = self.positions[pos_idx];
+            for comp in 0..3 {
+                let current = *volt.get(comp, i, j, k);
+                *volt.get_mut(comp, i, j, k) = current - self.volt_ade[comp][pos_idx];
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod debye_tests {
+    use super::*;
+
+    #[test]
+    fn test_debye_creation() {
+        let ext = EngineExtDebyeMaterial::new(2, 4);
+        assert_eq!(ext.get_priority(), ENG_EXT_PRIO_DISPERSIVE_DEBYE);
+        assert_eq!(ext.get_extension_name(), "Debye Material");
+        assert_eq!(ext.num_poles, 2);
+        assert_eq!(ext.num_positions, 4);
+    }
+
+    #[test]
+    fn test_debye_set_position() {
+        let mut ext = EngineExtDebyeMaterial::new(1, 1);
+        ext.set_position(0, [5, 5, 5], &[0.5_f32], &[0.3_f32], 0.8_f32);
+        assert_eq!(ext.positions[0], [5, 5, 5]);
+        assert_eq!(ext.v_relax_ade[0][0][0], 0.5_f32);
+        assert_eq!(ext.v_drive_ade[0][0][0], 0.3_f32);
+        assert_eq!(ext.v_solve_ade[0][0], 0.8_f32);
+    }
+
+    #[test]
+    fn test_debye_pre_post_voltage() {
+        let mut ext = EngineExtDebyeMaterial::new(1, 1);
+        ext.set_position(0, [1, 1, 1], &[0.5_f32], &[0.3_f32], 0.8_f32);
+
+        // Set up a voltage field
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        *volt.get_mut(0, 1, 1, 1) = 10.0_f32;
+        *volt.get_mut(1, 1, 1, 1) = 20.0_f32;
+        *volt.get_mut(2, 1, 1, 1) = 30.0_f32;
+
+        // Pre-voltage update: reads V^n, computes pole states
+        ext.do_pre_voltage_updates(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
+
+        // After pre-update, volt_pole_ade should be updated
+        // W = 0.5 * 0 + 0.3 * 10 = 3.0 for comp 0
+        assert!((ext.volt_pole_ade[0][0][0] - 3.0_f32).abs() < 1e-6);
+        // pre = W - 0 = 3.0 for comp 0
+        assert!((ext.volt_pre_ade[0][0] - 3.0_f32).abs() < 1e-6);
+
+        // Simulate main voltage update (V becomes V_raw)
+        *volt.get_mut(0, 1, 1, 1) = 15.0_f32;
+
+        // Post-voltage update: solves for V^(n+1)
+        ext.do_post_voltage_updates(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
+
+        // V^(n+1) = (V_raw - g) * inv = (15.0 - 3.0) * 0.8 = 9.6
+        // volt_ade = V_raw - V^(n+1) = 15.0 - 9.6 = 5.4
+        assert!((ext.volt_ade[0][0] - 5.4_f32).abs() < 1e-6);
+        // W += d * V^(n+1) = 3.0 + 0.3 * 9.6 = 5.88
+        assert!((ext.volt_pole_ade[0][0][0] - 5.88_f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_debye_apply2_voltages() {
+        let mut ext = EngineExtDebyeMaterial::new(1, 1);
+        ext.set_position(0, [1, 1, 1], &[0.5_f32], &[0.3_f32], 0.8_f32);
+        ext.volt_ade[0][0] = 5.4_f32;
+
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        *volt.get_mut(0, 1, 1, 1) = 15.0_f32;
+
+        ext.apply2_voltages(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
+
+        // V -= volt_ade = 15.0 - 5.4 = 9.6
+        assert!((*volt.get(0, 1, 1, 1) - 9.6_f32).abs() < 1e-6);
+    }
+}
+
+/// Engine extension for Lorentz dispersive materials.
+/// Implements the ADE method for Lorentz media.
+/// Mirrors C++ `Engine_Ext_LorentzMaterial`.
+pub struct EngineExtLorentzMaterial {
+    /// Number of dispersion orders.
+    pub num_orders: usize,
+    /// Number of mesh positions with Lorentz material.
+    pub num_positions: usize,
+    /// Position list: [pos_idx] -> [i, j, k].
+    pub positions: Vec<[usize; 3]>,
+    /// Voltage ADE state: [order][component][pos_idx].
+    pub volt_ade: Vec<Vec<Vec<FDTD_FLOAT>>>,
+    /// Current ADE state: [order][component][pos_idx].
+    pub curr_ade: Vec<Vec<Vec<FDTD_FLOAT>>>,
+    /// Lorentz voltage state: [order][component][pos_idx].
+    pub volt_lor_ade: Vec<Vec<Vec<FDTD_FLOAT>>>,
+    /// Lorentz current state: [order][component][pos_idx].
+    pub curr_lor_ade: Vec<Vec<Vec<FDTD_FLOAT>>>,
+    /// Voltage internal coefficient: [order][component][pos_idx].
+    pub v_int_ade: Vec<Vec<Vec<FDTD_FLOAT>>>,
+    /// Voltage external coefficient: [order][component][pos_idx].
+    pub v_ext_ade: Vec<Vec<Vec<FDTD_FLOAT>>>,
+    /// Voltage Lorentz coefficient: [order][component][pos_idx].
+    pub v_lor_ade: Vec<Vec<Vec<FDTD_FLOAT>>>,
+    /// Current internal coefficient: [order][component][pos_idx].
+    pub i_int_ade: Vec<Vec<Vec<FDTD_FLOAT>>>,
+    /// Current external coefficient: [order][component][pos_idx].
+    pub i_ext_ade: Vec<Vec<Vec<FDTD_FLOAT>>>,
+    /// Current Lorentz coefficient: [order][component][pos_idx].
+    pub i_lor_ade: Vec<Vec<Vec<FDTD_FLOAT>>>,
+}
+
+/// Coefficient set for a single Lorentz order at a position.
+pub struct LorentzCoeffs {
+    v_int: FDTD_FLOAT,
+    v_ext: FDTD_FLOAT,
+    v_lor: FDTD_FLOAT,
+    i_int: FDTD_FLOAT,
+    i_ext: FDTD_FLOAT,
+    i_lor: FDTD_FLOAT,
+}
+
+impl EngineExtLorentzMaterial {
+    /// Create a new Lorentz extension with the given number of orders and positions.
+    pub fn new(num_orders: usize, num_positions: usize) -> Self {
+        let zero_vec = vec![FDTD_FLOAT::default(); num_positions];
+        let zero_mat = vec![zero_vec.clone(); 3];
+        let zero_cube = vec![zero_mat.clone(); num_orders];
+
+        Self {
+            num_orders,
+            num_positions,
+            positions: vec![[0, 0, 0]; num_positions],
+            volt_ade: zero_cube.clone(),
+            curr_ade: zero_cube.clone(),
+            volt_lor_ade: zero_cube.clone(),
+            curr_lor_ade: zero_cube.clone(),
+            v_int_ade: zero_cube.clone(),
+            v_ext_ade: zero_cube.clone(),
+            v_lor_ade: zero_cube.clone(),
+            i_int_ade: zero_cube.clone(),
+            i_ext_ade: zero_cube.clone(),
+            i_lor_ade: zero_cube,
+        }
+    }
+
+    /// Set a position with its Lorentz coefficients.
+    pub fn set_position(&mut self, pos_idx: usize, pos: [usize; 3], coeffs: &[LorentzCoeffs]) {
+        self.positions[pos_idx] = pos;
+        for (o, c) in coeffs.iter().enumerate().take(self.num_orders) {
+            for comp in 0..3 {
+                self.v_int_ade[o][comp][pos_idx] = c.v_int;
+                self.v_ext_ade[o][comp][pos_idx] = c.v_ext;
+                self.v_lor_ade[o][comp][pos_idx] = c.v_lor;
+                self.i_int_ade[o][comp][pos_idx] = c.i_int;
+                self.i_ext_ade[o][comp][pos_idx] = c.i_ext;
+                self.i_lor_ade[o][comp][pos_idx] = c.i_lor;
+            }
+        }
+    }
+}
+
+impl Default for EngineExtLorentzMaterial {
+    fn default() -> Self {
+        Self::new(1, 1)
+    }
+}
+
+impl EngineExtension for EngineExtLorentzMaterial {
+    fn get_priority(&self) -> i32 {
+        ENG_EXT_PRIO_DISPERSIVE_LORENTZ
+    }
+
+    fn get_extension_name(&self) -> &'static str {
+        "Lorentz Material"
+    }
+
+    fn do_pre_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        // Update voltage ADE state: volt_ADE *= v_int + v_ext * (V - volt_Lor)
+        // volt_Lor += v_lor * volt_ADE (old)
+        for pos_idx in 0..self.num_positions {
+            let [i, j, k] = self.positions[pos_idx];
+            for o in 0..self.num_orders {
+                for comp in 0..3 {
+                    let volt_val = *volt.get(comp, i, j, k);
+                    if self.v_lor_ade[o][comp][pos_idx] != FDTD_FLOAT::default() {
+                        self.volt_lor_ade[o][comp][pos_idx] +=
+                            self.v_lor_ade[o][comp][pos_idx] * self.volt_ade[o][comp][pos_idx];
+                        self.volt_ade[o][comp][pos_idx] *= self.v_int_ade[o][comp][pos_idx];
+                        self.volt_ade[o][comp][pos_idx] += self.v_ext_ade[o][comp][pos_idx]
+                            * (volt_val - self.volt_lor_ade[o][comp][pos_idx]);
+                    } else {
+                        self.volt_ade[o][comp][pos_idx] *= self.v_int_ade[o][comp][pos_idx];
+                        self.volt_ade[o][comp][pos_idx] +=
+                            self.v_ext_ade[o][comp][pos_idx] * volt_val;
+                    }
+                }
+            }
+        }
+    }
+
+    fn do_pre_current_updates(&mut self, _volt: &FieldArray, curr: &mut FieldArray) {
+        // Update current ADE state: curr_ADE *= i_int + i_ext * (I - curr_Lor)
+        // curr_Lor += i_lor * curr_ADE (old)
+        for pos_idx in 0..self.num_positions {
+            let [i, j, k] = self.positions[pos_idx];
+            for o in 0..self.num_orders {
+                for comp in 0..3 {
+                    let curr_val = *curr.get(comp, i, j, k);
+                    if self.i_lor_ade[o][comp][pos_idx] != FDTD_FLOAT::default() {
+                        self.curr_lor_ade[o][comp][pos_idx] +=
+                            self.i_lor_ade[o][comp][pos_idx] * self.curr_ade[o][comp][pos_idx];
+                        self.curr_ade[o][comp][pos_idx] *= self.i_int_ade[o][comp][pos_idx];
+                        self.curr_ade[o][comp][pos_idx] += self.i_ext_ade[o][comp][pos_idx]
+                            * (curr_val - self.curr_lor_ade[o][comp][pos_idx]);
+                    } else {
+                        self.curr_ade[o][comp][pos_idx] *= self.i_int_ade[o][comp][pos_idx];
+                        self.curr_ade[o][comp][pos_idx] +=
+                            self.i_ext_ade[o][comp][pos_idx] * curr_val;
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply2_voltages(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        // Subtract voltage ADE correction from voltage fields.
+        for pos_idx in 0..self.num_positions {
+            let [i, j, k] = self.positions[pos_idx];
+            for o in 0..self.num_orders {
+                for comp in 0..3 {
+                    let current = *volt.get(comp, i, j, k);
+                    *volt.get_mut(comp, i, j, k) = current - self.volt_ade[o][comp][pos_idx];
+                }
+            }
+        }
+    }
+
+    fn apply2_current(&mut self, _volt: &FieldArray, curr: &mut FieldArray) {
+        // Subtract current ADE correction from current fields.
+        for pos_idx in 0..self.num_positions {
+            let [i, j, k] = self.positions[pos_idx];
+            for o in 0..self.num_orders {
+                for comp in 0..3 {
+                    let current = *curr.get(comp, i, j, k);
+                    *curr.get_mut(comp, i, j, k) = current - self.curr_ade[o][comp][pos_idx];
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod lorentz_tests {
+    use super::*;
+
+    #[test]
+    fn test_lorentz_creation() {
+        let ext = EngineExtLorentzMaterial::new(2, 4);
+        assert_eq!(ext.get_priority(), ENG_EXT_PRIO_DISPERSIVE_LORENTZ);
+        assert_eq!(ext.get_extension_name(), "Lorentz Material");
+        assert_eq!(ext.num_orders, 2);
+        assert_eq!(ext.num_positions, 4);
+    }
+
+    #[test]
+    fn test_lorentz_set_position() {
+        let mut ext = EngineExtLorentzMaterial::new(1, 1);
+        let coeffs = [LorentzCoeffs {
+            v_int: 0.5_f32,
+            v_ext: 0.3_f32,
+            v_lor: 0.1_f32,
+            i_int: 0.6_f32,
+            i_ext: 0.4_f32,
+            i_lor: 0.2_f32,
+        }];
+        ext.set_position(0, [5, 5, 5], &coeffs);
+        assert_eq!(ext.positions[0], [5, 5, 5]);
+        assert_eq!(ext.v_int_ade[0][0][0], 0.5_f32);
+        assert_eq!(ext.v_ext_ade[0][0][0], 0.3_f32);
+        assert_eq!(ext.v_lor_ade[0][0][0], 0.1_f32);
+        assert_eq!(ext.i_int_ade[0][0][0], 0.6_f32);
+        assert_eq!(ext.i_ext_ade[0][0][0], 0.4_f32);
+        assert_eq!(ext.i_lor_ade[0][0][0], 0.2_f32);
+    }
+
+    #[test]
+    fn test_lorentz_pre_voltage() {
+        let mut ext = EngineExtLorentzMaterial::new(1, 1);
+        let coeffs = [LorentzCoeffs {
+            v_int: 0.5_f32,
+            v_ext: 0.3_f32,
+            v_lor: 0.1_f32,
+            i_int: 0.6_f32,
+            i_ext: 0.4_f32,
+            i_lor: 0.2_f32,
+        }];
+        ext.set_position(0, [1, 1, 1], &coeffs);
+
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        *volt.get_mut(0, 1, 1, 1) = 10.0_f32;
+
+        ext.do_pre_voltage_updates(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
+
+        // volt_ADE = 0 * 0.5 + 0.3 * (10 - 0) = 3.0
+        // volt_Lor = 0 + 0.1 * 0 = 0
+        assert!((ext.volt_ade[0][0][0] - 3.0_f32).abs() < 1e-6);
+        assert!((ext.volt_lor_ade[0][0][0] - 0.0_f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_lorentz_pre_current() {
+        let mut ext = EngineExtLorentzMaterial::new(1, 1);
+        let coeffs = [LorentzCoeffs {
+            v_int: 0.5_f32,
+            v_ext: 0.3_f32,
+            v_lor: 0.1_f32,
+            i_int: 0.6_f32,
+            i_ext: 0.4_f32,
+            i_lor: 0.2_f32,
+        }];
+        ext.set_position(0, [1, 1, 1], &coeffs);
+
+        let mut curr = FieldArray::new("curr", [3, 3, 3]);
+        *curr.get_mut(0, 1, 1, 1) = 10.0_f32;
+
+        ext.do_pre_current_updates(&FieldArray::new("volt", [3, 3, 3]), &mut curr);
+
+        // curr_ADE = 0 * 0.6 + 0.4 * (10 - 0) = 4.0
+        // curr_Lor = 0 + 0.2 * 0 = 0
+        assert!((ext.curr_ade[0][0][0] - 4.0_f32).abs() < 1e-6);
+        assert!((ext.curr_lor_ade[0][0][0] - 0.0_f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_lorentz_apply2_voltages() {
+        let mut ext = EngineExtLorentzMaterial::new(1, 1);
+        let coeffs = [LorentzCoeffs {
+            v_int: 0.5_f32,
+            v_ext: 0.3_f32,
+            v_lor: 0.1_f32,
+            i_int: 0.6_f32,
+            i_ext: 0.4_f32,
+            i_lor: 0.2_f32,
+        }];
+        ext.set_position(0, [1, 1, 1], &coeffs);
+        ext.volt_ade[0][0][0] = 5.4_f32;
+
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        *volt.get_mut(0, 1, 1, 1) = 15.0_f32;
+
+        ext.apply2_voltages(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
+
+        // V -= volt_ade = 15.0 - 5.4 = 9.6
+        assert!((*volt.get(0, 1, 1, 1) - 9.6_f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_lorentz_apply2_current() {
+        let mut ext = EngineExtLorentzMaterial::new(1, 1);
+        let coeffs = [LorentzCoeffs {
+            v_int: 0.5_f32,
+            v_ext: 0.3_f32,
+            v_lor: 0.1_f32,
+            i_int: 0.6_f32,
+            i_ext: 0.4_f32,
+            i_lor: 0.2_f32,
+        }];
+        ext.set_position(0, [1, 1, 1], &coeffs);
+        ext.curr_ade[0][0][0] = 5.4_f32;
+
+        let mut curr = FieldArray::new("curr", [3, 3, 3]);
+        *curr.get_mut(0, 1, 1, 1) = 15.0_f32;
+
+        ext.apply2_current(&FieldArray::new("volt", [3, 3, 3]), &mut curr);
+
+        // I -= curr_ade = 15.0 - 5.4 = 9.6
+        assert!((*curr.get(0, 1, 1, 1) - 9.6_f32).abs() < 1e-6);
+    }
+}
