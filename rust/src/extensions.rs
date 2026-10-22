@@ -2150,3 +2150,196 @@ mod tests_steadystate {
         assert!(ext.get_last_diff() > 0.1_f32);
     }
 }
+
+// ============================================================================
+// Cylinder coordinates extension
+// ============================================================================
+
+/// Cylinder coordinates extension.
+///
+/// Handles the alpha-direction periodic boundary condition and r=0 special
+/// treatment for cylindrical FDTD. Ported from C++ `Engine_Ext_Cylinder`.
+///
+/// When `cc_closed_alpha` is true, tangential field components are copied
+/// from the last alpha-plane to the first alpha-plane (periodic boundary).
+/// When `cc_r0_included` is true, special EC coefficients (vv_r0, vi_r0)
+/// are applied at r=0 (the z-axis).
+pub struct EngineExtCylinder {
+    num_lines: [usize; 3],
+    cc_closed_alpha: bool,
+    cc_r0_included: bool,
+    /// Special vv coefficient for r=0, indexed by z-position
+    vv_r0: Vec<FDTD_FLOAT>,
+    /// Special vi coefficient for r=0, indexed by z-position
+    vi_r0: Vec<FDTD_FLOAT>,
+}
+
+impl EngineExtCylinder {
+    pub fn new(num_lines: [usize; 3]) -> Self {
+        Self {
+            num_lines,
+            cc_closed_alpha: false,
+            cc_r0_included: false,
+            vv_r0: vec![FDTD_FLOAT::default(); num_lines[2]],
+            vi_r0: vec![FDTD_FLOAT::default(); num_lines[2]],
+        }
+    }
+
+    pub fn set_closed_alpha(&mut self, closed: bool) {
+        self.cc_closed_alpha = closed;
+    }
+
+    pub fn set_r0_included(&mut self, included: bool) {
+        self.cc_r0_included = included;
+    }
+
+    /// Set the special EC coefficients for r=0 at a given z-position.
+    pub fn set_r0_coeffs(&mut self, k: usize, vv: FDTD_FLOAT, vi: FDTD_FLOAT) {
+        if k < self.vv_r0.len() {
+            self.vv_r0[k] = vv;
+            self.vi_r0[k] = vi;
+        }
+    }
+}
+
+impl EngineExtension for EngineExtCylinder {
+    fn get_priority(&self) -> i32 {
+        ENG_EXT_PRIO_CYLINDER
+    }
+
+    fn get_extension_name(&self) -> &'static str {
+        "cylinder"
+    }
+
+    fn do_post_voltage_updates(&mut self, volt: &mut FieldArray, curr: &FieldArray) {
+        if !self.cc_closed_alpha {
+            return;
+        }
+
+        let [nx, ny, nz] = self.num_lines;
+        let last_a_line = ny.saturating_sub(2);
+
+        if self.cc_r0_included {
+            // Special treatment for r=0 (z-axis)
+            for k in 0..nz {
+                let mut volt_val = *volt.get(2, 0, 0, k) * self.vv_r0[k];
+                for j in 0..ny.saturating_sub(1) {
+                    volt_val += self.vi_r0[k] * *curr.get(1, 0, j, k);
+                }
+                *volt.get_mut(2, 0, 0, k) = volt_val;
+            }
+
+            for j in 0..ny {
+                for k in 0..nz {
+                    *volt.get_mut(1, 0, j, k) = FDTD_FLOAT::default(); // no voltage in alpha at r=0
+                    *volt.get_mut(2, 0, j, k) = *volt.get(2, 0, 0, k);
+                }
+            }
+        }
+
+        // Close alpha: copy tangential voltages from last alpha-plane to first
+        for i in 0..nx {
+            for k in 0..nz {
+                *volt.get_mut(0, i, 0, k) = *volt.get(0, i, last_a_line, k);
+                *volt.get_mut(2, i, 0, k) = *volt.get(2, i, last_a_line, k);
+            }
+        }
+    }
+
+    fn do_post_current_updates(&mut self, _volt: &FieldArray, curr: &mut FieldArray) {
+        if !self.cc_closed_alpha {
+            return;
+        }
+
+        let [nx, ny, nz] = self.num_lines;
+        let last_a_line = ny.saturating_sub(2);
+
+        // Close alpha: copy tangential currents from first alpha-plane to last
+        for i in 0..nx.saturating_sub(1) {
+            for k in 0..nz.saturating_sub(1) {
+                *curr.get_mut(0, i, last_a_line, k) = *curr.get(0, i, 0, k);
+                *curr.get_mut(2, i, last_a_line, k) = *curr.get(2, i, 0, k);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_cylinder {
+    use super::*;
+
+    #[test]
+    fn test_cylinder_new() {
+        let ext = EngineExtCylinder::new([10, 8, 6]);
+        assert_eq!(ext.num_lines, [10, 8, 6]);
+        assert!(!ext.cc_closed_alpha);
+        assert!(!ext.cc_r0_included);
+        assert_eq!(ext.vv_r0.len(), 6);
+        assert_eq!(ext.vi_r0.len(), 6);
+    }
+
+    #[test]
+    fn test_cylinder_set_flags() {
+        let mut ext = EngineExtCylinder::new([10, 8, 6]);
+        ext.set_closed_alpha(true);
+        ext.set_r0_included(true);
+        assert!(ext.cc_closed_alpha);
+        assert!(ext.cc_r0_included);
+    }
+
+    #[test]
+    fn test_cylinder_set_r0_coeffs() {
+        let mut ext = EngineExtCylinder::new([10, 8, 6]);
+        ext.set_r0_coeffs(3, 0.5_f32, 0.25_f32);
+        assert_eq!(ext.vv_r0[3], 0.5);
+        assert_eq!(ext.vi_r0[3], 0.25);
+    }
+
+    #[test]
+    fn test_cylinder_no_closed_alpha_no_op() {
+        let mut ext = EngineExtCylinder::new([4, 4, 4]);
+        // cc_closed_alpha is false, so updates should be no-ops
+
+        let mut volt = FieldArray::new("volt", [4, 4, 4]);
+        let mut curr = FieldArray::new("curr", [4, 4, 4]);
+
+        ext.do_post_voltage_updates(&mut volt, &curr);
+        ext.do_post_current_updates(&volt, &mut curr);
+
+        // Fields should be unchanged
+        assert_eq!(*volt.get(0, 0, 0, 0), 0.0_f32);
+        assert_eq!(*curr.get(0, 0, 0, 0), 0.0_f32);
+    }
+
+    #[test]
+    fn test_cylinder_close_alpha_voltage() {
+        let mut ext = EngineExtCylinder::new([4, 4, 4]);
+        ext.set_closed_alpha(true);
+
+        let mut volt = FieldArray::new("volt", [4, 4, 4]);
+        *volt.get_mut(0, 1, 2, 1) = 7.0_f32;
+        *volt.get_mut(2, 1, 2, 1) = 3.0_f32;
+
+        ext.do_post_voltage_updates(&mut volt, &FieldArray::new("curr", [4, 4, 4]));
+
+        // Voltage at alpha=0 should be copied from alpha=last_a_line=2
+        assert!((*volt.get(0, 1, 0, 1) - 7.0_f32).abs() < 1e-6);
+        assert!((*volt.get(2, 1, 0, 1) - 3.0_f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cylinder_close_alpha_current() {
+        let mut ext = EngineExtCylinder::new([4, 4, 4]);
+        ext.set_closed_alpha(true);
+
+        let mut curr = FieldArray::new("curr", [4, 4, 4]);
+        *curr.get_mut(0, 1, 0, 1) = 5.0_f32;
+        *curr.get_mut(2, 1, 0, 1) = 2.0_f32;
+
+        ext.do_post_current_updates(&FieldArray::new("volt", [4, 4, 4]), &mut curr);
+
+        // Current at alpha=last_a_line=2 should be copied from alpha=0
+        assert!((*curr.get(0, 1, 2, 1) - 5.0_f32).abs() < 1e-6);
+        assert!((*curr.get(2, 1, 2, 1) - 2.0_f32).abs() < 1e-6);
+    }
+}
