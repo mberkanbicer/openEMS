@@ -2,7 +2,7 @@
 //! Mirrors `Common/operator_base.h/cpp` in the C++ codebase.
 
 use crate::array_nijk::FieldArray;
-use crate::constants::CoordinateSystem;
+use crate::constants::{CoordinateSystem, FDTD_FLOAT};
 
 /// Grid path structure for snap-to-mesh operations.
 #[derive(Debug, Clone)]
@@ -84,6 +84,20 @@ pub trait OperatorBase {
     /// Get the equivalent-circuit IV coefficient array (read-only).
     fn get_iv(&self) -> Option<&FieldArray> {
         None
+    }
+
+    /// Set EC voltage coefficients (vv/vi) at a specific mesh position.
+    /// Used by extensions like conducting sheet to modify EC coefficients.
+    fn set_ec_voltage_coeffs(
+        &mut self,
+        _n: usize,
+        _i: usize,
+        _j: usize,
+        _k: usize,
+        _vv: FDTD_FLOAT,
+        _vi: FDTD_FLOAT,
+    ) {
+        // Default: no-op. Override in concrete operator types that support it.
     }
 
     /// Snap coordinates to mesh indices.

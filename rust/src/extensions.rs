@@ -910,6 +910,7 @@ mod tfsf_tests {
 pub const ENG_EXT_PRIO_DISPERSIVE_DEBYE: i32 = 75_000;
 pub const ENG_EXT_PRIO_DISPERSIVE_LORENTZ: i32 = 75_000;
 pub const ENG_EXT_PRIO_DISPERSIVE_APPLY2: i32 = 0;
+pub const ENG_EXT_PRIO_CONDUCTING_SHEET: i32 = 75_000;
 
 /// Engine extension for Debye dispersive materials.
 /// Implements the ADE (Auxiliary Differential Equation) method for Debye media.
@@ -1423,5 +1424,266 @@ mod lorentz_tests {
 
         // I -= curr_ade = 15.0 - 5.4 = 9.6
         assert!((*curr.get(0, 1, 1, 1) - 9.6_f32).abs() < 1e-6);
+    }
+}
+
+// ============================================================================
+// Conducting sheet extension
+// ============================================================================
+
+/// Coefficient set for a single conducting sheet position.
+/// Contains ADE coefficients for 2 orders and 3 field components,
+/// plus modified EC voltage coefficients (vv/vi).
+pub struct ConductingSheetCoeffs {
+    /// Internal ADE coefficients: [order][component].
+    pub v_int_ade: [[FDTD_FLOAT; 3]; 2],
+    /// External ADE coefficients: [order][component].
+    pub v_ext_ade: [[FDTD_FLOAT; 3]; 2],
+    /// Modified EC voltage coefficient vv: [component].
+    pub vv: [FDTD_FLOAT; 3],
+    /// Modified EC voltage coefficient vi: [component].
+    pub vi: [FDTD_FLOAT; 3],
+}
+
+/// Engine extension for a conducting sheet model.
+/// Implements the ADE method for conducting sheets (order=2, voltage ADE only).
+/// Mirrors C++ `Operator_Ext_ConductingSheet`.
+pub struct EngineExtConductingSheet {
+    /// Number of mesh positions with conducting sheet.
+    pub num_positions: usize,
+    /// Position list: [pos_idx] -> [i, j, k].
+    pub positions: Vec<[usize; 3]>,
+    /// Voltage internal ADE coefficients: [order][component][pos_idx].
+    pub v_int_ade: Vec<Vec<Vec<FDTD_FLOAT>>>,
+    /// Voltage external ADE coefficients: [order][component][pos_idx].
+    pub v_ext_ade: Vec<Vec<Vec<FDTD_FLOAT>>>,
+    /// Voltage ADE state: [order][component][pos_idx].
+    pub volt_ade: Vec<Vec<Vec<FDTD_FLOAT>>>,
+    /// Modified EC voltage coefficient vv: [component][pos_idx].
+    pub vv_mod: Vec<Vec<FDTD_FLOAT>>,
+    /// Modified EC voltage coefficient vi: [component][pos_idx].
+    pub vi_mod: Vec<Vec<FDTD_FLOAT>>,
+    /// Whether EC coefficients have been applied to the operator.
+    pub ec_applied: bool,
+}
+
+impl EngineExtConductingSheet {
+    /// Create a new conducting sheet extension with the given number of positions.
+    pub fn new(num_positions: usize) -> Self {
+        let mut v_int_ade = Vec::with_capacity(2);
+        let mut v_ext_ade = Vec::with_capacity(2);
+        let mut volt_ade = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let mut comp_int = Vec::with_capacity(3);
+            let mut comp_ext = Vec::with_capacity(3);
+            let mut comp_state = Vec::with_capacity(3);
+            for _ in 0..3 {
+                comp_int.push(vec![FDTD_FLOAT::default(); num_positions]);
+                comp_ext.push(vec![FDTD_FLOAT::default(); num_positions]);
+                comp_state.push(vec![FDTD_FLOAT::default(); num_positions]);
+            }
+            v_int_ade.push(comp_int);
+            v_ext_ade.push(comp_ext);
+            volt_ade.push(comp_state);
+        }
+        let vv_mod = vec![vec![FDTD_FLOAT::default(); num_positions]; 3];
+        let vi_mod = vec![vec![FDTD_FLOAT::default(); num_positions]; 3];
+        Self {
+            num_positions,
+            positions: vec![[0, 0, 0]; num_positions],
+            v_int_ade,
+            v_ext_ade,
+            volt_ade,
+            vv_mod,
+            vi_mod,
+            ec_applied: false,
+        }
+    }
+
+    /// Set the position and coefficients for a conducting sheet cell.
+    pub fn set_position(
+        &mut self,
+        pos_idx: usize,
+        pos: [usize; 3],
+        coeffs: &ConductingSheetCoeffs,
+    ) {
+        self.positions[pos_idx] = pos;
+        for o in 0..2 {
+            for n in 0..3 {
+                self.v_int_ade[o][n][pos_idx] = coeffs.v_int_ade[o][n];
+                self.v_ext_ade[o][n][pos_idx] = coeffs.v_ext_ade[o][n];
+            }
+        }
+        for n in 0..3 {
+            self.vv_mod[n][pos_idx] = coeffs.vv[n];
+            self.vi_mod[n][pos_idx] = coeffs.vi[n];
+        }
+    }
+
+    /// Apply modified EC voltage coefficients to the operator.
+    /// Should be called before running the time-stepping loop.
+    pub fn apply_ec_coeffs(&mut self, op: &mut dyn crate::operator_base::OperatorBase) {
+        if self.ec_applied {
+            return;
+        }
+        for pos_idx in 0..self.num_positions {
+            let [i, j, k] = self.positions[pos_idx];
+            for n in 0..3 {
+                op.set_ec_voltage_coeffs(
+                    n,
+                    i,
+                    j,
+                    k,
+                    self.vv_mod[n][pos_idx],
+                    self.vi_mod[n][pos_idx],
+                );
+            }
+        }
+        self.ec_applied = true;
+    }
+}
+
+impl EngineExtension for EngineExtConductingSheet {
+    fn get_priority(&self) -> i32 {
+        ENG_EXT_PRIO_CONDUCTING_SHEET
+    }
+
+    fn get_extension_name(&self) -> &'static str {
+        "Conducting Sheet"
+    }
+
+    fn do_pre_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        // ADE update: volt_ADE[o][n] = v_int * volt_ADE[o][n] + v_ext * V[n]
+        for pos_idx in 0..self.num_positions {
+            let [i, j, k] = self.positions[pos_idx];
+            for o in 0..2 {
+                for n in 0..3 {
+                    let v = *volt.get(n, i, j, k);
+                    self.volt_ade[o][n][pos_idx] = self.v_int_ade[o][n][pos_idx]
+                        * self.volt_ade[o][n][pos_idx]
+                        + self.v_ext_ade[o][n][pos_idx] * v;
+                }
+            }
+        }
+    }
+
+    fn apply2_voltages(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        // Subtract the sum of ADE corrections from voltage fields.
+        for pos_idx in 0..self.num_positions {
+            let [i, j, k] = self.positions[pos_idx];
+            for n in 0..3 {
+                let mut correction = FDTD_FLOAT::default();
+                for o in 0..2 {
+                    correction += self.volt_ade[o][n][pos_idx];
+                }
+                let current = *volt.get(n, i, j, k);
+                *volt.get_mut(n, i, j, k) = current - correction;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod conducting_sheet_tests {
+    use super::*;
+
+    #[test]
+    fn test_conducting_sheet_creation() {
+        let ext = EngineExtConductingSheet::new(4);
+        assert_eq!(ext.get_priority(), ENG_EXT_PRIO_CONDUCTING_SHEET);
+        assert_eq!(ext.get_extension_name(), "Conducting Sheet");
+        assert_eq!(ext.num_positions, 4);
+        assert_eq!(ext.positions.len(), 4);
+        assert_eq!(ext.v_int_ade.len(), 2);
+        assert_eq!(ext.v_int_ade[0].len(), 3);
+        assert_eq!(ext.v_int_ade[0][0].len(), 4);
+        assert!(!ext.ec_applied);
+    }
+
+    #[test]
+    fn test_conducting_sheet_set_position() {
+        let mut ext = EngineExtConductingSheet::new(1);
+        let coeffs = ConductingSheetCoeffs {
+            v_int_ade: [[0.5_f32, 0.6_f32, 0.7_f32], [0.8_f32, 0.9_f32, 1.0_f32]],
+            v_ext_ade: [[0.1_f32, 0.2_f32, 0.3_f32], [0.4_f32, 0.5_f32, 0.6_f32]],
+            vv: [0.1_f32, 0.2_f32, 0.3_f32],
+            vi: [0.4_f32, 0.5_f32, 0.6_f32],
+        };
+        ext.set_position(0, [5, 5, 5], &coeffs);
+        assert_eq!(ext.positions[0], [5, 5, 5]);
+        assert_eq!(ext.v_int_ade[0][0][0], 0.5_f32);
+        assert_eq!(ext.v_int_ade[1][2][0], 1.0_f32);
+        assert_eq!(ext.v_ext_ade[0][0][0], 0.1_f32);
+        assert_eq!(ext.v_ext_ade[1][2][0], 0.6_f32);
+        assert_eq!(ext.vv_mod[0][0], 0.1_f32);
+        assert_eq!(ext.vi_mod[2][0], 0.6_f32);
+    }
+
+    #[test]
+    fn test_conducting_sheet_pre_voltage_ade() {
+        let mut ext = EngineExtConductingSheet::new(1);
+        let coeffs = ConductingSheetCoeffs {
+            v_int_ade: [[0.5_f32, 0.0_f32, 0.0_f32], [0.0_f32, 0.0_f32, 0.0_f32]],
+            v_ext_ade: [[0.3_f32, 0.0_f32, 0.0_f32], [0.0_f32, 0.0_f32, 0.0_f32]],
+            vv: [0.0_f32, 0.0_f32, 0.0_f32],
+            vi: [0.0_f32, 0.0_f32, 0.0_f32],
+        };
+        ext.set_position(0, [1, 1, 1], &coeffs);
+
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        *volt.get_mut(0, 1, 1, 1) = 10.0_f32;
+
+        ext.do_pre_voltage_updates(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
+
+        // volt_ADE[0][0] = 0.5 * 0 + 0.3 * 10 = 3.0
+        assert!((ext.volt_ade[0][0][0] - 3.0_f32).abs() < 1e-6);
+        // volt_ADE[1][0] = 0.0 * 0 + 0.0 * 10 = 0.0
+        assert!((ext.volt_ade[1][0][0] - 0.0_f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_conducting_sheet_apply2_voltages() {
+        let mut ext = EngineExtConductingSheet::new(1);
+        let coeffs = ConductingSheetCoeffs {
+            v_int_ade: [[0.0_f32, 0.0_f32, 0.0_f32], [0.0_f32, 0.0_f32, 0.0_f32]],
+            v_ext_ade: [[0.0_f32, 0.0_f32, 0.0_f32], [0.0_f32, 0.0_f32, 0.0_f32]],
+            vv: [0.0_f32, 0.0_f32, 0.0_f32],
+            vi: [0.0_f32, 0.0_f32, 0.0_f32],
+        };
+        ext.set_position(0, [1, 1, 1], &coeffs);
+        // Set ADE state directly
+        ext.volt_ade[0][0][0] = 5.4_f32;
+        ext.volt_ade[1][0][0] = 2.0_f32;
+
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        *volt.get_mut(0, 1, 1, 1) = 15.0_f32;
+
+        ext.apply2_voltages(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
+
+        // V -= volt_ade[0] + volt_ade[1] = 15.0 - 5.4 - 2.0 = 7.6
+        assert!((*volt.get(0, 1, 1, 1) - 7.6_f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_conducting_sheet_full_ade_cycle() {
+        let mut ext = EngineExtConductingSheet::new(1);
+        let coeffs = ConductingSheetCoeffs {
+            v_int_ade: [[0.5_f32, 0.0_f32, 0.0_f32], [0.0_f32, 0.0_f32, 0.0_f32]],
+            v_ext_ade: [[0.3_f32, 0.0_f32, 0.0_f32], [0.0_f32, 0.0_f32, 0.0_f32]],
+            vv: [0.0_f32, 0.0_f32, 0.0_f32],
+            vi: [0.0_f32, 0.0_f32, 0.0_f32],
+        };
+        ext.set_position(0, [1, 1, 1], &coeffs);
+
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        *volt.get_mut(0, 1, 1, 1) = 10.0_f32;
+
+        // Pre-voltage update: volt_ADE = 0.5 * 0 + 0.3 * 10 = 3.0
+        ext.do_pre_voltage_updates(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
+        assert!((ext.volt_ade[0][0][0] - 3.0_f32).abs() < 1e-6);
+
+        // Apply2Voltages: V -= 3.0 => 10.0 - 3.0 = 7.0
+        ext.apply2_voltages(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
+        assert!((*volt.get(0, 1, 1, 1) - 7.0_f32).abs() < 1e-6);
     }
 }

@@ -218,6 +218,29 @@ impl Operator {
         }
     }
 
+    /// Modify EC voltage coefficients at a specific mesh position.
+    /// Used by extensions like conducting sheet to adjust vv/vi coefficients.
+    pub fn set_ec_voltage_coeffs(
+        &mut self,
+        n: usize,
+        i: usize,
+        j: usize,
+        k: usize,
+        vv: FDTD_FLOAT,
+        vi: FDTD_FLOAT,
+    ) {
+        *self
+            .vv_ptr
+            .as_mut()
+            .expect("vv_ptr not allocated")
+            .get_mut(n, i, j, k) = vv;
+        *self
+            .vi_ptr
+            .as_mut()
+            .expect("vi_ptr not allocated")
+            .get_mut(n, i, j, k) = vi;
+    }
+
     /// Apply magnetic boundary conditions (PMC): zero out ii/iv at PMC boundaries.
     /// Mirrors C++ `ApplyMagneticBC`.
     pub fn apply_magnetic_bc(&mut self) {
