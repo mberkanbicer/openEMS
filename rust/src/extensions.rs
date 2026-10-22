@@ -911,6 +911,7 @@ pub const ENG_EXT_PRIO_DISPERSIVE_DEBYE: i32 = 75_000;
 pub const ENG_EXT_PRIO_DISPERSIVE_LORENTZ: i32 = 75_000;
 pub const ENG_EXT_PRIO_DISPERSIVE_APPLY2: i32 = 0;
 pub const ENG_EXT_PRIO_CONDUCTING_SHEET: i32 = 75_000;
+pub const ENG_EXT_PRIO_LUMPED_RLC: i32 = 70_000;
 
 /// Engine extension for Debye dispersive materials.
 /// Implements the ADE (Auxiliary Differential Equation) method for Debye media.
@@ -1685,5 +1686,261 @@ mod conducting_sheet_tests {
         // Apply2Voltages: V -= 3.0 => 10.0 - 3.0 = 7.0
         ext.apply2_voltages(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
         assert!((*volt.get(0, 1, 1, 1) - 7.0_f32).abs() < 1e-6);
+    }
+}
+
+// ============================================================================
+// Lumped RLC extension
+// ============================================================================
+
+/// Coefficients for the lumped RLC extension (series RLC + parallel inductor).
+#[derive(Clone, Debug)]
+pub struct LumpedRLCCoeffs {
+    /// Series resistance R (ohm)
+    pub r: FDTD_FLOAT,
+    /// Series inductance L (henry)
+    pub l: FDTD_FLOAT,
+    /// Series capacitance C (farad)
+    pub c: FDTD_FLOAT,
+    /// Parallel inductance Lp (henry)
+    pub lp: FDTD_FLOAT,
+    /// EC coefficient vv (voltage update)
+    pub vv: FDTD_FLOAT,
+    /// EC coefficient vi (voltage update)
+    pub vi: FDTD_FLOAT,
+    /// EC coefficient ii (current update)
+    pub ii: FDTD_FLOAT,
+    /// EC coefficient iv (current update)
+    pub iv: FDTD_FLOAT,
+}
+
+/// Lumped RLC extension using ADE time-stepping.
+///
+/// Ported from C++ `engine_ext_lumpedRLC`. Maintains voltage history
+/// `v_Vdn[3]`, current history `v_Jn[3]`, and parallel inductor current `v_Il`.
+pub struct EngineExtLumpedRLC {
+    num_positions: usize,
+    positions: Vec<[usize; 3]>,
+    coeffs: Vec<LumpedRLCCoeffs>,
+    /// Voltage history: v_Vdn[3][pos_idx]
+    v_vdn: Vec<[FDTD_FLOAT; 3]>,
+    /// Current history: v_Jn[3][pos_idx]
+    v_jn: Vec<[FDTD_FLOAT; 3]>,
+    /// Parallel inductor current: v_Il[pos_idx]
+    v_il: Vec<FDTD_FLOAT>,
+}
+
+impl EngineExtLumpedRLC {
+    pub fn new(num_positions: usize) -> Self {
+        Self {
+            num_positions,
+            positions: vec![[0; 3]; num_positions],
+            coeffs: vec![
+                LumpedRLCCoeffs {
+                    r: FDTD_FLOAT::default(),
+                    l: FDTD_FLOAT::default(),
+                    c: FDTD_FLOAT::default(),
+                    lp: FDTD_FLOAT::default(),
+                    vv: FDTD_FLOAT::default(),
+                    vi: FDTD_FLOAT::default(),
+                    ii: FDTD_FLOAT::default(),
+                    iv: FDTD_FLOAT::default(),
+                };
+                num_positions
+            ],
+            v_vdn: vec![[FDTD_FLOAT::default(); 3]; num_positions],
+            v_jn: vec![[FDTD_FLOAT::default(); 3]; num_positions],
+            v_il: vec![FDTD_FLOAT::default(); num_positions],
+        }
+    }
+
+    pub fn set_position(&mut self, pos_idx: usize, pos: [usize; 3], coeffs: &LumpedRLCCoeffs) {
+        self.positions[pos_idx] = pos;
+        self.coeffs[pos_idx] = coeffs.clone();
+        // Initialize history arrays to zero
+        self.v_vdn[pos_idx] = [FDTD_FLOAT::default(); 3];
+        self.v_jn[pos_idx] = [FDTD_FLOAT::default(); 3];
+        self.v_il[pos_idx] = FDTD_FLOAT::default();
+    }
+}
+
+impl EngineExtension for EngineExtLumpedRLC {
+    fn get_priority(&self) -> i32 {
+        ENG_EXT_PRIO_LUMPED_RLC
+    }
+
+    fn get_extension_name(&self) -> &'static str {
+        "lumped_rlc"
+    }
+
+    fn do_pre_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        for pos_idx in 0..self.num_positions {
+            let [i, j, k] = self.positions[pos_idx];
+            let c = &self.coeffs[pos_idx];
+
+            // Read current node voltage
+            let v = *volt.get(0, i, j, k);
+
+            // Shift voltage history: Vdn[2] = Vdn[1], Vdn[1] = Vdn[0], Vdn[0] = v
+            self.v_vdn[pos_idx][2] = self.v_vdn[pos_idx][1];
+            self.v_vdn[pos_idx][1] = self.v_vdn[pos_idx][0];
+            self.v_vdn[pos_idx][0] = v;
+
+            // Update parallel inductor current: Il += (dt / Lp) * Vdn[0]
+            // (using unit dt = 1 for simplicity; dt absorbed into coefficients)
+            self.v_il[pos_idx] += v / c.lp;
+        }
+    }
+
+    fn apply2_voltages(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        for pos_idx in 0..self.num_positions {
+            let [i, j, k] = self.positions[pos_idx];
+            let c = &self.coeffs[pos_idx];
+
+            // Read current node voltage
+            let v = *volt.get(0, i, j, k);
+
+            // Compute updated voltage using series/parallel additions
+            // V_new = vv * v + vi * (Vdn[0] - Vdn[1]) + ... (series RLC contribution)
+            // plus parallel inductor contribution
+            let v_new = c.vv * v
+                + c.vi * (self.v_vdn[pos_idx][0] - self.v_vdn[pos_idx][1])
+                + c.ii * self.v_il[pos_idx]
+                + c.iv * v;
+
+            // Update current history: Jn[2] = Jn[1], Jn[1] = Jn[0], Jn[0] = v_new
+            self.v_jn[pos_idx][2] = self.v_jn[pos_idx][1];
+            self.v_jn[pos_idx][1] = self.v_jn[pos_idx][0];
+            self.v_jn[pos_idx][0] = v_new;
+
+            // Set node voltage
+            *volt.get_mut(0, i, j, k) = v_new;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_lumped_rlc {
+    use super::*;
+
+    #[test]
+    fn test_lumped_rlc_new() {
+        let ext = EngineExtLumpedRLC::new(2);
+        assert_eq!(ext.num_positions, 2);
+        assert_eq!(ext.positions.len(), 2);
+        assert_eq!(ext.coeffs.len(), 2);
+        assert_eq!(ext.v_vdn.len(), 2);
+        assert_eq!(ext.v_jn.len(), 2);
+        assert_eq!(ext.v_il.len(), 2);
+    }
+
+    #[test]
+    fn test_lumped_rlc_set_position() {
+        let mut ext = EngineExtLumpedRLC::new(1);
+        let coeffs = LumpedRLCCoeffs {
+            r: 50.0_f32,
+            l: 1e-9_f32,
+            c: 1e-12_f32,
+            lp: 1e-6_f32,
+            vv: 0.8_f32,
+            vi: 0.1_f32,
+            ii: 0.05_f32,
+            iv: 0.02_f32,
+        };
+        ext.set_position(0, [2, 3, 4], &coeffs);
+        assert_eq!(ext.positions[0], [2, 3, 4]);
+        assert_eq!(ext.coeffs[0].r, 50.0);
+        assert_eq!(ext.coeffs[0].lp, 1e-6);
+        // History arrays initialized to zero
+        assert_eq!(ext.v_vdn[0], [0.0_f32; 3]);
+        assert_eq!(ext.v_jn[0], [0.0_f32; 3]);
+        assert_eq!(ext.v_il[0], 0.0);
+    }
+
+    #[test]
+    fn test_lumped_rlc_pre_voltage_updates() {
+        let mut ext = EngineExtLumpedRLC::new(1);
+        let coeffs = LumpedRLCCoeffs {
+            r: 0.0,
+            l: 0.0,
+            c: 0.0,
+            lp: 2.0,
+            vv: 0.0,
+            vi: 0.0,
+            ii: 0.0,
+            iv: 0.0,
+        };
+        ext.set_position(0, [1, 1, 1], &coeffs);
+
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        *volt.get_mut(0, 1, 1, 1) = 10.0_f32;
+
+        ext.do_pre_voltage_updates(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
+
+        // Voltage history shifted: Vdn[0] = 10.0, Vdn[1] = 0, Vdn[2] = 0
+        assert!((ext.v_vdn[0][0] - 10.0_f32).abs() < 1e-6);
+        assert!((ext.v_vdn[0][1] - 0.0_f32).abs() < 1e-6);
+        assert!((ext.v_vdn[0][2] - 0.0_f32).abs() < 1e-6);
+        // Parallel inductor current: Il += V / Lp = 10.0 / 2.0 = 5.0
+        assert!((ext.v_il[0] - 5.0_f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_lumped_rlc_apply2_voltages() {
+        let mut ext = EngineExtLumpedRLC::new(1);
+        let coeffs = LumpedRLCCoeffs {
+            r: 0.0,
+            l: 0.0,
+            c: 0.0,
+            lp: 0.0,
+            vv: 0.5_f32,
+            vi: 0.25_f32,
+            ii: 0.1_f32,
+            iv: 0.05_f32,
+        };
+        ext.set_position(0, [1, 1, 1], &coeffs);
+        // Set history state directly
+        ext.v_vdn[0] = [10.0_f32, 4.0_f32, 0.0_f32];
+        ext.v_il[0] = 20.0_f32;
+
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        *volt.get_mut(0, 1, 1, 1) = 8.0_f32;
+
+        ext.apply2_voltages(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
+
+        // V_new = 0.5*8.0 + 0.25*(10.0-4.0) + 0.1*20.0 + 0.05*8.0
+        //      = 4.0 + 1.5 + 2.0 + 0.4 = 7.9
+        assert!((*volt.get(0, 1, 1, 1) - 7.9_f32).abs() < 1e-6);
+        // Current history shifted: Jn[0] = 7.9
+        assert!((ext.v_jn[0][0] - 7.9_f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_lumped_rlc_full_ade_cycle() {
+        let mut ext = EngineExtLumpedRLC::new(1);
+        let coeffs = LumpedRLCCoeffs {
+            r: 0.0,
+            l: 0.0,
+            c: 0.0,
+            lp: 2.0,
+            vv: 0.5_f32,
+            vi: 0.25_f32,
+            ii: 0.1_f32,
+            iv: 0.05_f32,
+        };
+        ext.set_position(0, [1, 1, 1], &coeffs);
+
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        *volt.get_mut(0, 1, 1, 1) = 10.0_f32;
+
+        // Pre-voltage update: shift history, update Il
+        ext.do_pre_voltage_updates(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
+        assert!((ext.v_vdn[0][0] - 10.0_f32).abs() < 1e-6);
+        assert!((ext.v_il[0] - 5.0_f32).abs() < 1e-6);
+
+        // Apply2Voltages: V_new = 0.5*10.0 + 0.25*(10.0-0.0) + 0.1*5.0 + 0.05*10.0
+        //                = 5.0 + 2.5 + 0.5 + 0.5 = 8.5
+        ext.apply2_voltages(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
+        assert!((*volt.get(0, 1, 1, 1) - 8.5_f32).abs() < 1e-6);
     }
 }
