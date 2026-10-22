@@ -1,34 +1,402 @@
 //! Processing: post-processing (probes, dumps, SAR, NF2FF interface).
 //! Mirrors `Common/processing.h/cpp` and subclasses in the C++ codebase.
 
+/// Mesh type for processing (mirrors C++ `Processing::MeshType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshType {
+    Cartesian,
+    Cylindrical,
+}
+
 /// Base trait for processing objects that sample the running simulation.
+/// Mirrors the C++ `Processing` abstract class.
+///
+/// Processing objects are invoked by [`ProcessingArray`] during the FDTD
+/// time-stepping loop. They can sample fields at specific timesteps,
+/// accumulate frequency-domain data, and write output files.
 pub trait Processing {
-    fn process(&mut self);
+    /// Get the name of this processing.
     fn get_name(&self) -> String;
+    /// Set the name of this processing.
+    fn set_name(&mut self, val: &str);
+    /// Get the processing name used in file descriptions.
+    fn get_processing_name(&self) -> String;
+    /// Initialize processing before the simulation run.
+    fn init_process(&mut self) {}
+    /// Reset processing state (e.g. step counters).
+    fn reset(&mut self) {}
+    /// Define start/stop coordinates snapped to the mesh.
+    fn define_start_stop_coord(&mut self, _start: &[f64; 3], _stop: &[f64; 3]) {}
+    /// Show snapped coordinates (debug output).
+    fn show_snapped_coords(&self) {}
+    /// Set the process interval in timesteps.
+    fn set_process_interval(&mut self, interval: u32);
+    /// Get the process interval.
+    fn get_process_interval(&self) -> u32;
+    /// Set process start/stop time in seconds.
+    fn set_process_start_stop_time(&mut self, _start: f64, _stop: f64) {}
+    /// Add a processing step (timestep at which to process).
+    fn add_step(&mut self, _step: u32) {}
+    /// Add multiple processing steps.
+    fn add_steps(&mut self, _steps: &[u32]) {}
+    /// Set frequency domain oversampling factor.
+    fn set_fd_oversampling(&mut self, _factor: u32) {}
+    /// Add a frequency for frequency-domain sampling.
+    fn add_frequency(&mut self, _freq: f64) {}
+    /// Add multiple frequencies.
+    fn add_frequencies(&mut self, _freqs: &[f64]) {}
+    /// Check if the current timestep should be processed.
+    /// Advances the internal step pointer on match (mirrors C++ behavior).
+    fn check_timestep(&mut self, _num_ts: u32) -> bool {
+        false
+    }
+    /// Get the next processing interval (timesteps until next process).
+    fn get_next_interval(&self, _num_ts: u32) -> i32 {
+        i32::MAX
+    }
+    /// Process data prior to the simulation run.
+    fn pre_process(&mut self) {}
+    /// Process data during simulation run. Returns next interval.
+    fn process(&mut self, _num_ts: u32) -> i32 {
+        0
+    }
+    /// Process data after simulation has finished.
+    fn post_process(&mut self) {}
+    /// Enable or disable processing.
+    fn set_enable(&mut self, _val: bool) {}
+    /// Get whether processing is enabled.
+    fn get_enable(&self) -> bool {
+        true
+    }
+    /// Set the weight for this processing.
+    fn set_weight(&mut self, _weight: f64) {}
+    /// Get the weight.
+    fn get_weight(&self) -> f64 {
+        1.0
+    }
+    /// Invoke this flag to flush all stored data to disk.
+    fn flush_next(&mut self) {}
+    /// Flush stored data to disk.
+    fn flush_data(&mut self) {}
+    /// Set mesh type.
+    fn set_mesh_type(&mut self, _mesh_type: MeshType) {}
+    /// Get mesh type.
+    fn get_mesh_type(&self) -> MeshType {
+        MeshType::Cartesian
+    }
+    /// Set dump precision.
+    fn set_precision(&mut self, _val: u32) {}
+    /// Get dump precision.
+    fn get_precision(&self) -> u32 {
+        12
+    }
+    /// Dump probe geometry to VTK file.
+    fn dump_box_to_file(&self, _vtk_filename_prefix: &str, _dual_mesh: bool) {}
+    /// Set dual mesh flag.
+    fn set_dual_mesh(&mut self, _val: bool) {}
+    /// Set dual time flag.
+    fn set_dual_time(&mut self, _val: bool) {}
+}
+
+/// Manages a collection of [`Processing`] objects.
+/// Mirrors the C++ `ProcessingArray` class.
+///
+/// The array invokes `PreProcess`, `Process`, and `PostProcess` on all
+/// registered processings, and returns the smallest next processing interval
+/// so the caller knows when the next processing is due.
+pub struct ProcessingArray {
+    max_interval: u32,
+    processings: Vec<Box<dyn Processing>>,
+}
+
+impl ProcessingArray {
+    /// Create a new `ProcessingArray` with the given maximum interval.
+    pub fn new(max_interval: u32) -> Self {
+        Self {
+            max_interval,
+            processings: Vec::new(),
+        }
+    }
+
+    /// Add a processing to the array.
+    pub fn add_processing(&mut self, proc: Box<dyn Processing>) {
+        self.processings.push(proc);
+    }
+
+    /// Initialize all processings.
+    pub fn init_all(&mut self) {
+        for proc in self.processings.iter_mut() {
+            proc.init_process();
+        }
+    }
+
+    /// Invoke `flush_next` on all processings.
+    pub fn flush_next(&mut self) {
+        for proc in self.processings.iter_mut() {
+            proc.flush_next();
+        }
+    }
+
+    /// Reset all processings.
+    pub fn reset(&mut self) {
+        for proc in self.processings.iter_mut() {
+            proc.reset();
+        }
+    }
+
+    /// Invoke `pre_process` on all processings.
+    pub fn pre_process(&mut self) {
+        for proc in self.processings.iter_mut() {
+            proc.pre_process();
+        }
+    }
+
+    /// Invoke `process` on all processings. Returns the smallest next
+    /// interval (in timesteps) until any processing is due.
+    pub fn process(&mut self, num_ts: u32) -> i32 {
+        let mut next_process = self.max_interval as i32;
+        for proc in self.processings.iter_mut() {
+            let step = proc.process(num_ts);
+            if step > 0 && step < next_process {
+                next_process = step;
+            }
+        }
+        next_process
+    }
+
+    /// Invoke `post_process` on all processings.
+    pub fn post_process(&mut self) {
+        for proc in self.processings.iter_mut() {
+            proc.post_process();
+        }
+    }
+
+    /// Dump boxes to VTK file for all processings.
+    pub fn dump_boxes_to_file(&self, vtk_filename_prefix: &str) {
+        for proc in self.processings.iter() {
+            proc.dump_box_to_file(vtk_filename_prefix, false);
+        }
+    }
+
+    /// Get the number of processings.
+    pub fn get_number_of_processings(&self) -> usize {
+        self.processings.len()
+    }
+
+    /// Get a reference to a processing by index.
+    pub fn get_processing(&self, number: usize) -> Option<&dyn Processing> {
+        self.processings.get(number).map(|p| p.as_ref())
+    }
 }
 
 /// A field probe that samples E/H fields at a point during the simulation.
+/// Mirrors the C++ `FieldProbe` subclass of `Processing`.
+#[allow(dead_code)]
 pub struct FieldProbe {
-    pub name: String,
-    pub position: [f64; 3],
+    name: String,
+    processing_name: String,
+    position: [f64; 3],
+    process_interval: u32,
+    start_ts: u32,
+    stop_ts: u32,
+    process_steps: Vec<u32>,
+    ps_pos: usize,
+    enabled: bool,
+    weight: f64,
+    mesh_type: MeshType,
+    precision: u32,
+    dual_mesh: bool,
+    dual_time: bool,
+    start: [u32; 3],
+    stop: [u32; 3],
+    m_start_inside: [bool; 3],
+    m_stop_inside: [bool; 3],
 }
 
 impl FieldProbe {
+    /// Create a new field probe.
     pub fn new(name: &str, position: [f64; 3]) -> Self {
         Self {
             name: name.to_string(),
+            processing_name: name.to_string(),
             position,
+            process_interval: 0,
+            start_ts: 0,
+            stop_ts: u32::MAX,
+            process_steps: Vec::new(),
+            ps_pos: 0,
+            enabled: true,
+            weight: 1.0,
+            mesh_type: MeshType::Cartesian,
+            precision: 12,
+            dual_mesh: false,
+            dual_time: false,
+            start: [0, 0, 0],
+            stop: [0, 0, 0],
+            m_start_inside: [false, false, false],
+            m_stop_inside: [false, false, false],
         }
     }
 }
 
 impl Processing for FieldProbe {
-    fn process(&mut self) {
-        // Placeholder: sample fields at position
-    }
-
     fn get_name(&self) -> String {
         self.name.clone()
+    }
+
+    fn set_name(&mut self, val: &str) {
+        self.name = val.to_string();
+    }
+
+    fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    fn set_process_interval(&mut self, interval: u32) {
+        self.process_interval = interval;
+    }
+
+    fn get_process_interval(&self) -> u32 {
+        self.process_interval
+    }
+
+    fn set_process_start_stop_time(&mut self, start: f64, stop: f64) {
+        // Placeholder timestep (1 ps). In the full integration this should
+        // come from the engine/operator via `get_timestep()`.
+        let d_t: f64 = 1.0e-12;
+        self.start_ts = if start > 0.0 {
+            (start / d_t).floor() as u32
+        } else {
+            0
+        };
+        self.stop_ts = if stop > 0.0 {
+            (stop / d_t).ceil() as u32
+        } else {
+            u32::MAX
+        };
+        if self.stop_ts <= self.start_ts {
+            self.start_ts = 0;
+            self.stop_ts = u32::MAX;
+        }
+    }
+
+    fn add_step(&mut self, step: u32) {
+        if self.process_steps.is_empty() || !self.process_steps.contains(&step) {
+            self.process_steps.push(step);
+        }
+    }
+
+    fn add_steps(&mut self, steps: &[u32]) {
+        for &step in steps {
+            self.add_step(step);
+        }
+    }
+
+    fn set_fd_oversampling(&mut self, _factor: u32) {
+        // Placeholder: frequency-domain sampling not yet implemented.
+    }
+
+    fn add_frequency(&mut self, _freq: f64) {
+        // Placeholder: frequency-domain sampling not yet implemented.
+    }
+
+    fn add_frequencies(&mut self, _freqs: &[f64]) {
+        // Placeholder: frequency-domain sampling not yet implemented.
+    }
+
+    fn check_timestep(&mut self, num_ts: u32) -> bool {
+        if num_ts < self.start_ts || num_ts > self.stop_ts {
+            return false;
+        }
+        if self.ps_pos < self.process_steps.len() && self.process_steps[self.ps_pos] == num_ts {
+            self.ps_pos += 1;
+            return true;
+        }
+        if self.process_interval > 0 && num_ts.is_multiple_of(self.process_interval) {
+            return true;
+        }
+        false
+    }
+
+    fn get_next_interval(&self, num_ts: u32) -> i32 {
+        if !self.enabled {
+            return -1;
+        }
+        let mut next = i32::MAX;
+        if self.ps_pos < self.process_steps.len() {
+            next = self.process_steps[self.ps_pos] as i32 - num_ts as i32;
+        }
+        if self.process_interval != 0 {
+            let next_interval =
+                self.process_interval as i32 - (num_ts % self.process_interval) as i32;
+            if next_interval < next {
+                next = next_interval;
+            }
+        }
+        next
+    }
+
+    fn pre_process(&mut self) {
+        // Placeholder: no pre-processing needed for a point probe.
+    }
+
+    fn process(&mut self, num_ts: u32) -> i32 {
+        if !self.enabled {
+            return -1;
+        }
+        // Placeholder: sample fields at position.
+        // Field access will be wired up when the engine exposes field getters.
+        self.get_next_interval(num_ts)
+    }
+
+    fn post_process(&mut self) {
+        // Placeholder: no post-processing needed for a point probe.
+    }
+
+    fn set_enable(&mut self, val: bool) {
+        self.enabled = val;
+    }
+
+    fn get_enable(&self) -> bool {
+        self.enabled
+    }
+
+    fn set_weight(&mut self, weight: f64) {
+        self.weight = weight;
+    }
+
+    fn get_weight(&self) -> f64 {
+        self.weight
+    }
+
+    fn set_mesh_type(&mut self, mesh_type: MeshType) {
+        self.mesh_type = mesh_type;
+    }
+
+    fn get_mesh_type(&self) -> MeshType {
+        self.mesh_type
+    }
+
+    fn set_precision(&mut self, val: u32) {
+        self.precision = val;
+    }
+
+    fn get_precision(&self) -> u32 {
+        self.precision
+    }
+
+    fn set_dual_mesh(&mut self, val: bool) {
+        self.dual_mesh = val;
+    }
+
+    fn set_dual_time(&mut self, val: bool) {
+        self.dual_time = val;
+    }
+}
+
+impl Default for FieldProbe {
+    fn default() -> Self {
+        Self::new("probe", [0.0, 0.0, 0.0])
     }
 }
 
@@ -37,9 +405,261 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_field_probe() {
-        let mut probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
+    fn test_field_probe_creation() {
+        let probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
         assert_eq!(probe.get_name(), "probe1");
-        probe.process(); // should not panic
+        assert_eq!(probe.get_processing_name(), "probe1");
+        assert!(probe.get_enable());
+        assert_eq!(probe.get_process_interval(), 0);
+        assert_eq!(probe.get_weight(), 1.0);
+        assert_eq!(probe.get_precision(), 12);
+        assert_eq!(probe.get_mesh_type(), MeshType::Cartesian);
+    }
+
+    #[test]
+    fn test_field_probe_process_no_panic() {
+        let mut probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
+        probe.process(0); // should not panic
+        probe.process(100);
+    }
+
+    #[test]
+    fn test_field_probe_set_name() {
+        let mut probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
+        probe.set_name("renamed");
+        assert_eq!(probe.get_name(), "renamed");
+    }
+
+    #[test]
+    fn test_field_probe_process_interval() {
+        let mut probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
+        probe.set_process_interval(10);
+        assert_eq!(probe.get_process_interval(), 10);
+        assert!(probe.check_timestep(10));
+        assert!(!probe.check_timestep(11));
+        assert!(!probe.check_timestep(9));
+    }
+
+    #[test]
+    fn test_field_probe_process_interval_zero_disabled() {
+        let mut probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
+        probe.set_process_interval(0);
+        // Interval 0 means interval-based processing is disabled.
+        assert!(!probe.check_timestep(10));
+    }
+
+    #[test]
+    fn test_field_probe_enable_disable() {
+        let mut probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
+        assert!(probe.get_enable());
+        probe.set_enable(false);
+        assert!(!probe.get_enable());
+        assert_eq!(probe.process(0), -1);
+        probe.set_enable(true);
+        assert!(probe.get_enable());
+    }
+
+    #[test]
+    fn test_field_probe_add_step() {
+        let mut probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
+        probe.add_step(5);
+        probe.add_step(10);
+        // check_timestep advances ps_pos on match (mirrors C++ behavior).
+        assert!(probe.check_timestep(5));
+        assert!(probe.check_timestep(10));
+        assert!(!probe.check_timestep(7));
+    }
+
+    #[test]
+    fn test_field_probe_add_steps_duplicate_ignored() {
+        let mut probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
+        probe.add_step(5);
+        probe.add_step(5); // duplicate, should be ignored
+        assert!(probe.check_timestep(5));
+    }
+
+    #[test]
+    fn test_field_probe_add_steps_batch() {
+        let mut probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
+        probe.add_steps(&[3, 6, 9]);
+        assert!(probe.check_timestep(3));
+        assert!(probe.check_timestep(6));
+        assert!(probe.check_timestep(9));
+        assert!(!probe.check_timestep(4));
+    }
+
+    #[test]
+    fn test_field_probe_start_stop_time() {
+        let mut probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
+        // With placeholder d_t = 1e-12: start_ts = 1000, stop_ts = 5000
+        probe.set_process_start_stop_time(1e-9, 5e-9);
+        // With no steps and no interval, check_timestep returns false.
+        // Set an interval to enable time-based processing.
+        probe.set_process_interval(100);
+        assert!(!probe.check_timestep(500));
+        assert!(probe.check_timestep(1000));
+        assert!(probe.check_timestep(5000));
+        assert!(!probe.check_timestep(5001));
+    }
+
+    #[test]
+    fn test_field_probe_start_stop_invalid() {
+        let mut probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
+        // stop <= start should disable processing
+        probe.set_process_start_stop_time(5e-9, 1e-9);
+        assert_eq!(probe.start_ts, 0);
+        assert_eq!(probe.stop_ts, u32::MAX);
+    }
+
+    #[test]
+    fn test_field_probe_weight() {
+        let mut probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
+        assert!((probe.get_weight() - 1.0).abs() < 1e-12);
+        probe.set_weight(2.5);
+        assert!((probe.get_weight() - 2.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_field_probe_precision() {
+        let mut probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
+        assert_eq!(probe.get_precision(), 12);
+        probe.set_precision(6);
+        assert_eq!(probe.get_precision(), 6);
+    }
+
+    #[test]
+    fn test_field_probe_mesh_type() {
+        let mut probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
+        assert_eq!(probe.get_mesh_type(), MeshType::Cartesian);
+        probe.set_mesh_type(MeshType::Cylindrical);
+        assert_eq!(probe.get_mesh_type(), MeshType::Cylindrical);
+    }
+
+    #[test]
+    fn test_field_probe_dual_mesh_dual_time() {
+        let mut probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
+        probe.set_dual_mesh(true);
+        probe.set_dual_time(true);
+        // No getters for these yet; just ensure no panic.
+    }
+
+    #[test]
+    fn test_field_probe_dump_box_to_file() {
+        let probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
+        // Placeholder implementation should not panic.
+        probe.dump_box_to_file("/tmp/test_probe", false);
+        probe.dump_box_to_file("/tmp/test_probe_dual", true);
+    }
+
+    #[test]
+    fn test_field_probe_flush_next() {
+        let mut probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
+        probe.flush_next(); // should not panic
+        probe.flush_data(); // should not panic
+    }
+
+    #[test]
+    fn test_processing_array_creation() {
+        let array = ProcessingArray::new(100);
+        assert_eq!(array.get_number_of_processings(), 0);
+    }
+
+    #[test]
+    fn test_processing_array_add_processing() {
+        let mut array = ProcessingArray::new(100);
+        let probe = Box::new(FieldProbe::new("probe1", [0.0, 0.0, 0.0]));
+        array.add_processing(probe);
+        assert_eq!(array.get_number_of_processings(), 1);
+    }
+
+    #[test]
+    fn test_processing_array_init_pre_post() {
+        let mut array = ProcessingArray::new(100);
+        let probe = Box::new(FieldProbe::new("probe1", [0.0, 0.0, 0.0]));
+        array.add_processing(probe);
+        array.init_all();
+        array.pre_process();
+        array.post_process(); // should not panic
+    }
+
+    #[test]
+    fn test_processing_array_process() {
+        let mut array = ProcessingArray::new(100);
+        let probe = Box::new(FieldProbe::new("probe1", [0.0, 0.0, 0.0]));
+        array.add_processing(probe);
+        let next = array.process(0);
+        // With no interval and no steps, returns max_interval (100).
+        assert_eq!(next, 100);
+    }
+
+    #[test]
+    fn test_processing_array_process_with_interval() {
+        let mut array = ProcessingArray::new(1000);
+        let mut probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
+        probe.set_process_interval(10);
+        array.add_processing(Box::new(probe));
+        let next = array.process(5);
+        // Next interval should be 10 - 5%10 = 5.
+        assert_eq!(next, 5);
+    }
+
+    #[test]
+    fn test_processing_array_flush_next_reset() {
+        let mut array = ProcessingArray::new(100);
+        let probe = Box::new(FieldProbe::new("probe1", [0.0, 0.0, 0.0]));
+        array.add_processing(probe);
+        array.flush_next(); // should not panic
+        array.reset(); // should not panic
+    }
+
+    #[test]
+    fn test_processing_array_dump_boxes_to_file() {
+        let mut array = ProcessingArray::new(100);
+        let probe = Box::new(FieldProbe::new("probe1", [0.0, 0.0, 0.0]));
+        array.add_processing(probe);
+        array.dump_boxes_to_file("/tmp/test_array"); // should not panic
+    }
+
+    #[test]
+    fn test_processing_array_get_processing() {
+        let mut array = ProcessingArray::new(100);
+        let probe = Box::new(FieldProbe::new("probe1", [0.0, 0.0, 0.0]));
+        array.add_processing(probe);
+        let retrieved = array.get_processing(0);
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().get_name(), "probe1");
+        assert!(array.get_processing(1).is_none());
+    }
+
+    #[test]
+    fn test_field_probe_default() {
+        let probe = FieldProbe::default();
+        assert_eq!(probe.get_name(), "probe");
+        assert_eq!(probe.position, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_processing_trait_default_methods() {
+        // Verify that a minimal impl only needs the required methods.
+        struct MinimalProc;
+        impl Processing for MinimalProc {
+            fn get_name(&self) -> String {
+                "minimal".to_string()
+            }
+            fn set_name(&mut self, _val: &str) {}
+            fn get_processing_name(&self) -> String {
+                "minimal".to_string()
+            }
+            fn set_process_interval(&mut self, _interval: u32) {}
+            fn get_process_interval(&self) -> u32 {
+                0
+            }
+        }
+        let proc = MinimalProc;
+        assert_eq!(proc.get_name(), "minimal");
+        assert!(proc.get_enable());
+        assert_eq!(proc.get_weight(), 1.0);
+        assert_eq!(proc.get_precision(), 12);
+        assert_eq!(proc.get_mesh_type(), MeshType::Cartesian);
     }
 }
