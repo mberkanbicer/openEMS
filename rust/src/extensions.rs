@@ -1944,3 +1944,209 @@ mod tests_lumped_rlc {
         assert!((*volt.get(0, 1, 1, 1) - 8.5_f32).abs() < 1e-6);
     }
 }
+
+// ============================================================================
+// Steady-state extension
+// ============================================================================
+
+/// Steady-state detection extension.
+///
+/// Records E-field values at probe positions over time and detects steady state
+/// by comparing consecutive periods. Ported from C++ `Engine_Ext_SteadyState`.
+///
+/// The extension records E-field samples at each probe position into a circular
+/// buffer of size `2 * ts_period`. Every `ts_period` timesteps, it computes the
+/// normalized difference between the current period and the previous period.
+/// When the difference falls below a threshold, the simulation has reached
+/// steady state.
+pub struct EngineExtSteadyState {
+    /// Number of timesteps per period
+    ts_period: usize,
+    /// Internal timestep counter (incremented each apply2_voltages call)
+    num_ts: usize,
+    /// Probe positions: [pos_idx][axis]
+    probe_pos: Vec<[usize; 3]>,
+    /// Probe field component: 0=Ex, 1=Ey, 2=Ez
+    probe_dir: Vec<usize>,
+    /// Circular buffer of E-field records: [probe_idx][sample_idx]
+    e_records: Vec<Vec<FDTD_FLOAT>>,
+    /// Last computed max difference (steady-state convergence metric)
+    last_max_diff: FDTD_FLOAT,
+}
+
+impl EngineExtSteadyState {
+    pub fn new(ts_period: usize) -> Self {
+        Self {
+            ts_period,
+            num_ts: 0,
+            probe_pos: Vec::new(),
+            probe_dir: Vec::new(),
+            e_records: Vec::new(),
+            last_max_diff: FDTD_FLOAT::default(),
+        }
+    }
+
+    /// Add an E-field probe at the given position and component.
+    pub fn add_e_probe(&mut self, pos: [usize; 3], dir: usize) {
+        self.probe_pos.push(pos);
+        self.probe_dir.push(dir);
+        self.e_records
+            .push(vec![FDTD_FLOAT::default(); 2 * self.ts_period]);
+    }
+
+    /// Get the last computed max difference (steady-state convergence metric).
+    pub fn get_last_diff(&self) -> FDTD_FLOAT {
+        self.last_max_diff
+    }
+}
+
+impl EngineExtension for EngineExtSteadyState {
+    fn get_priority(&self) -> i32 {
+        ENG_EXT_PRIO_STEADYSTATE
+    }
+
+    fn get_extension_name(&self) -> &'static str {
+        "steadystate"
+    }
+
+    fn apply2_voltages(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        self.num_ts += 1;
+        let p = self.ts_period;
+        let ts = self.num_ts;
+        let rel_pos = ts % (2 * p);
+
+        // Record E-field values at probe positions
+        for n in 0..self.probe_pos.len() {
+            let [i, j, k] = self.probe_pos[n];
+            let dir = self.probe_dir[n];
+            self.e_records[n][rel_pos] = *volt.get(dir, i, j, k);
+        }
+
+        // Every period, compute steady-state difference
+        if ts.is_multiple_of(p) && ts >= 2 * p {
+            let mut no_valid = true;
+            self.last_max_diff = FDTD_FLOAT::default();
+
+            let mut old_pos = 0usize;
+            let mut new_pos = p;
+            if rel_pos <= p {
+                new_pos = 0;
+                old_pos = p;
+            }
+
+            let mut max_pow = FDTD_FLOAT::default();
+            let mut curr_pow = vec![FDTD_FLOAT::default(); self.probe_pos.len()];
+            let mut diff_pow = vec![FDTD_FLOAT::default(); self.probe_pos.len()];
+
+            for n in 0..self.probe_pos.len() {
+                let buf = &self.e_records[n];
+                for nt in 0..p {
+                    let v_new = buf[nt + new_pos];
+                    let v_old = buf[nt + old_pos];
+                    curr_pow[n] += v_new * v_new;
+                    diff_pow[n] += (v_old - v_new) * (v_old - v_new);
+                }
+                max_pow = max_pow.max(curr_pow[n]);
+            }
+
+            for n in 0..self.probe_pos.len() {
+                if curr_pow[n] > max_pow * 1e-2_f32 {
+                    let ratio = diff_pow[n] / curr_pow[n];
+                    self.last_max_diff = self.last_max_diff.max(ratio);
+                    no_valid = false;
+                }
+            }
+
+            if no_valid || self.last_max_diff > 1.0_f32 {
+                self.last_max_diff = 1.0_f32;
+            }
+        }
+    }
+
+    fn apply2_current(&mut self, _volt: &FieldArray, _curr: &mut FieldArray) {
+        // No-op: steady-state detection only operates on voltage fields
+    }
+}
+
+#[cfg(test)]
+mod tests_steadystate {
+    use super::*;
+
+    #[test]
+    fn test_steadystate_new() {
+        let ext = EngineExtSteadyState::new(10);
+        assert_eq!(ext.ts_period, 10);
+        assert_eq!(ext.probe_pos.len(), 0);
+        assert_eq!(ext.e_records.len(), 0);
+        assert!((ext.get_last_diff() - 0.0_f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_steadystate_add_e_probe() {
+        let mut ext = EngineExtSteadyState::new(4);
+        ext.add_e_probe([1, 2, 3], 0);
+        ext.add_e_probe([4, 5, 6], 1);
+        assert_eq!(ext.probe_pos.len(), 2);
+        assert_eq!(ext.probe_pos[0], [1, 2, 3]);
+        assert_eq!(ext.probe_dir[0], 0);
+        assert_eq!(ext.probe_pos[1], [4, 5, 6]);
+        assert_eq!(ext.probe_dir[1], 1);
+        // Each probe gets a buffer of 2 * ts_period = 8 samples
+        assert_eq!(ext.e_records[0].len(), 8);
+        assert_eq!(ext.e_records[1].len(), 8);
+    }
+
+    #[test]
+    fn test_steadystate_record_and_diff() {
+        let mut ext = EngineExtSteadyState::new(2);
+        ext.add_e_probe([1, 1, 1], 0);
+
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+
+        // Simulate 4 timesteps (2 periods of 2)
+        // Period 0: E = 1.0, 2.0
+        // Period 1: E = 1.0, 2.0 (identical → steady state, diff = 0)
+        for ts in 0..4u32 {
+            let e_val = if ts % 2 == 0 { 1.0_f32 } else { 2.0_f32 };
+            *volt.get_mut(0, 1, 1, 1) = e_val;
+            // Manually set num_ts via the extension's internal tracking
+            // We simulate by calling apply2_voltages which uses its own ts counter
+            // Note: num_ts is not accessible here; we rely on the call count
+            ext.apply2_voltages(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
+        }
+
+        // After 4 timesteps (2 periods), diff should be 0 (identical periods)
+        assert!((ext.get_last_diff() - 0.0_f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_steadystate_not_converged() {
+        let mut ext = EngineExtSteadyState::new(2);
+        ext.add_e_probe([1, 1, 1], 0);
+
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+
+        // Period 0: E = 1.0, 2.0
+        // Period 1: E = 10.0, 20.0 (very different → not converged)
+        for ts in 0..4u32 {
+            let e_val = if ts < 2 {
+                if ts == 0 {
+                    1.0_f32
+                } else {
+                    2.0_f32
+                }
+            } else {
+                if ts == 2 {
+                    10.0_f32
+                } else {
+                    20.0_f32
+                }
+            };
+            *volt.get_mut(0, 1, 1, 1) = e_val;
+            ext.apply2_voltages(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
+        }
+
+        // Diff should be large (not converged)
+        assert!(ext.get_last_diff() > 0.1_f32);
+    }
+}
