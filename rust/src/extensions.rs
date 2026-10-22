@@ -574,3 +574,330 @@ mod upml_tests {
         assert_eq!(ext.volt_flux.len(), 3);
     }
 }
+
+// ============================================================================
+// TFSF (Total Field / Scattered Field) extension
+// ============================================================================
+
+/// TFSF engine extension implementing a Total-Field / Scattered-Field boundary.
+/// Adds a correction term to fields on the boundary of the total-field region
+/// based on an excitation signal with delays and amplitudes.
+/// Mirrors C++ `Engine_Ext_TFSF`.
+pub struct EngineExtTFSF {
+    /// TFSF region start position (inclusive) in each direction.
+    pub start: [usize; 3],
+    /// TFSF region stop position (inclusive) in each direction.
+    pub stop: [usize; 3],
+    /// Number of mesh lines in each direction within the TFSF region.
+    pub num_lines: [usize; 3],
+    /// Active faces: m_ActiveDir[direction][0=low, 1=high].
+    pub active_dir: [[bool; 2]; 3],
+    /// Excitation signal.
+    pub signal: Excitation,
+    /// Current timestep.
+    pub current_ts: u32,
+    /// Maximum delay value.
+    pub max_delay: u32,
+    /// Voltage delay lookup: [direction][face][component][position_index].
+    pub volt_delay: Vec<Vec<Vec<Vec<u32>>>>,
+    /// Voltage delay delta (interpolation factor): [direction][face][component][position_index].
+    pub volt_delay_delta: Vec<Vec<Vec<Vec<FDTD_FLOAT>>>>,
+    /// Voltage amplitude: [direction][face][component][position_index].
+    pub volt_amp: Vec<Vec<Vec<Vec<FDTD_FLOAT>>>>,
+    /// Current delay lookup: [direction][face][component][position_index].
+    pub curr_delay: Vec<Vec<Vec<Vec<u32>>>>,
+    /// Current delay delta (interpolation factor): [direction][face][component][position_index].
+    pub curr_delay_delta: Vec<Vec<Vec<Vec<FDTD_FLOAT>>>>,
+    /// Current amplitude: [direction][face][component][position_index].
+    pub curr_amp: Vec<Vec<Vec<Vec<FDTD_FLOAT>>>>,
+}
+
+impl EngineExtTFSF {
+    pub fn new() -> Self {
+        Self {
+            start: [0, 0, 0],
+            stop: [0, 0, 0],
+            num_lines: [0, 0, 0],
+            active_dir: [[false; 2]; 3],
+            signal: Excitation::default(),
+            current_ts: 0,
+            max_delay: 0,
+            volt_delay: vec![vec![vec![vec![]; 2]; 2]; 3],
+            volt_delay_delta: vec![vec![vec![vec![]; 2]; 2]; 3],
+            volt_amp: vec![vec![vec![vec![]; 2]; 2]; 3],
+            curr_delay: vec![vec![vec![vec![]; 2]; 2]; 3],
+            curr_delay_delta: vec![vec![vec![vec![]; 2]; 2]; 3],
+            curr_amp: vec![vec![vec![vec![]; 2]; 2]; 3],
+        }
+    }
+
+    /// Set the TFSF region boundaries.
+    pub fn set_region(&mut self, start: [usize; 3], stop: [usize; 3]) {
+        self.start = start;
+        self.stop = stop;
+        self.num_lines = [
+            stop[0].saturating_sub(start[0]),
+            stop[1].saturating_sub(start[1]),
+            stop[2].saturating_sub(start[2]),
+        ];
+    }
+
+    /// Activate a face for TFSF correction.
+    pub fn activate_face(&mut self, direction: usize, face: i32) {
+        if direction < 3 && (0..=1).contains(&face) {
+            self.active_dir[direction][face as usize] = true;
+        }
+    }
+
+    /// Set the excitation signal.
+    pub fn set_signal(&mut self, signal: Excitation) {
+        self.signal = signal;
+    }
+
+    /// Set the maximum delay.
+    pub fn set_max_delay(&mut self, max_delay: u32) {
+        self.max_delay = max_delay;
+    }
+
+    /// Compute the delay lookup index for the current timestep.
+    fn delay_lookup(&self, delay: u32, signal_length: u32, signal_period: u32) -> usize {
+        let num_ts = self.current_ts;
+        let idx = if num_ts < delay || ((num_ts - delay >= signal_length) && signal_period == 0) {
+            0
+        } else {
+            num_ts - delay
+        };
+        if signal_period > 0 {
+            (idx % signal_period) as usize
+        } else {
+            idx as usize
+        }
+    }
+}
+
+impl Default for EngineExtTFSF {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EngineExtension for EngineExtTFSF {
+    fn get_priority(&self) -> i32 {
+        ENG_EXT_PRIO_TFSF
+    }
+
+    fn get_extension_name(&self) -> &'static str {
+        "TFSF"
+    }
+
+    fn do_post_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        let signal_length = 1u32; // placeholder; in full implementation this comes from the signal
+        let signal_period = 0u32;
+
+        for n in 0..3 {
+            let n_p = (n + 1) % 3;
+            let n_pp = (n + 2) % 3;
+
+            // lower plane
+            if self.active_dir[n][0] {
+                let mut pos = [0usize; 3];
+                pos[n_p] = self.start[n_p];
+                let mut ui_pos = 0usize;
+                for _i in 0..self.num_lines[n_p] {
+                    pos[n_pp] = self.start[n_pp];
+                    for _j in 0..self.num_lines[n_pp] {
+                        pos[n] = self.start[n];
+                        // Add TFSF correction to the two perpendicular field components
+                        for comp in [n_p, n_pp] {
+                            let delay = self.volt_delay[n][0][comp][ui_pos];
+                            let delta = self.volt_delay_delta[n][0][comp][ui_pos];
+                            let amp = self.volt_amp[n][0][comp][ui_pos];
+                            let signal_idx = self.delay_lookup(delay, signal_length, signal_period);
+                            let signal_val = self.signal_value_at(signal_idx);
+                            let correction =
+                                (1.0_f32 - delta) * amp * signal_val + delta * amp * signal_val;
+                            let current = *volt.get(comp, pos[0], pos[1], pos[2]);
+                            *volt.get_mut(comp, pos[0], pos[1], pos[2]) = current + correction;
+                        }
+                        pos[n_pp] += 1;
+                        ui_pos += 1;
+                    }
+                    pos[n_p] += 1;
+                }
+            }
+
+            // upper plane
+            if self.active_dir[n][1] {
+                let mut pos = [0usize; 3];
+                pos[n_p] = self.start[n_p];
+                let mut ui_pos = 0usize;
+                for _i in 0..self.num_lines[n_p] {
+                    pos[n_pp] = self.start[n_pp];
+                    for _j in 0..self.num_lines[n_pp] {
+                        pos[n] = self.stop[n];
+                        for comp in [n_p, n_pp] {
+                            let delay = self.volt_delay[n][1][comp][ui_pos];
+                            let delta = self.volt_delay_delta[n][1][comp][ui_pos];
+                            let amp = self.volt_amp[n][1][comp][ui_pos];
+                            let signal_idx = self.delay_lookup(delay, signal_length, signal_period);
+                            let signal_val = self.signal_value_at(signal_idx);
+                            let correction =
+                                (1.0_f32 - delta) * amp * signal_val + delta * amp * signal_val;
+                            let current = *volt.get(comp, pos[0], pos[1], pos[2]);
+                            *volt.get_mut(comp, pos[0], pos[1], pos[2]) =
+                                current + correction as FDTD_FLOAT;
+                        }
+                        pos[n_pp] += 1;
+                        ui_pos += 1;
+                    }
+                    pos[n_p] += 1;
+                }
+            }
+        }
+    }
+
+    fn do_post_current_updates(&mut self, _volt: &FieldArray, curr: &mut FieldArray) {
+        let signal_length = 1u32;
+        let signal_period = 0u32;
+
+        for n in 0..3 {
+            if !self.active_dir[n][0] && !self.active_dir[n][1] {
+                continue;
+            }
+
+            let n_p = (n + 1) % 3;
+            let n_pp = (n + 2) % 3;
+
+            // lower plane
+            if self.active_dir[n][0] {
+                let mut pos = [0usize; 3];
+                pos[n_p] = self.start[n_p];
+                let mut ui_pos = 0usize;
+                for _i in 0..self.num_lines[n_p] {
+                    pos[n_pp] = self.start[n_pp];
+                    for _j in 0..self.num_lines[n_pp] {
+                        pos[n] = self.start[n].saturating_sub(1);
+                        for comp in [n_p, n_pp] {
+                            let delay = self.curr_delay[n][0][comp][ui_pos];
+                            let delta = self.curr_delay_delta[n][0][comp][ui_pos];
+                            let amp = self.curr_amp[n][0][comp][ui_pos];
+                            let signal_idx = self.delay_lookup(delay, signal_length, signal_period);
+                            let signal_val = self.signal_value_at(signal_idx);
+                            let correction =
+                                (1.0_f32 - delta) * amp * signal_val + delta * amp * signal_val;
+                            let current = *curr.get(comp, pos[0], pos[1], pos[2]);
+                            *curr.get_mut(comp, pos[0], pos[1], pos[2]) = current + correction;
+                        }
+                        pos[n_pp] += 1;
+                        ui_pos += 1;
+                    }
+                    pos[n_p] += 1;
+                }
+            }
+
+            // upper plane
+            if self.active_dir[n][1] {
+                let mut pos = [0usize; 3];
+                pos[n_p] = self.start[n_p];
+                let mut ui_pos = 0usize;
+                for _i in 0..self.num_lines[n_p] {
+                    pos[n_pp] = self.start[n_pp];
+                    for _j in 0..self.num_lines[n_pp] {
+                        pos[n] = self.stop[n];
+                        for comp in [n_p, n_pp] {
+                            let delay = self.curr_delay[n][1][comp][ui_pos];
+                            let delta = self.curr_delay_delta[n][1][comp][ui_pos];
+                            let amp = self.curr_amp[n][1][comp][ui_pos];
+                            let signal_idx = self.delay_lookup(delay, signal_length, signal_period);
+                            let signal_val = self.signal_value_at(signal_idx);
+                            let correction =
+                                (1.0_f32 - delta) * amp * signal_val + delta * amp * signal_val;
+                            let current = *curr.get(comp, pos[0], pos[1], pos[2]);
+                            *curr.get_mut(comp, pos[0], pos[1], pos[2]) =
+                                current + correction as FDTD_FLOAT;
+                        }
+                        pos[n_pp] += 1;
+                        ui_pos += 1;
+                    }
+                    pos[n_p] += 1;
+                }
+            }
+        }
+    }
+}
+
+impl EngineExtTFSF {
+    /// Get the signal value at the given index into the signal waveform.
+    fn signal_value_at(&self, idx: usize) -> FDTD_FLOAT {
+        // Simplified: use the excitation signal computation directly
+        let t = idx as f64;
+        let val: f64 = match self.signal.exc_type {
+            ExcitationType::Gauss => {
+                let fc = self.signal.fc;
+                let sigma = 1.0 / (2.0 * std::f64::consts::PI * fc);
+                let t0 = 3.0 * sigma;
+                let dt = t - t0;
+                (-((dt / sigma).powi(2))).exp()
+            }
+            ExcitationType::Sinus => (2.0 * std::f64::consts::PI * self.signal.f0 * t).sin(),
+            ExcitationType::Dirac => {
+                if t == 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            ExcitationType::Step => {
+                if t >= 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            ExcitationType::Custom => 0.0,
+        };
+        val as FDTD_FLOAT
+    }
+}
+
+#[cfg(test)]
+mod tfsf_tests {
+    use super::*;
+
+    #[test]
+    fn test_tfsf_creation() {
+        let ext = EngineExtTFSF::new();
+        assert_eq!(ext.get_priority(), ENG_EXT_PRIO_TFSF);
+        assert_eq!(ext.get_extension_name(), "TFSF");
+    }
+
+    #[test]
+    fn test_tfsf_set_region() {
+        let mut ext = EngineExtTFSF::new();
+        ext.set_region([5, 5, 5], [15, 15, 15]);
+        assert_eq!(ext.start, [5, 5, 5]);
+        assert_eq!(ext.stop, [15, 15, 15]);
+        assert_eq!(ext.num_lines, [10, 10, 10]);
+    }
+
+    #[test]
+    fn test_tfsf_activate_face() {
+        let mut ext = EngineExtTFSF::new();
+        ext.activate_face(0, 0);
+        ext.activate_face(2, 1);
+        assert!(ext.active_dir[0][0]);
+        assert!(ext.active_dir[2][1]);
+        assert!(!ext.active_dir[1][0]);
+    }
+
+    #[test]
+    fn test_tfsf_delay_lookup() {
+        let mut ext = EngineExtTFSF::new();
+        ext.current_ts = 100;
+        ext.max_delay = 50;
+        // delay=0, signal_length=200 (signal still active), signal_period=0 => idx = 100
+        assert_eq!(ext.delay_lookup(0, 200, 0), 100);
+        // delay=150 > current_ts => idx = 0
+        assert_eq!(ext.delay_lookup(150, 1, 0), 0);
+    }
+}
