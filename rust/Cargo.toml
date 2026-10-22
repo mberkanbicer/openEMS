@@ -1,0 +1,13 @@
+[package]
+name = "openems-core"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Rust foundations for the openEMS FDTD solver"
+
+[dependencies]
+csxcad-core = { package = "csxcad-core", path = "../../CSXCAD/rust" }
+fparser = { package = "fparser-rs", path = "../../fparser/rust" }
+
+[features]
+hdf5 = []
