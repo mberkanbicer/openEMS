@@ -26,6 +26,12 @@ pub trait EngineExtension {
     fn do_pre_current_updates(&mut self, _volt: &FieldArray, _curr: &mut FieldArray) {}
     fn do_post_current_updates(&mut self, _volt: &FieldArray, _curr: &mut FieldArray) {}
     fn apply2_current(&mut self, _volt: &FieldArray, _curr: &mut FieldArray) {}
+
+    /// Query extension-specific convergence metric (e.g. steady-state diff).
+    /// Returns `None` by default; override in extensions that support it.
+    fn get_last_diff(&self) -> Option<FDTD_FLOAT> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -2007,6 +2013,10 @@ impl EngineExtension for EngineExtSteadyState {
 
     fn get_extension_name(&self) -> &'static str {
         "steadystate"
+    }
+
+    fn get_last_diff(&self) -> Option<FDTD_FLOAT> {
+        Some(self.get_last_diff())
     }
 
     fn apply2_voltages(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {

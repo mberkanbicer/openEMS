@@ -45,6 +45,17 @@ impl Engine {
         self.num_ts
     }
 
+    /// Query the steady-state convergence diff from the steady-state extension,
+    /// if one is registered. Returns `None` if no steady-state extension exists.
+    pub fn get_steady_state_diff(&self) -> Option<FDTD_FLOAT> {
+        for ext in self.extensions.iter() {
+            if let Some(diff) = ext.get_last_diff() {
+                return Some(diff);
+            }
+        }
+        None
+    }
+
     /// Execute pre-voltage extension updates (highest priority last).
     pub fn do_pre_voltage_updates(&mut self) {
         self.extensions
@@ -142,7 +153,7 @@ impl Engine {
         let ny = self.num_lines[1];
         let nz = self.num_lines[2];
 
-        for i in 0..nx {
+        for i in 0..nx.saturating_sub(1) {
             for j in 0..ny.saturating_sub(1) {
                 for k in 0..nz.saturating_sub(1) {
                     // Read all voltage values before taking mutable borrow
