@@ -400,6 +400,369 @@ impl Default for FieldProbe {
     }
 }
 
+/// Base struct for integral-based processing (voltage, current, etc.).
+/// Mirrors the C++ `ProcessIntegral` subclass of `Processing`.
+#[allow(dead_code)]
+pub struct ProcessIntegral {
+    name: String,
+    processing_name: String,
+    position: [f64; 3],
+    normal_dir: i32,
+    normal_vector: [f64; 3],
+}
+
+impl ProcessIntegral {
+    /// Create a new integral processing. `normal_dir` is a direction vector
+    /// like [1.0, 0.0, 0.0]; it is converted to an axis index 0/1/2.
+    pub fn new(position: [f64; 3], normal_dir: [f64; 3]) -> Self {
+        let axis = normal_dir
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                a.abs()
+                    .partial_cmp(&b.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i as i32)
+            .unwrap_or(0);
+        Self {
+            name: "integral".to_string(),
+            processing_name: "integral".to_string(),
+            position,
+            normal_dir: axis,
+            normal_vector: normal_dir,
+        }
+    }
+
+    pub fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    pub fn get_integral_name(&self, _index: usize) -> String {
+        "integral".to_string()
+    }
+
+    pub fn get_number_of_integrals(&self) -> usize {
+        1
+    }
+
+    pub fn get_normal_dir(&self) -> i32 {
+        self.normal_dir
+    }
+
+    pub fn set_normal_dir(&mut self, dir: i32) {
+        self.normal_dir = dir;
+    }
+
+    pub fn calc_integral(&self) -> f64 {
+        0.0
+    }
+
+    pub fn calc_multiple_integrals(&self) -> Vec<f64> {
+        vec![0.0]
+    }
+}
+
+impl Processing for ProcessIntegral {
+    fn get_name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn set_name(&mut self, val: &str) {
+        self.name = val.to_string();
+    }
+
+    fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    fn set_process_interval(&mut self, _interval: u32) {}
+
+    fn get_process_interval(&self) -> u32 {
+        0
+    }
+}
+
+/// Voltage integration processing.
+#[allow(dead_code)]
+pub struct ProcessVoltage {
+    name: String,
+    processing_name: String,
+    position: [f64; 3],
+    normal_dir: i32,
+    normal_vector: [f64; 3],
+}
+
+impl ProcessVoltage {
+    pub fn new(position: [f64; 3], normal_dir: [f64; 3]) -> Self {
+        let axis = normal_dir
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                a.abs()
+                    .partial_cmp(&b.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i as i32)
+            .unwrap_or(0);
+        Self {
+            name: "voltage".to_string(),
+            processing_name: "voltage integration".to_string(),
+            position,
+            normal_dir: axis,
+            normal_vector: normal_dir,
+        }
+    }
+
+    pub fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    pub fn get_integral_name(&self, _index: usize) -> String {
+        "voltage".to_string()
+    }
+
+    pub fn get_number_of_integrals(&self) -> usize {
+        1
+    }
+
+    pub fn get_normal_dir(&self) -> i32 {
+        self.normal_dir
+    }
+
+    pub fn set_normal_dir(&mut self, dir: i32) {
+        self.normal_dir = dir;
+    }
+
+    pub fn calc_integral(&self) -> f64 {
+        0.0
+    }
+
+    pub fn calc_multiple_integrals(&self) -> Vec<f64> {
+        vec![0.0]
+    }
+}
+
+impl Processing for ProcessVoltage {
+    fn get_name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn set_name(&mut self, val: &str) {
+        self.name = val.to_string();
+    }
+
+    fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    fn set_process_interval(&mut self, _interval: u32) {}
+
+    fn get_process_interval(&self) -> u32 {
+        0
+    }
+}
+
+/// Current integration processing.
+#[allow(dead_code)]
+pub struct ProcessCurrent {
+    name: String,
+    processing_name: String,
+    position: [f64; 3],
+    normal_dir: i32,
+    normal_vector: [f64; 3],
+}
+
+impl ProcessCurrent {
+    pub fn new(position: [f64; 3], normal_dir: [f64; 3]) -> Self {
+        let axis = normal_dir
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                a.abs()
+                    .partial_cmp(&b.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i as i32)
+            .unwrap_or(0);
+        Self {
+            name: "current".to_string(),
+            processing_name: "current integration".to_string(),
+            position,
+            normal_dir: axis,
+            normal_vector: normal_dir,
+        }
+    }
+
+    pub fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    pub fn get_integral_name(&self, _index: usize) -> String {
+        "current".to_string()
+    }
+
+    pub fn get_number_of_integrals(&self) -> usize {
+        1
+    }
+
+    pub fn get_normal_dir(&self) -> i32 {
+        self.normal_dir
+    }
+
+    pub fn set_normal_dir(&mut self, dir: i32) {
+        self.normal_dir = dir;
+    }
+
+    pub fn calc_integral(&self) -> f64 {
+        0.0
+    }
+
+    pub fn calc_multiple_integrals(&self) -> Vec<f64> {
+        vec![0.0]
+    }
+}
+
+impl Processing for ProcessCurrent {
+    fn get_name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn set_name(&mut self, val: &str) {
+        self.name = val.to_string();
+    }
+
+    fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    fn set_process_interval(&mut self, _interval: u32) {}
+
+    fn get_process_interval(&self) -> u32 {
+        0
+    }
+}
+
+/// Common field processing (E/H/J/D/B field dumps, SAR, etc.).
+/// Mirrors the C++ `ProcessFields` subclass of `Processing`.
+#[allow(dead_code)]
+pub struct ProcessFields {
+    name: String,
+    processing_name: String,
+    start: [f64; 3],
+    stop: [f64; 3],
+    dump_type: i32,
+    file_type: i32,
+    sub_sampling: [i32; 3],
+    opt_resolution: [f64; 3],
+    dump_mode: i32,
+}
+
+impl ProcessFields {
+    pub fn new(name: &str, start: [f64; 3], stop: [f64; 3]) -> Self {
+        Self {
+            name: name.to_string(),
+            processing_name: "common field processing".to_string(),
+            start,
+            stop,
+            dump_type: 0, // E_FIELD_DUMP
+            file_type: 1, // VTK_FILETYPE
+            sub_sampling: [1, 1, 1],
+            opt_resolution: [0.0, 0.0, 0.0],
+            dump_mode: 0,
+        }
+    }
+
+    pub fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    pub fn get_dump_type(&self) -> i32 {
+        self.dump_type
+    }
+
+    pub fn get_file_type(&self) -> i32 {
+        self.file_type
+    }
+
+    pub fn set_dump_type(&mut self, val: i32) {
+        self.dump_type = val;
+    }
+
+    pub fn set_file_type(&mut self, val: i32) {
+        self.file_type = val;
+    }
+
+    pub fn set_sub_sampling(&mut self, val: i32, _: i32) {
+        self.sub_sampling[0] = val;
+    }
+
+    pub fn set_opt_resolution(&mut self, val: f64, _: i32) {
+        self.opt_resolution[0] = val;
+    }
+
+    pub fn set_dump_mode(&mut self, val: i32) {
+        self.dump_mode = val;
+    }
+
+    pub fn set_dump_mode_2_node(&mut self) {
+        self.dump_mode = 0;
+    }
+
+    pub fn set_dump_mode_2_cell(&mut self) {
+        self.dump_mode = 1;
+    }
+
+    pub fn need_conductivity(&self) -> bool {
+        true
+    }
+
+    pub fn need_permittivity(&self) -> bool {
+        true
+    }
+
+    pub fn need_permeability(&self) -> bool {
+        true
+    }
+
+    pub fn calc_total_energy_estimate(&self) -> f64 {
+        0.0
+    }
+
+    pub fn get_field_name_by_type(type_: i32) -> String {
+        match type_ {
+            0 => "E-Field".to_string(),
+            1 => "H-Field".to_string(),
+            2 => "J-Field".to_string(),
+            3 => "D-Field".to_string(),
+            4 => "B-Field".to_string(),
+            5 => "B-Field".to_string(),
+            20 => "SAR-Local".to_string(),
+            _ => "Unknown".to_string(),
+        }
+    }
+}
+
+impl Processing for ProcessFields {
+    fn get_name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn set_name(&mut self, val: &str) {
+        self.name = val.to_string();
+    }
+
+    fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    fn set_process_interval(&mut self, _interval: u32) {}
+
+    fn get_process_interval(&self) -> u32 {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,6 +925,100 @@ mod tests {
     fn test_processing_array_creation() {
         let array = ProcessingArray::new(100);
         assert_eq!(array.get_number_of_processings(), 0);
+    }
+
+    #[test]
+    fn test_process_integral_creation() {
+        let voltage = ProcessVoltage::new([0.0, 0.0, 0.0], [1.0, 0.0, 0.0]);
+        assert_eq!(voltage.get_processing_name(), "voltage integration");
+        assert_eq!(voltage.get_integral_name(0), "voltage");
+        assert_eq!(voltage.get_number_of_integrals(), 1);
+        assert_eq!(voltage.get_normal_dir(), 0);
+    }
+
+    #[test]
+    fn test_process_integral_calc() {
+        let voltage = ProcessVoltage::new([0.0, 0.0, 0.0], [1.0, 0.0, 0.0]);
+        assert_eq!(voltage.calc_integral(), 0.0);
+        let results = voltage.calc_multiple_integrals();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_process_integral_normal_dir() {
+        let mut voltage = ProcessVoltage::new([0.0, 0.0, 0.0], [1.0, 0.0, 0.0]);
+        voltage.set_normal_dir(1);
+        assert_eq!(voltage.get_normal_dir(), 1);
+    }
+
+    #[test]
+    fn test_process_current_creation() {
+        let current = ProcessCurrent::new([0.0, 0.0, 0.0], [1.0, 0.0, 0.0]);
+        assert_eq!(current.get_processing_name(), "current integration");
+        assert_eq!(current.get_integral_name(0), "current");
+        assert_eq!(current.get_number_of_integrals(), 1);
+    }
+
+    #[test]
+    fn test_process_fields_creation() {
+        let fields = ProcessFields::new("dump", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        assert_eq!(fields.get_processing_name(), "common field processing");
+        assert_eq!(fields.get_dump_type(), 0); // E_FIELD_DUMP
+        assert_eq!(fields.get_file_type(), 1); // VTK_FILETYPE
+    }
+
+    #[test]
+    fn test_process_fields_dump_type() {
+        let mut fields = ProcessFields::new("dump", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        fields.set_dump_type(1); // H_FIELD_DUMP
+        assert_eq!(fields.get_dump_type(), 1);
+    }
+
+    #[test]
+    fn test_process_fields_file_type() {
+        let mut fields = ProcessFields::new("dump", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        fields.set_file_type(0); // HDF5_FILETYPE
+        assert_eq!(fields.get_file_type(), 0);
+    }
+
+    #[test]
+    fn test_process_fields_sub_sampling() {
+        let mut fields = ProcessFields::new("dump", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        fields.set_sub_sampling(2, -1);
+        fields.set_sub_sampling(3, 0);
+        fields.set_opt_resolution(0.5, -1);
+    }
+
+    #[test]
+    fn test_process_fields_dump_mode() {
+        let mut fields = ProcessFields::new("dump", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        fields.set_dump_mode(0); // NODE_INTERPOLATE
+        fields.set_dump_mode(1); // CELL_INTERPOLATE
+        fields.set_dump_mode_2_node();
+        fields.set_dump_mode_2_cell();
+    }
+
+    #[test]
+    fn test_process_fields_conductivity_needs() {
+        let fields = ProcessFields::new("dump", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        assert!(fields.need_conductivity());
+        assert!(fields.need_permittivity());
+        assert!(fields.need_permeability());
+    }
+
+    #[test]
+    fn test_process_fields_calc_total_energy() {
+        let fields = ProcessFields::new("dump", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        assert_eq!(fields.calc_total_energy_estimate(), 0.0);
+    }
+
+    #[test]
+    fn test_process_fields_field_name_by_type() {
+        assert_eq!(ProcessFields::get_field_name_by_type(0), "E-Field");
+        assert_eq!(ProcessFields::get_field_name_by_type(1), "H-Field");
+        assert_eq!(ProcessFields::get_field_name_by_type(2), "J-Field");
+        assert_eq!(ProcessFields::get_field_name_by_type(5), "B-Field");
+        assert_eq!(ProcessFields::get_field_name_by_type(20), "SAR-Local");
     }
 
     #[test]

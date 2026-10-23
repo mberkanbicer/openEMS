@@ -33,6 +33,10 @@ pub struct OpenEMS {
     pub time_step: f64,
     pub time_step_factor: f64,
     pub abort: bool,
+    /// CSXCAD XML geometry string. When set, `setup_fdtd()` parses it via
+    /// `Operator::load_csx()` to populate the grid, materials, boundary
+    /// conditions and per-cell materials.
+    pub csx_xml: Option<String>,
 }
 
 impl OpenEMS {
@@ -56,6 +60,7 @@ impl OpenEMS {
             time_step: 0.0,
             time_step_factor: 1.0,
             abort: false,
+            csx_xml: None,
         }
     }
 
@@ -198,6 +203,18 @@ impl OpenEMS {
         self.abort = val;
     }
 
+    /// Set the CSXCAD XML geometry string.
+    /// When set, `setup_fdtd()` parses it via `Operator::load_csx()` to
+    /// populate the grid, materials, boundary conditions and per-cell materials.
+    pub fn set_csx_xml(&mut self, xml: String) {
+        self.csx_xml = Some(xml);
+    }
+
+    /// Clear the CSXCAD XML geometry (falls back to default placeholder grid).
+    pub fn clear_csx_xml(&mut self) {
+        self.csx_xml = None;
+    }
+
     /// Set the number of threads for multithreaded engine.
     pub fn set_number_of_threads(&mut self, val: i32) {
         let _ = val; // stored for future multithreaded engine support
@@ -240,24 +257,50 @@ impl OpenEMS {
 
     /// Initialize the FDTD operator from a CSX geometry.
     /// Mirrors C++ `SetupFDTD` (operator setup portion).
+    ///
+    /// When `csx_xml` is set, the geometry is parsed via `Operator::load_csx()`
+    /// to populate the grid, materials, boundary conditions and per-cell
+    /// materials. Otherwise a default placeholder grid is used.
     pub fn setup_fdtd(&mut self) -> bool {
         let mut op = Operator::new();
 
-        // Configure a uniform grid (placeholder values; CSXCAD integration will set these).
-        op.base.grid_delta = 1.0e-3; // 1 mm
-        op.base.num_lines = [10, 10, 10];
-        op.base.d_t = 0.0; // will be computed by calc_timestep
+        // Load CSXCAD geometry if an XML string was provided.
+        if let Some(ref xml) = self.csx_xml {
+            match op.load_csx(xml) {
+                Ok(()) => {
+                    println!("[openEMS] CSXCAD geometry loaded: {} lines, delta={:.6}",
+                        op.base.num_lines.iter().map(|&v| v as f64).sum::<f64>() / 3.0,
+                        op.base.grid_delta);
+                }
+                Err(e) => {
+                    eprintln!("[openEMS] Failed to load CSXCAD geometry: {}", e);
+                    return false;
+                }
+            }
+        } else {
+            // Configure a uniform grid (placeholder values).
+            op.base.grid_delta = 1.0e-3; // 1 mm
+            op.base.num_lines = [10, 10, 10];
+            op.base.d_t = 0.0; // will be computed by calc_timestep
+        }
 
-        // Set boundary conditions.
-        op.base.set_boundary_condition(self.bc_type);
+        // Set boundary conditions (CSXCAD may have already set them via load_csx;
+        // only override with explicit settings when no XML was loaded).
+        if self.csx_xml.is_none() {
+            op.base.set_boundary_condition(self.bc_type);
+        }
 
-        // Allocate EC coefficient arrays (convert u32 -> usize).
-        let num_lines_usize: [usize; 3] = op.base.num_lines.map(|v| v as usize);
-        op.init_data_storage(num_lines_usize);
+        // Ensure EC coefficient arrays are allocated.
+        if op.vv_ptr.is_none() || op.vi_ptr.is_none() || op.ii_ptr.is_none() || op.iv_ptr.is_none() {
+            let num_lines_usize: [usize; 3] = op.base.num_lines.map(|v| v as usize);
+            op.init_data_storage(num_lines_usize);
+        }
 
-        // Set up excitation (default Gaussian pulse).
-        let exc = Excitation::gauss(1.0e9, 5.0e8);
-        self.excitation = Some(Box::new(exc));
+        // Set up excitation (default Gaussian pulse if none specified).
+        if self.excitation.is_none() {
+            let exc = Excitation::gauss(1.0e9, 5.0e8);
+            self.excitation = Some(Box::new(exc));
+        }
 
         // Compute EC coefficients (vv, vi, ii, iv) for all cells.
         op.calc_ec_operator();
