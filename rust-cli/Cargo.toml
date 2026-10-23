@@ -1,0 +1,14 @@
+[package]
+name = "openems-cli"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Command-line interface for the openEMS FDTD solver"
+
+[[bin]]
+name = "openems-cli"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+openems-core = { path = "../rust" }

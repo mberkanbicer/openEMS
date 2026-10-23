@@ -303,6 +303,13 @@ impl PyOpenEMS {
         self.csx.as_ref().map(|c| c.clone_ref(py))
     }
 
+    /// Set the CSXCAD XML geometry string.
+    /// When set, `run()` parses it via `Operator::load_csx()` to populate
+    /// the grid, materials, boundary conditions and per-cell materials.
+    fn set_csx_xml(&mut self, xml: &str) {
+        self.inner.set_csx_xml(xml.to_string());
+    }
+
     /// Add edges of primitives to the FDTD grid.
     #[pyo3(signature = (dirs, primitives=None))]
     fn add_edges2grid(
@@ -387,16 +394,46 @@ impl PyOpenEMS {
     }
 
     /// Write the FDTD setup and CSX data to an XML file.
-    fn write2xml(&self, _file: &str) -> PyResult<bool> {
-        Err(PyException::new_err(
-            "Write2XML: requires CSXCAD integration (future task)",
-        ))
+    fn write2xml(&self, file: &str) -> PyResult<bool> {
+        let xml = self
+            .inner
+            .csx_xml
+            .as_ref()
+            .ok_or_else(|| {
+                PyValueError::new_err("Write2XML: No CSXCAD XML geometry set")
+            })?;
+        match std::fs::write(file, xml) {
+            Ok(()) => Ok(true),
+            Err(e) => Err(PyValueError::new_err(format!(
+                "Write2XML: Failed to write '{}': {}",
+                file, e
+            ))),
+        }
     }
 
     /// Read the FDTD setup and CSX data from an XML file.
-    fn read_from_xml(&mut self, _file: &str) -> PyResult<bool> {
+    fn read_from_xml(&mut self, file: &str) -> PyResult<bool> {
+        let xml = match std::fs::read_to_string(file) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(PyValueError::new_err(format!(
+                    "ReadFromXML: Failed to read '{}': {}",
+                    file, e
+                )))
+            }
+        };
+        self.inner.set_csx_xml(xml);
+        Ok(true)
+    }
+
+    /// Add a processing object (probe, field dump, SAR, etc.) to the
+    /// post-processing array.
+    fn add_processing(&mut self, _proc: Bound<'_, PyAny>) -> PyResult<()> {
+        // Processing objects are added via the Rust API; Python-side
+        // processing wrappers are a future task.
+        let _ = _proc;
         Err(PyException::new_err(
-            "ReadFromXML: requires CSXCAD integration (future task)",
+            "AddProcessing: Python processing wrappers not yet implemented",
         ))
     }
 }

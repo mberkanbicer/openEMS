@@ -20,3 +20,7 @@ pub mod openems;
 pub mod operator;
 pub mod operator_base;
 pub mod processing;
+
+// Re-export the main solver and boundary condition types at the crate root
+// so dependents can use `openems_core::{OpenEMS, BC_PEC, ...}`.
+pub use openems::{OpenEMS, BC_PEC, BC_PMC, BC_MUR, BC_PML};
