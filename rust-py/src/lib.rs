@@ -153,6 +153,25 @@ impl PyOpenEMS {
         self.inner.set_cell_constant_material(val);
     }
 
+    /// Enable or disable field dumps.
+    fn set_enable_dumps(&mut self, val: bool) {
+        self.inner.set_enable_dumps(val);
+    }
+
+    /// Set MUR phase velocity for a given boundary side (0..6).
+    fn set_mur_phase_vel(&mut self, idx: usize, val: f64) -> PyResult<()> {
+        if idx >= 6 {
+            return Err(PyValueError::new_err("Boundary index must be 0..6"));
+        }
+        self.inner.set_mur_phase_vel(idx, val);
+        Ok(())
+    }
+
+    /// Check abort conditions.
+    fn check_abort_cond(&self) -> bool {
+        self.inner.check_abort_cond()
+    }
+
     /// Set the coordinate system (0=Cartesian, 1=Cylindrical).
     fn set_coord_system(&mut self, val: i32) -> PyResult<()> {
         self.inner.set_coord_system(val).map_err(|e| {
@@ -258,6 +277,22 @@ impl PyOpenEMS {
         Ok(())
     }
 
+    /// Get the boundary condition type for a given side (0..6).
+    fn get_bc_type(&self, idx: usize) -> PyResult<i32> {
+        if idx >= 6 {
+            return Err(PyValueError::new_err("Boundary index must be 0..6"));
+        }
+        Ok(self.inner.get_bc_type(idx))
+    }
+
+    /// Get the PML size for a given side (0..6).
+    fn get_pml_size(&self, idx: usize) -> PyResult<u32> {
+        if idx >= 6 {
+            return Err(PyValueError::new_err("Boundary index must be 0..6"));
+        }
+        Ok(self.inner.get_pml_size(idx))
+    }
+
     /// Set the CSXCAD ContinuousStructure for CAD data handling.
     fn set_csx(&mut self, csx: Py<PyAny>) {
         self.csx = Some(csx);
@@ -314,6 +349,41 @@ impl PyOpenEMS {
     /// Set the abort flag.
     fn set_abort(&mut self, val: bool) {
         self.inner.set_abort(val);
+    }
+
+    /// Set the number of threads for multithreaded engine.
+    fn set_number_of_threads(&mut self, val: i32) {
+        self.inner.set_number_of_threads(val);
+    }
+
+    /// Set the verbose level for console output.
+    fn set_verbose_level(&mut self, level: i32) {
+        self.inner.set_verbose_level(level);
+    }
+
+    /// Enable debug material output.
+    fn debug_material(&mut self) {
+        self.inner.debug_material();
+    }
+
+    /// Enable debug operator output.
+    fn debug_operator(&mut self) {
+        self.inner.debug_operator();
+    }
+
+    /// Enable debug box output.
+    fn debug_box(&mut self) {
+        self.inner.debug_box();
+    }
+
+    /// Enable debug PEC output.
+    fn debug_pec(&mut self) {
+        self.inner.debug_pec();
+    }
+
+    /// Enable debug CSX output.
+    fn debug_csx(&mut self) {
+        self.inner.debug_csx();
     }
 
     /// Write the FDTD setup and CSX data to an XML file.

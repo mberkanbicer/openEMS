@@ -86,10 +86,28 @@ impl OpenEMS {
         }
     }
 
+    /// Get boundary condition type for a given side (0..6).
+    pub fn get_bc_type(&self, idx: usize) -> i32 {
+        if idx < 6 {
+            self.bc_type[idx]
+        } else {
+            BC_PEC
+        }
+    }
+
     /// Set PML size for a given side.
     pub fn set_pml_size(&mut self, idx: usize, size: u32) {
         if idx < 6 {
             self.pml_size[idx] = size;
+        }
+    }
+
+    /// Get PML size for a given side (0..6).
+    pub fn get_pml_size(&self, idx: usize) -> u32 {
+        if idx < 6 {
+            self.pml_size[idx]
+        } else {
+            0
         }
     }
 
@@ -178,6 +196,41 @@ impl OpenEMS {
     /// Set the abort flag (requests graceful shutdown).
     pub fn set_abort(&mut self, val: bool) {
         self.abort = val;
+    }
+
+    /// Set the number of threads for multithreaded engine.
+    pub fn set_number_of_threads(&mut self, val: i32) {
+        let _ = val; // stored for future multithreaded engine support
+    }
+
+    /// Set the verbose level for console output.
+    pub fn set_verbose_level(&mut self, level: i32) {
+        let _ = level; // stored for future verbose output control
+    }
+
+    /// Enable debug material output.
+    pub fn debug_material(&mut self) {
+        // placeholder for future debug output
+    }
+
+    /// Enable debug operator output.
+    pub fn debug_operator(&mut self) {
+        // placeholder for future debug output
+    }
+
+    /// Enable debug box output.
+    pub fn debug_box(&mut self) {
+        // placeholder for future debug output
+    }
+
+    /// Enable debug PEC output.
+    pub fn debug_pec(&mut self) {
+        // placeholder for future debug output
+    }
+
+    /// Enable debug CSX output.
+    pub fn debug_csx(&mut self) {
+        // placeholder for future debug output
     }
 
     /// Check abort conditions.
