@@ -763,6 +763,609 @@ impl Processing for ProcessFields {
     }
 }
 
+/// Time-domain field dump processing.
+/// Mirrors the C++ `ProcessFieldsTD` concept (time-domain E/H/J/D/B field dumps).
+#[allow(dead_code)]
+pub struct ProcessFieldsTD {
+    name: String,
+    processing_name: String,
+    start: [f64; 3],
+    stop: [f64; 3],
+    dump_type: i32,
+    file_type: i32,
+    sub_sampling: [i32; 3],
+    opt_resolution: [f64; 3],
+    dump_mode: i32,
+}
+
+impl ProcessFieldsTD {
+    pub fn new(name: &str, start: [f64; 3], stop: [f64; 3]) -> Self {
+        Self {
+            name: name.to_string(),
+            processing_name: "time-domain field dump".to_string(),
+            start,
+            stop,
+            dump_type: 0, // E_FIELD_DUMP
+            file_type: 1, // VTK_FILETYPE
+            sub_sampling: [1, 1, 1],
+            opt_resolution: [0.0, 0.0, 0.0],
+            dump_mode: 0,
+        }
+    }
+
+    pub fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    pub fn get_dump_type(&self) -> i32 {
+        self.dump_type
+    }
+
+    pub fn get_file_type(&self) -> i32 {
+        self.file_type
+    }
+
+    pub fn set_dump_type(&mut self, val: i32) {
+        self.dump_type = val;
+    }
+
+    pub fn set_file_type(&mut self, val: i32) {
+        self.file_type = val;
+    }
+
+    pub fn set_sub_sampling(&mut self, val: i32, _: i32) {
+        self.sub_sampling[0] = val;
+    }
+
+    pub fn set_opt_resolution(&mut self, val: f64, _: i32) {
+        self.opt_resolution[0] = val;
+    }
+
+    pub fn set_dump_mode(&mut self, val: i32) {
+        self.dump_mode = val;
+    }
+
+    pub fn set_dump_mode_2_node(&mut self) {
+        self.dump_mode = 0;
+    }
+
+    pub fn set_dump_mode_2_cell(&mut self) {
+        self.dump_mode = 1;
+    }
+
+    pub fn need_conductivity(&self) -> bool {
+        true
+    }
+
+    pub fn need_permittivity(&self) -> bool {
+        true
+    }
+
+    pub fn need_permeability(&self) -> bool {
+        true
+    }
+
+    pub fn calc_total_energy_estimate(&self) -> f64 {
+        0.0
+    }
+
+    pub fn get_field_name_by_type(type_: i32) -> String {
+        match type_ {
+            0 => "E-Field".to_string(),
+            1 => "H-Field".to_string(),
+            2 => "J-Field".to_string(),
+            3 => "D-Field".to_string(),
+            4 => "B-Field".to_string(),
+            5 => "B-Field".to_string(),
+            20 => "SAR-Local".to_string(),
+            _ => "Unknown".to_string(),
+        }
+    }
+}
+
+impl Processing for ProcessFieldsTD {
+    fn get_name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn set_name(&mut self, val: &str) {
+        self.name = val.to_string();
+    }
+
+    fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    fn set_process_interval(&mut self, _interval: u32) {}
+
+    fn get_process_interval(&self) -> u32 {
+        0
+    }
+}
+
+/// Frequency-domain field dump processing.
+/// Mirrors the C++ `ProcessFieldsFD` concept (frequency-domain field dumps via FD oversampling).
+#[allow(dead_code)]
+pub struct ProcessFieldsFD {
+    name: String,
+    processing_name: String,
+    start: [f64; 3],
+    stop: [f64; 3],
+    dump_type: i32,
+    file_type: i32,
+    fd_oversampling: u32,
+    frequencies: Vec<f64>,
+}
+
+impl ProcessFieldsFD {
+    pub fn new(name: &str, start: [f64; 3], stop: [f64; 3]) -> Self {
+        Self {
+            name: name.to_string(),
+            processing_name: "frequency-domain field dump".to_string(),
+            start,
+            stop,
+            dump_type: 0, // E_FIELD_DUMP
+            file_type: 1, // VTK_FILETYPE
+            fd_oversampling: 4,
+            frequencies: Vec::new(),
+        }
+    }
+
+    pub fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    pub fn get_dump_type(&self) -> i32 {
+        self.dump_type
+    }
+
+    pub fn get_file_type(&self) -> i32 {
+        self.file_type
+    }
+
+    pub fn get_fd_oversampling(&self) -> u32 {
+        self.fd_oversampling
+    }
+
+    pub fn set_fd_oversampling(&mut self, factor: u32) {
+        self.fd_oversampling = factor;
+    }
+
+    pub fn add_frequency(&mut self, freq: f64) {
+        self.frequencies.push(freq);
+    }
+
+    pub fn get_frequencies(&self) -> &[f64] {
+        &self.frequencies
+    }
+
+    pub fn set_dump_type(&mut self, val: i32) {
+        self.dump_type = val;
+    }
+
+    pub fn set_file_type(&mut self, val: i32) {
+        self.file_type = val;
+    }
+
+    pub fn need_conductivity(&self) -> bool {
+        true
+    }
+
+    pub fn need_permittivity(&self) -> bool {
+        true
+    }
+
+    pub fn need_permeability(&self) -> bool {
+        true
+    }
+
+    pub fn calc_total_energy_estimate(&self) -> f64 {
+        0.0
+    }
+}
+
+impl Processing for ProcessFieldsFD {
+    fn get_name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn set_name(&mut self, val: &str) {
+        self.name = val.to_string();
+    }
+
+    fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    fn set_process_interval(&mut self, _interval: u32) {}
+
+    fn get_process_interval(&self) -> u32 {
+        0
+    }
+
+    fn set_fd_oversampling(&mut self, factor: u32) {
+        self.fd_oversampling = factor;
+    }
+
+    fn add_frequency(&mut self, freq: f64) {
+        self.frequencies.push(freq);
+    }
+}
+
+/// SAR (Specific Absorption Rate) field processing.
+/// Mirrors the C++ `ProcessFieldsSAR` concept (SAR-Local, SAR-1G, SAR-10G dumps).
+#[allow(dead_code)]
+pub struct ProcessFieldsSAR {
+    name: String,
+    processing_name: String,
+    start: [f64; 3],
+    stop: [f64; 3],
+    dump_type: i32, // SAR_LOCAL_DUMP=20, SAR_1G_DUMP=21, SAR_10G_DUMP=22
+    file_type: i32,
+    mass_density: f64,
+}
+
+impl ProcessFieldsSAR {
+    pub fn new(name: &str, start: [f64; 3], stop: [f64; 3]) -> Self {
+        Self {
+            name: name.to_string(),
+            processing_name: "SAR field processing".to_string(),
+            start,
+            stop,
+            dump_type: 20, // SAR_LOCAL_DUMP
+            file_type: 1,  // VTK_FILETYPE
+            mass_density: 1000.0, // kg/m^3 (water)
+        }
+    }
+
+    pub fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    pub fn get_dump_type(&self) -> i32 {
+        self.dump_type
+    }
+
+    pub fn get_file_type(&self) -> i32 {
+        self.file_type
+    }
+
+    pub fn get_mass_density(&self) -> f64 {
+        self.mass_density
+    }
+
+    pub fn set_dump_type(&mut self, val: i32) {
+        self.dump_type = val;
+    }
+
+    pub fn set_file_type(&mut self, val: i32) {
+        self.file_type = val;
+    }
+
+    pub fn set_mass_density(&mut self, val: f64) {
+        self.mass_density = val;
+    }
+
+    pub fn need_conductivity(&self) -> bool {
+        true
+    }
+
+    pub fn need_permittivity(&self) -> bool {
+        false
+    }
+
+    pub fn need_permeability(&self) -> bool {
+        false
+    }
+
+    pub fn calc_total_energy_estimate(&self) -> f64 {
+        0.0
+    }
+}
+
+impl Processing for ProcessFieldsSAR {
+    fn get_name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn set_name(&mut self, val: &str) {
+        self.name = val.to_string();
+    }
+
+    fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    fn set_process_interval(&mut self, _interval: u32) {}
+
+    fn get_process_interval(&self) -> u32 {
+        0
+    }
+}
+
+/// Mode matching processing.
+/// Mirrors the C++ `ProcessModeMatch` concept (modal decomposition at ports).
+#[allow(dead_code)]
+pub struct ProcessModeMatch {
+    name: String,
+    processing_name: String,
+    start: [f64; 3],
+    stop: [f64; 3],
+    normal_dir: i32,
+    num_modes: u32,
+    frequencies: Vec<f64>,
+}
+
+impl ProcessModeMatch {
+    pub fn new(name: &str, start: [f64; 3], stop: [f64; 3], normal_dir: i32) -> Self {
+        Self {
+            name: name.to_string(),
+            processing_name: "mode match".to_string(),
+            start,
+            stop,
+            normal_dir,
+            num_modes: 1,
+            frequencies: Vec::new(),
+        }
+    }
+
+    pub fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    pub fn get_normal_dir(&self) -> i32 {
+        self.normal_dir
+    }
+
+    pub fn get_num_modes(&self) -> u32 {
+        self.num_modes
+    }
+
+    pub fn set_num_modes(&mut self, n: u32) {
+        self.num_modes = n;
+    }
+
+    pub fn add_frequency(&mut self, freq: f64) {
+        self.frequencies.push(freq);
+    }
+
+    pub fn get_frequencies(&self) -> &[f64] {
+        &self.frequencies
+    }
+}
+
+impl Processing for ProcessModeMatch {
+    fn get_name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn set_name(&mut self, val: &str) {
+        self.name = val.to_string();
+    }
+
+    fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    fn set_process_interval(&mut self, _interval: u32) {}
+
+    fn get_process_interval(&self) -> u32 {
+        0
+    }
+}
+
+/// Near-field to far-field transformation.
+/// Mirrors the C++ NF2FF post-processing concept.
+#[allow(dead_code)]
+pub struct NF2FF {
+    name: String,
+    processing_name: String,
+    start: [f64; 3],
+    stop: [f64; 3],
+    center: [f64; 3],
+    radius: f64,
+    frequencies: Vec<f64>,
+}
+
+impl NF2FF {
+    pub fn new(name: &str, start: [f64; 3], stop: [f64; 3]) -> Self {
+        Self {
+            name: name.to_string(),
+            processing_name: "near-field to far-field".to_string(),
+            start,
+            stop,
+            center: [0.0, 0.0, 0.0],
+            radius: 0.0,
+            frequencies: Vec::new(),
+        }
+    }
+
+    pub fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    pub fn set_center(&mut self, center: [f64; 3]) {
+        self.center = center;
+    }
+
+    pub fn set_radius(&mut self, radius: f64) {
+        self.radius = radius;
+    }
+
+    pub fn add_frequency(&mut self, freq: f64) {
+        self.frequencies.push(freq);
+    }
+
+    pub fn get_frequencies(&self) -> &[f64] {
+        &self.frequencies
+    }
+}
+
+impl Processing for NF2FF {
+    fn get_name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn set_name(&mut self, val: &str) {
+        self.name = val.to_string();
+    }
+
+    fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    fn set_process_interval(&mut self, _interval: u32) {}
+
+    fn get_process_interval(&self) -> u32 {
+        0
+    }
+}
+
+/// SAR calculation processing (standalone SAR, not field-dump based).
+/// Mirrors the C++ SAR post-processing concept.
+#[allow(dead_code)]
+pub struct SAR {
+    name: String,
+    processing_name: String,
+    start: [f64; 3],
+    stop: [f64; 3],
+    mass_density: f64,
+    averaging_cube: f64, // 1g or 10g averaging cube side length
+}
+
+impl SAR {
+    pub fn new(name: &str, start: [f64; 3], stop: [f64; 3]) -> Self {
+        Self {
+            name: name.to_string(),
+            processing_name: "SAR calculation".to_string(),
+            start,
+            stop,
+            mass_density: 1000.0,
+            averaging_cube: 0.0,
+        }
+    }
+
+    pub fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    pub fn get_mass_density(&self) -> f64 {
+        self.mass_density
+    }
+
+    pub fn get_averaging_cube(&self) -> f64 {
+        self.averaging_cube
+    }
+
+    pub fn set_mass_density(&mut self, val: f64) {
+        self.mass_density = val;
+    }
+
+    pub fn set_averaging_cube(&mut self, val: f64) {
+        self.averaging_cube = val;
+    }
+
+    pub fn need_conductivity(&self) -> bool {
+        true
+    }
+
+    pub fn need_permittivity(&self) -> bool {
+        false
+    }
+
+    pub fn need_permeability(&self) -> bool {
+        false
+    }
+}
+
+impl Processing for SAR {
+    fn get_name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn set_name(&mut self, val: &str) {
+        self.name = val.to_string();
+    }
+
+    fn get_processing_name(&self) -> String {
+        self.processing_name.clone()
+    }
+
+    fn set_process_interval(&mut self, _interval: u32) {}
+
+    fn get_process_interval(&self) -> u32 {
+        0
+    }
+}
+
+/// HDF5 file writer for field dumps.
+/// Mirrors the C++ `HDF5_File_Writer` concept.
+#[allow(dead_code)]
+pub struct HDF5FileWriter {
+    filename: String,
+    precision: u32,
+}
+
+impl HDF5FileWriter {
+    pub fn new(filename: &str) -> Self {
+        Self {
+            filename: filename.to_string(),
+            precision: 12,
+        }
+    }
+
+    pub fn get_filename(&self) -> &str {
+        &self.filename
+    }
+
+    pub fn set_precision(&mut self, val: u32) {
+        self.precision = val;
+    }
+
+    pub fn get_precision(&self) -> u32 {
+        self.precision
+    }
+
+    /// Write field data to HDF5 file (placeholder: no-op).
+    pub fn write_field(&self, _field_name: &str, _data: &[f64]) {
+        // Placeholder: HDF5 backend not yet linked.
+    }
+}
+
+/// VTK file writer for field dumps.
+/// Mirrors the C++ `VTK_File_Writer` concept.
+#[allow(dead_code)]
+pub struct VTKFileWriter {
+    filename_prefix: String,
+    precision: u32,
+}
+
+impl VTKFileWriter {
+    pub fn new(filename_prefix: &str) -> Self {
+        Self {
+            filename_prefix: filename_prefix.to_string(),
+            precision: 12,
+        }
+    }
+
+    pub fn get_filename_prefix(&self) -> &str {
+        &self.filename_prefix
+    }
+
+    pub fn set_precision(&mut self, val: u32) {
+        self.precision = val;
+    }
+
+    pub fn get_precision(&self) -> u32 {
+        self.precision
+    }
+
+    /// Write field data to VTK file (placeholder: no-op).
+    pub fn write_field(&self, _field_name: &str, _data: &[f64]) {
+        // Placeholder: VTK backend not yet linked.
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1118,5 +1721,136 @@ mod tests {
         assert_eq!(proc.get_weight(), 1.0);
         assert_eq!(proc.get_precision(), 12);
         assert_eq!(proc.get_mesh_type(), MeshType::Cartesian);
+    }
+
+    #[test]
+    fn test_process_fields_td_creation() {
+        let td = ProcessFieldsTD::new("td_dump", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        assert_eq!(td.get_processing_name(), "time-domain field dump");
+        assert_eq!(td.get_dump_type(), 0); // E_FIELD_DUMP
+        assert_eq!(td.get_file_type(), 1); // VTK_FILETYPE
+        assert!(td.need_conductivity());
+        assert!(td.need_permittivity());
+        assert!(td.need_permeability());
+    }
+
+    #[test]
+    fn test_process_fields_td_dump_type() {
+        let mut td = ProcessFieldsTD::new("td_dump", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        td.set_dump_type(1); // H_FIELD_DUMP
+        assert_eq!(td.get_dump_type(), 1);
+    }
+
+    #[test]
+    fn test_process_fields_fd_creation() {
+        let fd = ProcessFieldsFD::new("fd_dump", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        assert_eq!(fd.get_processing_name(), "frequency-domain field dump");
+        assert_eq!(fd.get_fd_oversampling(), 4);
+        assert_eq!(fd.get_frequencies().len(), 0);
+    }
+
+    #[test]
+    fn test_process_fields_fd_frequency() {
+        let mut fd = ProcessFieldsFD::new("fd_dump", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        fd.add_frequency(1.0e9);
+        fd.add_frequency(2.0e9);
+        assert_eq!(fd.get_frequencies(), &[1.0e9, 2.0e9]);
+        fd.set_fd_oversampling(8);
+        assert_eq!(fd.get_fd_oversampling(), 8);
+    }
+
+    #[test]
+    fn test_process_fields_sar_creation() {
+        let sar = ProcessFieldsSAR::new("sar_dump", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        assert_eq!(sar.get_processing_name(), "SAR field processing");
+        assert_eq!(sar.get_dump_type(), 20); // SAR_LOCAL_DUMP
+        assert!((sar.get_mass_density() - 1000.0).abs() < 1e-12);
+        assert!(sar.need_conductivity());
+        assert!(!sar.need_permittivity());
+        assert!(!sar.need_permeability());
+    }
+
+    #[test]
+    fn test_process_fields_sar_density() {
+        let mut sar = ProcessFieldsSAR::new("sar_dump", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        sar.set_mass_density(1050.0);
+        assert!((sar.get_mass_density() - 1050.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_process_mode_match_creation() {
+        let mm = ProcessModeMatch::new("mm", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], 0);
+        assert_eq!(mm.get_processing_name(), "mode match");
+        assert_eq!(mm.get_normal_dir(), 0);
+        assert_eq!(mm.get_num_modes(), 1);
+    }
+
+    #[test]
+    fn test_process_mode_match_modes() {
+        let mut mm = ProcessModeMatch::new("mm", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], 0);
+        mm.set_num_modes(3);
+        mm.add_frequency(1.0e9);
+        mm.add_frequency(2.0e9);
+        assert_eq!(mm.get_num_modes(), 3);
+        assert_eq!(mm.get_frequencies(), &[1.0e9, 2.0e9]);
+    }
+
+    #[test]
+    fn test_nf2ff_creation() {
+        let nf2ff = NF2FF::new("nf2ff", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        assert_eq!(nf2ff.get_processing_name(), "near-field to far-field");
+        assert_eq!(nf2ff.center, [0.0, 0.0, 0.0]);
+        assert_eq!(nf2ff.radius, 0.0);
+    }
+
+    #[test]
+    fn test_nf2ff_center_radius() {
+        let mut nf2ff = NF2FF::new("nf2ff", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        nf2ff.set_center([0.5, 0.5, 0.5]);
+        nf2ff.set_radius(2.0);
+        nf2ff.add_frequency(1.0e9);
+        assert_eq!(nf2ff.center, [0.5, 0.5, 0.5]);
+        assert_eq!(nf2ff.radius, 2.0);
+        assert_eq!(nf2ff.get_frequencies(), &[1.0e9]);
+    }
+
+    #[test]
+    fn test_sar_creation() {
+        let sar = SAR::new("sar", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        assert_eq!(sar.get_processing_name(), "SAR calculation");
+        assert!((sar.get_mass_density() - 1000.0).abs() < 1e-12);
+        assert_eq!(sar.get_averaging_cube(), 0.0);
+        assert!(sar.need_conductivity());
+        assert!(!sar.need_permittivity());
+        assert!(!sar.need_permeability());
+    }
+
+    #[test]
+    fn test_sar_averaging_cube() {
+        let mut sar = SAR::new("sar", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        sar.set_averaging_cube(0.022); // 1g cube ~22mm
+        assert!((sar.get_averaging_cube() - 0.022).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_hdf5_file_writer() {
+        let mut writer = HDF5FileWriter::new("output.h5");
+        assert_eq!(writer.get_filename(), "output.h5");
+        assert_eq!(writer.get_precision(), 12);
+        writer.set_precision(6);
+        assert_eq!(writer.get_precision(), 6);
+        // write_field should not panic (placeholder).
+        writer.write_field("E-Field", &[1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_vtk_file_writer() {
+        let mut writer = VTKFileWriter::new("output");
+        assert_eq!(writer.get_filename_prefix(), "output");
+        assert_eq!(writer.get_precision(), 12);
+        writer.set_precision(6);
+        assert_eq!(writer.get_precision(), 6);
+        // write_field should not panic (placeholder).
+        writer.write_field("E-Field", &[1.0, 2.0, 3.0]);
     }
 }

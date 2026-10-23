@@ -5,6 +5,7 @@ use crate::engine::Engine;
 use crate::excitation::Excitation;
 use crate::operator::Operator;
 use crate::operator_base::OperatorBase;
+use crate::processing::{Processing, ProcessingArray};
 
 /// Boundary condition types (mirroring C++).
 pub const BC_PEC: i32 = 0;
@@ -37,6 +38,9 @@ pub struct OpenEMS {
     /// `Operator::load_csx()` to populate the grid, materials, boundary
     /// conditions and per-cell materials.
     pub csx_xml: Option<String>,
+    /// Post-processing array (probes, field dumps, SAR, etc.).
+    /// Wired into the `run_fdtd()` time-stepping loop.
+    pub processing_array: Option<ProcessingArray>,
 }
 
 impl OpenEMS {
@@ -61,6 +65,7 @@ impl OpenEMS {
             time_step_factor: 1.0,
             abort: false,
             csx_xml: None,
+            processing_array: None,
         }
     }
 
@@ -215,6 +220,16 @@ impl OpenEMS {
         self.csx_xml = None;
     }
 
+    /// Add a processing object (probe, field dump, SAR, etc.) to the
+    /// post-processing array. The array is wired into the `run_fdtd()`
+    /// time-stepping loop.
+    pub fn add_processing(&mut self, proc: Box<dyn Processing>) {
+        if self.processing_array.is_none() {
+            self.processing_array = Some(ProcessingArray::new(u32::MAX));
+        }
+        self.processing_array.as_mut().unwrap().add_processing(proc);
+    }
+
     /// Set the number of threads for multithreaded engine.
     pub fn set_number_of_threads(&mut self, val: i32) {
         let _ = val; // stored for future multithreaded engine support
@@ -327,6 +342,11 @@ impl OpenEMS {
             return false;
         }
 
+        // Invoke PreProcess on all registered processings.
+        if let Some(ref mut pa) = self.processing_array {
+            pa.pre_process();
+        }
+
         let nr_ts = self.nr_ts;
         let end_crit = self.end_crit;
 
@@ -338,6 +358,11 @@ impl OpenEMS {
             self.fdtd_eng.as_mut().unwrap().iterate_ts(1);
             ts = self.fdtd_eng.as_ref().unwrap().get_number_of_timesteps();
 
+            // Invoke Process on all registered processings.
+            if let Some(ref mut pa) = self.processing_array {
+                pa.process(ts);
+            }
+
             // Check steady-state end criteria.
             if let Some(diff) = self.fdtd_eng.as_ref().unwrap().get_steady_state_diff() {
                 change = diff as f64;
@@ -347,6 +372,11 @@ impl OpenEMS {
             if ts.is_multiple_of(100) {
                 println!("[openEMS] Timestep: {}", ts);
             }
+        }
+
+        // Invoke PostProcess on all registered processings.
+        if let Some(ref mut pa) = self.processing_array {
+            pa.post_process();
         }
 
         if change > end_crit {
@@ -436,5 +466,13 @@ mod tests {
     fn test_run_without_setup() {
         let mut sim = OpenEMS::new();
         assert!(!sim.run_fdtd());
+    }
+
+    #[test]
+    fn test_add_processing() {
+        use crate::processing::FieldProbe;
+        let mut sim = OpenEMS::new();
+        sim.add_processing(Box::new(FieldProbe::new("probe1", [0.0, 0.0, 0.0])));
+        assert!(sim.processing_array.is_some());
     }
 }
