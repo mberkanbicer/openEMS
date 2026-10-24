@@ -394,3 +394,32 @@ mod tests {
         assert_eq!(extension.priority(), ENG_EXT_PRIO_UPML);
     }
 }
+
+/// Conducting-sheet ADE model (`Operator_Ext_ConductingSheet`).
+pub struct ConductingSheetOperatorExtension {
+    /// Highest frequency of interest, used to select the approximation band.
+    pub f_max: f64,
+    /// Boundary-layer sizes per face; edges inside them fall back to PEC.
+    pub boundary_size: [u32; 6],
+}
+
+impl OperatorExtension for ConductingSheetOperatorExtension {
+    fn name(&self) -> &'static str {
+        "ConductingSheet"
+    }
+
+    fn priority(&self) -> i32 {
+        ENG_EXT_PRIO_DEFAULT
+    }
+
+    fn build(
+        &mut self,
+        operator: &mut Operator,
+    ) -> Result<Vec<Box<dyn EngineExtension>>, String> {
+        Ok(operator
+            .build_conducting_sheet_extension(self.f_max, self.boundary_size)?
+            .into_iter()
+            .map(|extension| Box::new(extension) as Box<dyn EngineExtension>)
+            .collect())
+    }
+}

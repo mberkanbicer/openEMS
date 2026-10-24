@@ -6,8 +6,8 @@ use crate::excitation::Excitation;
 use crate::operator::Operator;
 use crate::operator_base::OperatorBase;
 use crate::operator_extension::{
-    ExcitationOperatorExtension, MurOperatorExtension, OperatorExtensionRegistry,
-    SteadyStateOperatorExtension, UpmlOperatorExtension,
+    ConductingSheetOperatorExtension, ExcitationOperatorExtension, MurOperatorExtension,
+    OperatorExtensionRegistry, SteadyStateOperatorExtension, UpmlOperatorExtension,
 };
 use crate::processing::{
     EngineInterface, EngineMeta, Processing, ProcessingArray,
@@ -453,6 +453,34 @@ impl OpenEMS {
                 pml_size: self.pml_size,
             }));
         }
+        // Conducting sheets need the boundary-layer sizes: edges inside a Mur
+        // or PML layer fall back to PEC, as in the native operator.
+        let has_conducting_sheet = op.structure.as_ref().is_some_and(|structure| {
+            (0..structure.property_count()).any(|index| {
+                structure
+                    .property_by_index(index)
+                    .is_some_and(|property| property.conducting_sheet().is_some())
+            })
+        });
+        if has_conducting_sheet {
+            let mut boundary_size = [0u32; 6];
+            for face in 0..6 {
+                if op.base.m_bc[face] == BC_PML {
+                    boundary_size[face] = self.pml_size[face];
+                } else if op.base.m_bc[face] == BC_MUR {
+                    boundary_size[face] = 1;
+                }
+            }
+            let f_max = self
+                .excitation
+                .as_ref()
+                .map(|signal| signal.f_max)
+                .unwrap_or(0.0);
+            registry.add(Box::new(ConductingSheetOperatorExtension {
+                f_max,
+                boundary_size,
+            }));
+        }
         registry.add(Box::new(MurOperatorExtension {
             phase_velocity: self.mur_v_ph,
         }));
@@ -748,7 +776,7 @@ mod tests {
             <Properties>
                 <Excitation Name="exc" Number="0" Enabled="1" Frequency="1e9" Delay="0" Type="0" Excite="1,0,0">
                     <Primitives>
-                        <Box Priority="1"><P1 X="5" Y="5" Z="5"/><P2 X="5" Y="6" Z="6"/></Box>
+                        <Box Priority="1"><P1 X="5" Y="5" Z="5"/><P2 X="6" Y="6" Z="6"/></Box>
                     </Primitives>
                 </Excitation>
             </Properties>
@@ -1046,7 +1074,7 @@ mod steady_state_wiring_tests {
                 <Properties>
                     <Excitation Number="0" Enabled="1" Frequency="5e9" Delay="0" Type="0" Excite="1,0,0" PropDir="0,0,0">
                         <Primitives>
-                            <Box Priority="0"><P1 X="10" Y="10" Z="10"/><P2 X="10" Y="11" Z="11"/></Box>
+                            <Box Priority="0"><P1 X="10" Y="10" Z="10"/><P2 X="11" Y="11" Z="11"/></Box>
                         </Primitives>
                     </Excitation>
                 </Properties>

@@ -5,11 +5,13 @@ use crate::array_nijk::FieldArray;
 use crate::constants::{C0, EPS0, FDTD_FLOAT, MU0, Z0};
 use crate::excitation::Excitation;
 use crate::extensions::{
-    EngineExtExcitation, EngineExtMurABC, EngineExtSteadyState, EngineExtUPML,
+    ConductingSheetCoeffs, EngineExtConductingSheet, EngineExtExcitation, EngineExtMurABC,
+    EngineExtSteadyState, EngineExtUPML,
 };
 use crate::operator_base::OperatorBase;
-use csxcad_core::material::{ExcitationProperties, MaterialField};
+use csxcad_core::material::{ConductingSheetProperties, ExcitationProperties, MaterialField};
 use csxcad_core::model::{Primitive, PropertyType};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Per-cell material properties for material averaging.
@@ -466,7 +468,7 @@ impl Operator {
                                 loc[n] -= 1;
                             }
                             let width =
-                                edge_length_value(&disc_lines, counts, n, loc, true, 1.0);
+                                edge_length_value(&disc_lines, counts, n, loc, false, 1.0);
                             if width <= 0.0 {
                                 continue;
                             }
@@ -1308,6 +1310,232 @@ impl Operator {
         extension
     }
 
+    /// Build the conducting-sheet extension from the CSX `ConductingSheet`
+    /// properties.
+    ///
+    /// Mirrors `Operator_Ext_ConductingSheet::BuildExtension`: every Yee edge
+    /// inside a two-dimensional sheet primitive gets the ADE model, edges inside
+    /// a boundary layer or a non-2D primitive fall back to PEC, and edges sharing
+    /// their width with a non-sheet cell get the native `factor = 2`.
+    pub fn build_conducting_sheet_extension(
+        &mut self,
+        f_max: f64,
+        boundary_size: [u32; 6],
+    ) -> Result<Option<EngineExtConductingSheet>, String> {
+        let Some(structure) = self.structure.as_ref() else {
+            return Ok(None);
+        };
+        let params = structure.parameters();
+
+        struct SheetCandidate<'a> {
+            priority: i32,
+            properties: &'a ConductingSheetProperties,
+            primitive: &'a Primitive,
+        }
+        let mut candidates: Vec<SheetCandidate<'_>> = Vec::new();
+        for index in 0..structure.property_count() {
+            let Some(property) = structure.property_by_index(index) else {
+                continue;
+            };
+            let Some(sheet) = property.conducting_sheet() else {
+                continue;
+            };
+            for primitive in property.primitives() {
+                candidates.push(SheetCandidate {
+                    priority: primitive.priority(),
+                    properties: sheet,
+                    primitive,
+                });
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let sheet_at = |coordinate: [f64; 3]| -> Option<&SheetCandidate<'_>> {
+            let mut winner: Option<&SheetCandidate<'_>> = None;
+            let mut winner_priority = i32::MIN;
+            for candidate in &candidates {
+                if winner.is_some() && candidate.priority <= winner_priority {
+                    continue;
+                }
+                if candidate
+                    .primitive
+                    .is_inside(coordinate, Some(params))
+                    .unwrap_or(false)
+                {
+                    winner = Some(candidate);
+                    winner_priority = candidate.priority;
+                }
+            }
+            winner
+        };
+
+        let counts = self.base.num_lines;
+        let disc_lines = self.base.disc_lines.clone();
+        let grid_delta = self.base.grid_delta;
+        let dt = self.base.d_t;
+        if dt <= 0.0 {
+            return Err("conducting sheet requires a positive timestep".to_string());
+        }
+        let nx = counts[0] as usize;
+        let ny = counts[1] as usize;
+        let nz = counts[2] as usize;
+
+        // Upper triangular bookkeeping: for every position, which edge
+        // directions carry a sheet and along which tangential direction.
+        let mut tan_dir: HashMap<[usize; 3], [i8; 3]> = HashMap::new();
+        let mut active: Vec<[usize; 3]> = Vec::new();
+        let mut vv = self.vv_ptr.as_mut().ok_or("vv coefficients not allocated")?;
+        let mut vi = self.vi_ptr.as_mut().ok_or("vi coefficients not allocated")?;
+
+        for i in 0..nx {
+            for j in 0..ny {
+                for k in 0..nz {
+                    let pos = [i, j, k];
+                    let disabled = (0..3).any(|axis| {
+                        pos[axis] <= boundary_size[2 * axis] as usize
+                            || pos[axis]
+                                >= counts[axis] as usize
+                                    - boundary_size[2 * axis + 1] as usize
+                                    - 1
+                    });
+                    let mut local = [-1i8; 3];
+                    let mut any = false;
+                    for n in 0..3 {
+                        let coordinate = yee_coordinates(&disc_lines, counts, n, pos, false);
+                        let Some(candidate) = sheet_at(coordinate) else {
+                            continue;
+                        };
+                        let sigma = candidate
+                            .properties
+                            .conductivity(Some(params))
+                            .unwrap_or(0.0);
+                        let thickness = candidate
+                            .properties
+                            .thickness(Some(params))
+                            .unwrap_or(0.0);
+                        let bounds = candidate
+                            .primitive
+                            .bounding_box(Some(params), false)
+                            .unwrap_or([0.0; 6]);
+                        let dimension = candidate
+                            .primitive
+                            .dimension(Some(params))
+                            .unwrap_or(0);
+                        if disabled
+                            || dimension != 2
+                            || sigma <= 0.0
+                            || thickness <= 0.0
+                        {
+                            // Native fallback: this edge becomes PEC.
+                            *vv.get_mut(n, i, j, k) = 0.0;
+                            *vi.get_mut(n, i, j, k) = 0.0;
+                            local[n] = -1;
+                            continue;
+                        }
+                        let n_p = (n + 1) % 3;
+                        let n_pp = (n + 2) % 3;
+                        let mut direction = -1i8;
+                        if bounds[2 * n_p] != bounds[2 * n_p + 1] {
+                            direction = n_p as i8;
+                        }
+                        if bounds[2 * n_pp] != bounds[2 * n_pp + 1] {
+                            direction = n_pp as i8;
+                        }
+                        if direction >= 0 {
+                            local[n] = direction;
+                            any = true;
+                        }
+                    }
+                    if any {
+                        tan_dir.insert(pos, local);
+                        active.push(pos);
+                    }
+                }
+            }
+        }
+
+        if active.is_empty() {
+            return Ok(None);
+        }
+
+        let mut extension = EngineExtConductingSheet::new(active.len());
+        for (index, &pos) in active.iter().enumerate() {
+            let directions = tan_dir.get(&pos).copied().unwrap_or([-1; 3]);
+            let mut coefficients = ConductingSheetCoeffs {
+                v_int_ade: [[0.0; 3]; 2],
+                v_ext_ade: [[0.0; 3]; 2],
+                vv: [0.0; 3],
+                vi: [0.0; 3],
+            };
+            for n in 0..3 {
+                let coordinate = yee_coordinates(&disc_lines, counts, n, pos, false);
+                let Some(candidate) = sheet_at(coordinate) else {
+                    continue;
+                };
+                let direction = directions[n];
+                if direction < 0 {
+                    continue;
+                }
+                let t_dir = direction as usize;
+                let sigma = candidate
+                    .properties
+                    .conductivity(Some(params))
+                    .unwrap_or(0.0);
+                let thickness = candidate
+                    .properties
+                    .thickness(Some(params))
+                    .unwrap_or(0.0);
+                let edge_length =
+                    edge_length_value(&disc_lines, counts, n, pos, false, grid_delta);
+                let node_width =
+                    edge_length_value(&disc_lines, counts, t_dir, pos, true, grid_delta);
+                if edge_length <= 0.0 || node_width <= 0.0 {
+                    continue;
+                }
+                // Native `factor`: 2 when the neighbouring cell along the
+                // tangential direction does not also carry a sheet.
+                let mut factor = 1.0;
+                let current = tan_dir.get(&pos).map(|map| map[t_dir]).unwrap_or(-1);
+                if current < 0 {
+                    factor = 2.0;
+                }
+                let mut neighbour = pos;
+                if neighbour[t_dir] > 0 {
+                    neighbour[t_dir] -= 1;
+                    let previous = tan_dir
+                        .get(&neighbour)
+                        .map(|map| map[t_dir])
+                        .unwrap_or(-1);
+                    if previous < 0 {
+                        factor = 2.0;
+                    }
+                } else {
+                    factor = 2.0;
+                }
+
+                let model = crate::conducting_sheet::sheet_coefficients(
+                    sigma,
+                    thickness,
+                    dt,
+                    f_max,
+                    edge_length / node_width,
+                    factor,
+                )?;
+                coefficients.vv[n] = model.vv as f32;
+                coefficients.vi[n] = model.vi as f32;
+                for order in 0..2 {
+                    coefficients.v_int_ade[order][n] = model.v_int_ade[order] as f32;
+                    coefficients.v_ext_ade[order][n] = model.v_ext_ade[order] as f32;
+                }
+                *vv.get_mut(n, pos[0], pos[1], pos[2]) = model.vv as f32;
+                *vi.get_mut(n, pos[0], pos[1], pos[2]) = model.vi as f32;
+            }
+            extension.set_position(index, pos, &coefficients);
+        }
+        Ok(Some(extension))
+    }
+
     /// Build the steady-state detection extension with the native probe layout:
     /// the centre plus the quarter and three-quarter positions along each axis,
     /// all three E components.
@@ -1744,7 +1972,9 @@ fn yee_coordinates(
 ) -> [f64; 3] {
     let mut coordinates = [0.0; 3];
     for d in 0..3 {
-        let use_dual = if d == n { dual } else { !dual };
+        // Native `GetYeeCoords`: transverse axes use the requested mesh
+        // (`dualMesh`), the edge axis uses the opposite one.
+        let use_dual = if d == n { !dual } else { dual };
         coordinates[d] = disc_line_value(&lines[d], counts[d] as usize, pos[d], use_dual);
     }
     coordinates
@@ -1779,8 +2009,10 @@ fn edge_area_value(
     }
     let n_p = (n + 1) % 3;
     let n_pp = (n + 2) % 3;
-    edge_length_value(lines, counts, n_p, pos, dual, grid_delta)
-        * edge_length_value(lines, counts, n_pp, pos, dual, grid_delta)
+    // Native `GetNodeArea` uses `GetNodeWidth(axis, pos, dual)` which is
+    // `GetEdgeLength(axis, pos, !dual)`.
+    edge_length_value(lines, counts, n_p, pos, !dual, grid_delta)
+        * edge_length_value(lines, counts, n_pp, pos, !dual, grid_delta)
 }
 
 
@@ -2608,9 +2840,9 @@ mod timestep_tests {
     fn var3_is_larger_than_var1_on_a_nonuniform_mesh() {
         let xml = r#"<ContinuousStructure CoordSystem="0">
             <RectilinearGrid DeltaUnit="0.001">
-                <XLines>0,1,1.2,3,6</XLines>
-                <YLines>0,0.5,1,2.5,5</YLines>
-                <ZLines>0,2,2.1,2.2,4</ZLines>
+                <XLines>0,1,1.5,3,6</XLines>
+                <YLines>0,0.6,1.2,2.5,5</YLines>
+                <ZLines>0,2,2.4,2.8,4</ZLines>
             </RectilinearGrid>
             <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
             <Properties></Properties>
@@ -2718,5 +2950,180 @@ mod steady_state_layout_tests {
         assert_eq!(extension.probe_positions()[9], [4, 2, 4]);
         // z three-quarter probe (last group, first component).
         assert_eq!(extension.probe_positions()[18], [4, 4, 6]);
+    }
+}
+
+#[cfg(test)]
+mod conducting_sheet_tests {
+    use super::*;
+
+    fn mesh_with_sheet(box_bounds: &str) -> String {
+        let lines: Vec<String> = (0..11).map(|index| index.to_string()).collect();
+        let joined = lines.join(",");
+        format!(
+            r#"<ContinuousStructure CoordSystem="0">
+                <RectilinearGrid DeltaUnit="0.001">
+                    <XLines>{joined}</XLines>
+                    <YLines>{joined}</YLines>
+                    <ZLines>{joined}</ZLines>
+                </RectilinearGrid>
+                <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                <Properties>
+                    <ConductingSheet Name="sheet" Conductivity="1e5" Thickness="35e-6">
+                        <Primitives>{box_bounds}</Primitives>
+                    </ConductingSheet>
+                </Properties>
+            </ContinuousStructure>"#
+        )
+    }
+
+    #[test]
+    fn two_dimensional_sheet_gets_the_ade_model() {
+        let xml = mesh_with_sheet(
+            r#"<Box Priority="1"><P1 X="5" Y="-1" Z="-1"/><P2 X="5" Y="12" Z="12"/></Box>"#,
+        );
+        let mut op = Operator::new();
+        op.load_csx(&xml).expect("sheet CSX should load");
+        op.base.d_t = 1.0e-12;
+        op.calc_ec_operator();
+
+        let extension = op
+            .build_conducting_sheet_extension(10.0e9, [0; 6])
+            .expect("sheet model should build")
+            .expect("the sheet must be active");
+        assert!(extension.num_positions > 0);
+        // Tangential E edges on the sheet plane are modified; the normal
+        // component keeps its vacuum update coefficient.
+        let vv = op.vv_ptr.as_ref().unwrap();
+        let tangential = *vv.get(2, 5, 5, 5);
+        let normal = *vv.get(0, 5, 5, 5);
+        assert!(
+            tangential < 0.999_9,
+            "tangential vv should include the sheet loss, got {tangential}"
+        );
+        assert!(
+            normal > 0.999,
+            "the normal edge is not on the sheet, got {normal}"
+        );
+        // The extension carries finite ADE coefficients.
+        for order in 0..2 {
+            let coefficient = extension.v_int_ade[order][2][0];
+            assert!(coefficient.is_finite() && coefficient.abs() < 1.0);
+        }
+    }
+
+    #[test]
+    fn volume_primitive_falls_back_to_pec_and_is_not_registered() {
+        let xml = mesh_with_sheet(
+            r#"<Box Priority="1"><P1 X="4" Y="0" Z="0"/><P2 X="6" Y="10" Z="10"/></Box>"#,
+        );
+        let mut op = Operator::new();
+        op.load_csx(&xml).expect("sheet CSX should load");
+        op.base.d_t = 1.0e-12;
+        op.calc_ec_operator();
+        let extension = op
+            .build_conducting_sheet_extension(10.0e9, [0; 6])
+            .expect("the model must not error");
+        eprintln!(
+            "3d extension positions: {:?}",
+            extension.as_ref().map(|e| e.num_positions)
+        );
+        assert!(extension.is_none(), "3-D primitives are not sheets");
+        let vv = op.vv_ptr.as_ref().unwrap();
+        assert_eq!(*vv.get(2, 5, 5, 5), 0.0, "fallback edges become PEC");
+    }
+
+    #[test]
+    fn boundary_layer_edges_fall_back_to_pec() {
+        let xml = mesh_with_sheet(
+            r#"<Box Priority="1"><P1 X="5" Y="-1" Z="-1"/><P2 X="5" Y="12" Z="12"/></Box>"#,
+        );
+        let mut op = Operator::new();
+        op.load_csx(&xml).expect("sheet CSX should load");
+        op.base.d_t = 1.0e-12;
+        op.calc_ec_operator();
+        // A 5-cell boundary layer covers x = 5 (0..5 and 5..10).
+        let extension = op
+            .build_conducting_sheet_extension(10.0e9, [5, 5, 0, 0, 0, 0])
+            .expect("the model must not error");
+        eprintln!(
+            "layer extension positions: {:?}",
+            extension.as_ref().map(|e| e.num_positions)
+        );
+        assert!(extension.is_none(), "edges inside the layer are disabled");
+        let vv = op.vv_ptr.as_ref().unwrap();
+        assert_eq!(*vv.get(2, 5, 5, 5), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod yee_convention_tests {
+    use super::*;
+
+    fn lines(values: [&[f64]; 3]) -> ([Option<Vec<f64>>; 3], [u32; 3]) {
+        (
+            [
+                Some(values[0].to_vec()),
+                Some(values[1].to_vec()),
+                Some(values[2].to_vec()),
+            ],
+            [
+                values[0].len() as u32,
+                values[1].len() as u32,
+                values[2].len() as u32,
+            ],
+        )
+    }
+
+    #[test]
+    fn yee_coordinates_use_nodes_transverse_and_dual_along_the_edge() {
+        // Non-uniform mesh so node and dual positions are distinguishable.
+        let x: &[f64] = &[0.0, 1.0, 3.0];
+        let y: &[f64] = &[0.0, 3.0, 7.0];
+        let z: &[f64] = &[0.0, 5.0, 11.0];
+        let (disc, counts) = lines([x, y, z]);
+
+        // E_y at (1,1,1): x and z are nodes, y is the dual midpoint.
+        let coordinate = yee_coordinates(&disc, counts, 1, [1, 1, 1], false);
+        assert_eq!(coordinate, [1.0, 5.0, 5.0]);
+
+        // The dual request swaps along/transverse.
+        let dual = yee_coordinates(&disc, counts, 1, [1, 1, 1], true);
+        assert_eq!(dual, [2.0, 3.0, 8.0]);
+    }
+
+    #[test]
+    fn capacitance_uses_the_dual_area_on_a_nonuniform_mesh() {
+        let x: &[f64] = &[0.0, 1.0, 3.0];
+        let y: &[f64] = &[0.0, 3.0, 7.0];
+        let z: &[f64] = &[0.0, 5.0, 11.0];
+        let (disc, counts) = lines([x, y, z]);
+        let mut op = Operator::new();
+        op.base.num_lines = counts;
+        op.base.disc_lines = disc;
+        op.base.grid_delta = 1.0e-3;
+
+        // Native `Calc_ECPos` at the interior position (1,1,1):
+        // C = eps * dual_y * dual_z / primary_x.
+        let dual_y = 3.5e-3;
+        let dual_z = 5.5e-3;
+        let primary_x = 2.0e-3;
+        let expected = EPS0 * dual_y * dual_z / primary_x;
+        let measured = op.get_ec_c(0, 1, 1, 1);
+        assert!(
+            (measured - expected).abs() / expected < 1e-12,
+            "C {measured:e} vs {expected:e}"
+        );
+
+        // L = mue * primary_y * primary_z / dual_x.
+        let primary_y = 4.0e-3;
+        let primary_z = 6.0e-3;
+        let dual_x = 1.5e-3;
+        let expected_l = MU0 * primary_y * primary_z / dual_x;
+        let measured_l = op.get_ec_l(0, 1, 1, 1);
+        assert!(
+            (measured_l - expected_l).abs() / expected_l < 1e-12,
+            "L {measured_l:e} vs {expected_l:e}"
+        );
     }
 }

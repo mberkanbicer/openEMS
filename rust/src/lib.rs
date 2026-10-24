@@ -13,6 +13,7 @@
 //! - `hdf5` — HDF5 field dump writer/reader (native-compatible layout)
 
 pub mod array_nijk;
+pub mod conducting_sheet;
 pub mod constants;
 pub mod engine;
 pub mod excitation;
