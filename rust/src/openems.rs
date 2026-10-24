@@ -5,9 +5,14 @@ use crate::engine::Engine;
 use crate::excitation::Excitation;
 use crate::operator::Operator;
 use crate::operator_base::OperatorBase;
+use crate::operator_extension::{
+    ExcitationOperatorExtension, MurOperatorExtension, OperatorExtensionRegistry,
+    SteadyStateOperatorExtension, UpmlOperatorExtension,
+};
 use crate::processing::{
     EngineInterface, EngineMeta, Processing, ProcessingArray,
 };
+use std::sync::Arc;
 
 /// Boundary condition types (mirroring C++).
 pub const BC_PEC: i32 = 0;
@@ -429,54 +434,41 @@ impl OpenEMS {
         op.apply_electric_bc();
         op.apply_magnetic_bc();
 
-        // UPML: build the layer coefficients and the matching engine extension
-        // for every PML face. `build_upml_extensions` modifies the main
-        // operator coefficients inside the layer, exactly like the native
-        // `Operator_Ext_UPML::BuildExtension`.
-        let mut upml_extensions = Vec::new();
-        if op.base.m_bc.iter().any(|&boundary| boundary == BC_PML) {
-            match op.build_upml_extensions(self.pml_size) {
-                Ok(extensions) => upml_extensions = extensions,
-                Err(error) => {
-                    eprintln!("[openEMS] Failed to build UPML: {error}");
-                    return false;
-                }
+        // Build every operator-side extension through one ordered registry,
+        // mirroring `Operator::AddExtension` + `BuildExtension`. Physics that
+        // needs to rewrite the operator happens here, after the boundary
+        // conditions and before the operator is moved into the engine.
+        let mut registry = OperatorExtensionRegistry::new();
+        if let Some(signal) = self.excitation.as_deref() {
+            let period = signal.signal_period();
+            if period > 0 {
+                registry.add(Box::new(SteadyStateOperatorExtension { period_ts: period }));
             }
+            registry.add(Box::new(ExcitationOperatorExtension {
+                signal: Arc::new(signal.clone()),
+            }));
         }
-
-        // Build the operator-side extension state before the operator is moved
-        // into the engine.
-        let mur_extension = op.build_mur_extension(self.mur_v_ph);
-        let excitation_extension = self
-            .excitation
-            .as_deref()
-            .map(|signal| op.build_excitation_extension(signal));
-        // Native `SetupFDTD`: periodic signals get steady-state detection.
-        let steady_state_extension = self
-            .excitation
-            .as_deref()
-            .map(|signal| signal.signal_period())
-            .filter(|&period| period > 0)
-            .and_then(|period| op.build_steady_state_extension(period));
+        if op.base.m_bc.iter().any(|&boundary| boundary == BC_PML) {
+            registry.add(Box::new(UpmlOperatorExtension {
+                pml_size: self.pml_size,
+            }));
+        }
+        registry.add(Box::new(MurOperatorExtension {
+            phase_velocity: self.mur_v_ph,
+        }));
+        let engine_extensions = match registry.build(&mut op) {
+            Ok(extensions) => extensions,
+            Err(error) => {
+                eprintln!("[openEMS] Failed to build an operator extension: {error}");
+                return false;
+            }
+        };
 
         // Box as trait object for the engine (unsizing coercion).
         let op_dyn: Box<dyn OperatorBase> = Box::new(op);
         let mut engine = Engine::new(op_dyn);
-        for extension in upml_extensions {
-            engine.add_extension(Box::new(extension));
-        }
-        if let Some(extension) = steady_state_extension {
-            engine.add_extension(Box::new(extension));
-        }
-        if !mur_extension.faces.is_empty() {
-            engine.add_extension(Box::new(mur_extension));
-        }
-        if let Some(extension) = excitation_extension {
-            if !extension.voltage_excitations.is_empty()
-                || !extension.current_excitations.is_empty()
-            {
-                engine.add_extension(Box::new(extension));
-            }
+        for extension in engine_extensions {
+            engine.add_extension(extension);
         }
         self.fdtd_eng = Some(Box::new(engine));
         self.fdtd_op = None; // operator is owned by the engine

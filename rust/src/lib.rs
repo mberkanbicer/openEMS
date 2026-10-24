@@ -21,6 +21,7 @@ pub mod hdf5;
 pub mod openems;
 pub mod operator;
 pub mod operator_base;
+pub mod operator_extension;
 pub mod processing;
 pub mod processing_integral;
 
