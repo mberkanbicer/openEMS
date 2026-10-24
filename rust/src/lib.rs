@@ -10,16 +10,19 @@
 //! - `excitation` — time-domain source signals
 //! - `openems` — main solver orchestrator (ParseFDTDSetup, SetupFDTD, RunFDTD)
 //! - `processing` — post-processing (probes, dumps, SAR, NF2FF interface)
+//! - `hdf5` — HDF5 field dump writer/reader (native-compatible layout)
 
 pub mod array_nijk;
 pub mod constants;
 pub mod engine;
 pub mod excitation;
 pub mod extensions;
+pub mod hdf5;
 pub mod openems;
 pub mod operator;
 pub mod operator_base;
 pub mod processing;
+pub mod processing_integral;
 
 // Re-export the main solver and boundary condition types at the crate root
 // so dependents can use `openems_core::{OpenEMS, BC_PEC, ...}`.

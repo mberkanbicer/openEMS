@@ -9,10 +9,13 @@ pub type FDTD_FLOAT = f32;
 pub const C0: f64 = 299792458.0;
 
 /// Vacuum permittivity (F/m).
-pub const EPS0: f64 = 8.8541878128e-12;
+pub const EPS0: f64 = 8.85418781762e-12;
 
 /// Vacuum permeability (H/m).
-pub const MU0: f64 = 1.25663706212e-6;
+pub const MU0: f64 = 1.256637062e-6;
+
+/// Free-space wave impedance (ohm).
+pub const Z0: f64 = 376.730313461;
 
 /// Pi constant.
 pub const PI: f64 = std::f64::consts::PI;

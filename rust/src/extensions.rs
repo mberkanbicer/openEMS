@@ -3,7 +3,8 @@
 
 use crate::array_nijk::FieldArray;
 use crate::constants::FDTD_FLOAT;
-use crate::excitation::{Excitation, ExcitationType};
+use crate::excitation::Excitation;
+use std::sync::Arc;
 
 // Extension priority constants (mirroring C++ #defines)
 pub const ENG_EXT_PRIO_DEFAULT: i32 = 0;
@@ -52,18 +53,20 @@ mod tests {
 
 /// A single voltage excitation applied to a field component at a position.
 pub struct VoltageExcitation {
-    pub component: usize,   // 0=Ex, 1=Ey, 2=Ez
-    pub pos: [usize; 3],    // position in the field array
-    pub delay: u32,         // start delay in timesteps
-    pub signal: Excitation, // the time-domain signal
+    pub component: usize, // 0=Ex, 1=Ey, 2=Ez
+    pub pos: [usize; 3],  // position in the field array
+    pub delay: u32,       // start delay in timesteps
+    pub amp: FDTD_FLOAT,  // weighted amplitude incl. edge length
+    pub signal: Arc<Excitation>,
 }
 
 /// A single current excitation applied to a field component at a position.
 pub struct CurrentExcitation {
-    pub component: usize,   // 0=Hx, 1=Hy, 2=Hz
-    pub pos: [usize; 3],    // position in the field array
-    pub delay: u32,         // start delay in timesteps
-    pub signal: Excitation, // the time-domain signal
+    pub component: usize, // 0=Hx, 1=Hy, 2=Hz
+    pub pos: [usize; 3],  // position in the field array
+    pub delay: u32,       // start delay in timesteps
+    pub amp: FDTD_FLOAT,  // weighted amplitude incl. edge length
+    pub signal: Arc<Excitation>,
 }
 
 /// Engine extension that applies time-domain excitation sources to the field arrays.
@@ -89,12 +92,14 @@ impl EngineExtExcitation {
         comp: usize,
         pos: [usize; 3],
         delay: u32,
-        signal: Excitation,
+        amp: FDTD_FLOAT,
+        signal: Arc<Excitation>,
     ) {
         self.voltage_excitations.push(VoltageExcitation {
             component: comp,
             pos,
             delay,
+            amp,
             signal,
         });
     }
@@ -105,45 +110,16 @@ impl EngineExtExcitation {
         comp: usize,
         pos: [usize; 3],
         delay: u32,
-        signal: Excitation,
+        amp: FDTD_FLOAT,
+        signal: Arc<Excitation>,
     ) {
         self.current_excitations.push(CurrentExcitation {
             component: comp,
             pos,
             delay,
+            amp,
             signal,
         });
-    }
-
-    /// Compute the signal value at the given timestep.
-    fn signal_value(signal: &Excitation, ts: u32) -> f64 {
-        let t = ts as f64;
-        match signal.exc_type {
-            ExcitationType::Gauss => {
-                // Gaussian pulse: exp(-((t - t0)/sigma)^2)
-                let fc = signal.fc;
-                let sigma = 1.0 / (2.0 * std::f64::consts::PI * fc);
-                let t0 = 3.0 * sigma;
-                let dt = t - t0;
-                (-((dt / sigma).powi(2))).exp()
-            }
-            ExcitationType::Sinus => (2.0 * std::f64::consts::PI * signal.f0 * t).sin(),
-            ExcitationType::Dirac => {
-                if ts == 0 {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
-            ExcitationType::Step => {
-                if t >= 0.0 {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
-            ExcitationType::Custom => 0.0,
-        }
     }
 }
 
@@ -162,31 +138,33 @@ impl EngineExtension for EngineExtExcitation {
         "Excitation"
     }
 
-    fn do_pre_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
-        self.current_ts += 1;
+    fn apply2_voltages(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
         let ts = self.current_ts;
         for exc in &self.voltage_excitations {
             if ts < exc.delay {
                 continue;
             }
             let rel_ts = ts - exc.delay;
-            let val = Self::signal_value(&exc.signal, rel_ts) as FDTD_FLOAT;
+            let val = exc.signal.voltage(rel_ts as usize);
             let cur = *volt.get(exc.component, exc.pos[0], exc.pos[1], exc.pos[2]);
-            *volt.get_mut(exc.component, exc.pos[0], exc.pos[1], exc.pos[2]) = cur + val;
+            *volt.get_mut(exc.component, exc.pos[0], exc.pos[1], exc.pos[2]) =
+                cur + exc.amp * val;
         }
     }
 
-    fn do_pre_current_updates(&mut self, _volt: &FieldArray, curr: &mut FieldArray) {
+    fn apply2_current(&mut self, _volt: &FieldArray, curr: &mut FieldArray) {
         let ts = self.current_ts;
         for exc in &self.current_excitations {
             if ts < exc.delay {
                 continue;
             }
             let rel_ts = ts - exc.delay;
-            let val = Self::signal_value(&exc.signal, rel_ts) as FDTD_FLOAT;
+            let val = exc.signal.current(rel_ts as usize);
             let cur = *curr.get(exc.component, exc.pos[0], exc.pos[1], exc.pos[2]);
-            *curr.get_mut(exc.component, exc.pos[0], exc.pos[1], exc.pos[2]) = cur + val;
+            *curr.get_mut(exc.component, exc.pos[0], exc.pos[1], exc.pos[2]) =
+                cur + exc.amp * val;
         }
+        self.current_ts += 1;
     }
 }
 
@@ -205,26 +183,30 @@ mod excitation_tests {
     fn test_add_voltage_excitation() {
         let mut ext = EngineExtExcitation::new();
         let signal = Excitation::gauss(1.0e9, 5.0e8);
-        ext.add_voltage_excitation(0, [5, 5, 5], 10, signal);
+        ext.add_voltage_excitation(0, [5, 5, 5], 10, 1.0, Arc::new(signal));
         assert_eq!(ext.voltage_excitations.len(), 1);
         assert_eq!(ext.voltage_excitations[0].component, 0);
         assert_eq!(ext.voltage_excitations[0].pos, [5, 5, 5]);
         assert_eq!(ext.voltage_excitations[0].delay, 10);
+        assert_eq!(ext.voltage_excitations[0].amp, 1.0);
     }
 
     #[test]
     fn test_signal_value_gauss() {
-        let signal = Excitation::gauss(1.0e9, 5.0e8);
-        let val = EngineExtExcitation::signal_value(&signal, 0);
-        assert!(val > 0.0);
-        assert!(val <= 1.0);
+        let mut signal = Excitation::gauss(1.0e9, 5.0e8);
+        signal.build(1.0e-12, 10_000).unwrap();
+        let val = signal.voltage(1);
+        assert!(val.abs() > 0.0);
+        assert!(val.abs() <= 1.0);
     }
 
     #[test]
     fn test_signal_value_dirac() {
-        let signal = Excitation::dirac(1.0e9);
-        assert_eq!(EngineExtExcitation::signal_value(&signal, 0), 1.0);
-        assert_eq!(EngineExtExcitation::signal_value(&signal, 1), 0.0);
+        let mut signal = Excitation::dirac(1.0e9);
+        signal.build(1.0e-12, 100).unwrap();
+        assert_eq!(signal.voltage(0), 0.0);
+        assert_eq!(signal.voltage(1), 1.0);
+        assert_eq!(signal.voltage(2), 0.0);
     }
 }
 
@@ -232,34 +214,65 @@ mod excitation_tests {
 // Mur ABC extension
 // ============================================================================
 
-/// Mur Absorbing Boundary Condition engine extension.
-/// Implements a first-order Mur ABC on the specified boundary faces.
-/// Mirrors C++ `Engine_Ext_Mur_ABC`.
+/// One active Mur face: per-position coefficients and the stored voltage
+/// history used by the three-phase native update.
+#[derive(Debug, Clone)]
+pub struct MurFace {
+    pub face: usize,
+    pub dir: usize,
+    pub top: bool,
+    pub line: usize,
+    pub shift: usize,
+    pub dims_p: usize,
+    pub dims_pp: usize,
+    pub coeff_p: Vec<FDTD_FLOAT>,
+    pub coeff_pp: Vec<FDTD_FLOAT>,
+    pub hist_p: Vec<FDTD_FLOAT>,
+    pub hist_pp: Vec<FDTD_FLOAT>,
+}
+
+/// First-order Mur absorbing boundary on all configured faces.
+/// Mirrors the `pre -> post -> apply2` sequence of `Engine_Ext_Mur_ABC`.
+#[derive(Debug, Clone, Default)]
 pub struct EngineExtMurABC {
-    /// Boundary face indices (0=x-min, 1=x-max, 2=y-min, 3=y-max, 4=z-min, 5=z-max) that are active.
-    pub active_faces: [bool; 6],
-    /// Field history for each face: [face][position_index] -> previous voltage values.
-    /// Used for the Mur ABC time-delayed update.
-    pub volt_history: Vec<Vec<FDTD_FLOAT>>,
+    pub faces: Vec<MurFace>,
     pub current_ts: u32,
     pub start_ts: u32,
 }
 
 impl EngineExtMurABC {
     pub fn new() -> Self {
-        Self {
-            active_faces: [false; 6],
-            volt_history: Vec::new(),
-            current_ts: 0,
-            start_ts: 0,
-        }
+        Self::default()
     }
 
-    /// Activate a boundary face for Mur ABC.
-    pub fn activate_face(&mut self, face: i32) {
-        if (0..=5).contains(&face) {
-            self.active_faces[face as usize] = true;
-        }
+    /// Register a face with pre-computed coefficients.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_face(
+        &mut self,
+        face: usize,
+        dir: usize,
+        top: bool,
+        line: usize,
+        shift: usize,
+        dims_p: usize,
+        dims_pp: usize,
+        coeff_p: Vec<FDTD_FLOAT>,
+        coeff_pp: Vec<FDTD_FLOAT>,
+    ) {
+        let size = dims_p * dims_pp;
+        self.faces.push(MurFace {
+            face,
+            dir,
+            top,
+            line,
+            shift,
+            dims_p,
+            dims_pp,
+            coeff_p,
+            coeff_pp,
+            hist_p: vec![0.0; size],
+            hist_pp: vec![0.0; size],
+        });
     }
 
     /// Set the timestep at which the Mur ABC becomes active.
@@ -269,12 +282,6 @@ impl EngineExtMurABC {
 
     fn is_active(&self) -> bool {
         self.current_ts >= self.start_ts
-    }
-}
-
-impl Default for EngineExtMurABC {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -292,65 +299,72 @@ impl EngineExtension for EngineExtMurABC {
         if !self.is_active() {
             return;
         }
-        let nx = volt.ni();
-        let ny = volt.nj();
-        let nz = volt.nk();
+        for face in &mut self.faces {
+            let n_p = (face.dir + 1) % 3;
+            let n_pp = (face.dir + 2) % 3;
+            for ip in 0..face.dims_p {
+                for ipp in 0..face.dims_pp {
+                    let idx = ip * face.dims_pp + ipp;
+                    let mut pos = [0usize; 3];
+                    pos[face.dir] = face.line;
+                    pos[n_p] = ip;
+                    pos[n_pp] = ipp;
+                    let mut pos_shift = [0usize; 3];
+                    pos_shift[face.dir] = face.shift;
+                    pos_shift[n_p] = ip;
+                    pos_shift[n_pp] = ipp;
 
-        // First-order Mur ABC: E(n+1) at boundary = E(n) at boundary + (c*dt/dx - 1)/(c*dt/dx + 1) * (E(n+1) at neighbor - E(n) at neighbor)
-        // Simplified: copy the neighbor value inward (first-order approximation)
-        for comp in 0..3 {
-            // x-min face (face 0)
-            if self.active_faces[0] {
-                for j in 0..ny {
-                    for k in 0..nz {
-                        let val = *volt.get(comp, 1, j, k);
-                        *volt.get_mut(comp, 0, j, k) = val;
-                    }
+                    let v_p_shift = *volt.get(n_p, pos_shift[0], pos_shift[1], pos_shift[2]);
+                    let v_p_bound = *volt.get(n_p, pos[0], pos[1], pos[2]);
+                    face.hist_p[idx] = v_p_shift - face.coeff_p[idx] * v_p_bound;
+
+                    let v_pp_shift = *volt.get(n_pp, pos_shift[0], pos_shift[1], pos_shift[2]);
+                    let v_pp_bound = *volt.get(n_pp, pos[0], pos[1], pos[2]);
+                    face.hist_pp[idx] = v_pp_shift - face.coeff_pp[idx] * v_pp_bound;
                 }
             }
-            // x-max face (face 1)
-            if self.active_faces[1] {
-                for j in 0..ny {
-                    for k in 0..nz {
-                        let val = *volt.get(comp, nx - 2, j, k);
-                        *volt.get_mut(comp, nx - 1, j, k) = val;
-                    }
+        }
+    }
+
+    fn do_post_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        if !self.is_active() {
+            return;
+        }
+        for face in &mut self.faces {
+            let n_p = (face.dir + 1) % 3;
+            let n_pp = (face.dir + 2) % 3;
+            for ip in 0..face.dims_p {
+                for ipp in 0..face.dims_pp {
+                    let idx = ip * face.dims_pp + ipp;
+                    let mut pos_shift = [0usize; 3];
+                    pos_shift[face.dir] = face.shift;
+                    pos_shift[n_p] = ip;
+                    pos_shift[n_pp] = ipp;
+                    let v_p_shift = *volt.get(n_p, pos_shift[0], pos_shift[1], pos_shift[2]);
+                    let v_pp_shift = *volt.get(n_pp, pos_shift[0], pos_shift[1], pos_shift[2]);
+                    face.hist_p[idx] += face.coeff_p[idx] * v_p_shift;
+                    face.hist_pp[idx] += face.coeff_pp[idx] * v_pp_shift;
                 }
             }
-            // y-min face (face 2)
-            if self.active_faces[2] {
-                for i in 0..nx {
-                    for k in 0..nz {
-                        let val = *volt.get(comp, i, 1, k);
-                        *volt.get_mut(comp, i, 0, k) = val;
-                    }
-                }
-            }
-            // y-max face (face 3)
-            if self.active_faces[3] {
-                for i in 0..nx {
-                    for k in 0..nz {
-                        let val = *volt.get(comp, i, ny - 2, k);
-                        *volt.get_mut(comp, i, ny - 1, k) = val;
-                    }
-                }
-            }
-            // z-min face (face 4)
-            if self.active_faces[4] {
-                for i in 0..nx {
-                    for j in 0..ny {
-                        let val = *volt.get(comp, i, j, 1);
-                        *volt.get_mut(comp, i, j, 0) = val;
-                    }
-                }
-            }
-            // z-max face (face 5)
-            if self.active_faces[5] {
-                for i in 0..nx {
-                    for j in 0..ny {
-                        let val = *volt.get(comp, i, j, nz - 2);
-                        *volt.get_mut(comp, i, j, nz - 1) = val;
-                    }
+        }
+    }
+
+    fn apply2_voltages(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        if !self.is_active() {
+            return;
+        }
+        for face in &self.faces {
+            let n_p = (face.dir + 1) % 3;
+            let n_pp = (face.dir + 2) % 3;
+            for ip in 0..face.dims_p {
+                for ipp in 0..face.dims_pp {
+                    let idx = ip * face.dims_pp + ipp;
+                    let mut pos = [0usize; 3];
+                    pos[face.dir] = face.line;
+                    pos[n_p] = ip;
+                    pos[n_pp] = ipp;
+                    *volt.get_mut(n_p, pos[0], pos[1], pos[2]) = face.hist_p[idx];
+                    *volt.get_mut(n_pp, pos[0], pos[1], pos[2]) = face.hist_pp[idx];
                 }
             }
         }
@@ -366,18 +380,43 @@ mod mur_abc_tests {
         let ext = EngineExtMurABC::new();
         assert_eq!(ext.get_priority(), ENG_EXT_PRIO_DEFAULT);
         assert_eq!(ext.get_extension_name(), "Mur ABC");
+        assert!(ext.faces.is_empty());
     }
 
     #[test]
-    fn test_activate_face() {
+    fn test_mur_three_phase_update_matches_native_sequence() {
         let mut ext = EngineExtMurABC::new();
-        ext.activate_face(0);
-        ext.activate_face(5);
-        assert!(ext.active_faces[0]);
-        assert!(ext.active_faces[5]);
-        assert!(!ext.active_faces[1]);
+        ext.add_face(
+            0, 0, false, 0, 1, 3, 3, vec![0.5; 9], vec![0.25; 9],
+        );
+        let mut volt = FieldArray::new("volt", [4, 3, 3]);
+        let curr = FieldArray::new("curr", [4, 3, 3]);
+
+        // V^n on the x-min face and its inward neighbour.
+        *volt.get_mut(1, 0, 1, 1) = 1.0;
+        *volt.get_mut(1, 1, 1, 1) = 3.0;
+        *volt.get_mut(2, 0, 1, 1) = 2.0;
+        *volt.get_mut(2, 1, 1, 1) = 4.0;
+
+        ext.do_pre_voltage_updates(&mut volt, &curr);
+        // hist_y = 3 - 0.5*1 = 2.5; hist_z = 4 - 0.25*2 = 3.5
+        assert_eq!(ext.faces[0].hist_p[4], 2.5);
+        assert_eq!(ext.faces[0].hist_pp[4], 3.5);
+
+        // Main voltage update changes the inward neighbour.
+        *volt.get_mut(1, 1, 1, 1) = 5.0;
+        *volt.get_mut(2, 1, 1, 1) = 6.0;
+        ext.do_post_voltage_updates(&mut volt, &curr);
+        // hist_y = 2.5 + 0.5*5 = 5.0; hist_z = 3.5 + 0.25*6 = 5.0
+        assert_eq!(ext.faces[0].hist_p[4], 5.0);
+        assert_eq!(ext.faces[0].hist_pp[4], 5.0);
+
+        ext.apply2_voltages(&mut volt, &curr);
+        assert_eq!(*volt.get(1, 0, 1, 1), 5.0);
+        assert_eq!(*volt.get(2, 0, 1, 1), 5.0);
     }
 }
+
 
 // ============================================================================
 // UPML (Uniaxial Perfectly Matched Layer) extension
@@ -480,8 +519,9 @@ impl EngineExtension for EngineExtUPML {
                         let f_help = *self.vv[comp].get(0, i, j, k) * *volt.get(comp, gi, gj, gk)
                             - *self.vvfo[comp].get(0, i, j, k)
                                 * *self.volt_flux[comp].get(0, i, j, k);
-                        *self.volt_flux[comp].get_mut(0, i, j, k) = *volt.get(comp, gi, gj, gk);
-                        *volt.get_mut(comp, gi, gj, gk) = f_help;
+                        let flux_old = *self.volt_flux[comp].get(0, i, j, k);
+                        *volt.get_mut(comp, gi, gj, gk) = flux_old;
+                        *self.volt_flux[comp].get_mut(0, i, j, k) = f_help;
                     }
                 }
             }
@@ -532,8 +572,9 @@ impl EngineExtension for EngineExtUPML {
                         let f_help = *self.ii[comp].get(0, i, j, k) * *curr.get(comp, gi, gj, gk)
                             - *self.iifo[comp].get(0, i, j, k)
                                 * *self.curr_flux[comp].get(0, i, j, k);
-                        *self.curr_flux[comp].get_mut(0, i, j, k) = *curr.get(comp, gi, gj, gk);
-                        *curr.get_mut(comp, gi, gj, gk) = f_help;
+                        let flux_old = *self.curr_flux[comp].get(0, i, j, k);
+                        *curr.get_mut(comp, gi, gj, gk) = flux_old;
+                        *self.curr_flux[comp].get_mut(0, i, j, k) = f_help;
                     }
                 }
             }
@@ -570,6 +611,26 @@ impl EngineExtension for EngineExtUPML {
 #[cfg(test)]
 mod upml_tests {
     use super::*;
+
+    #[test]
+    fn upml_flux_sequence_changes_fields() {
+        let mut ext = EngineExtUPML::new([0, 0, 0], [2, 2, 2]);
+        *ext.vv[0].get_mut(0, 0, 0, 0) = 1.0;
+        *ext.vvfo[0].get_mut(0, 0, 0, 0) = 0.5;
+        *ext.vvfn[0].get_mut(0, 0, 0, 0) = 2.0;
+        let mut volt = FieldArray::new("volt", [2, 2, 2]);
+        let curr = FieldArray::new("curr", [2, 2, 2]);
+        *volt.get_mut(0, 0, 0, 0) = 1.0;
+
+        ext.do_pre_voltage_updates(&mut volt, &curr);
+        // V is replaced by the old flux (0), flux becomes 1*1 - 0.5*0 = 1.
+        assert_eq!(*volt.get(0, 0, 0, 0), 0.0);
+        // Simulate the main voltage update.
+        *volt.get_mut(0, 0, 0, 0) = 5.0;
+        ext.do_post_voltage_updates(&mut volt, &curr);
+        // V = flux_old (1) + vvfn (2) * V_new_raw (5) = 11.
+        assert_eq!(*volt.get(0, 0, 0, 0), 11.0);
+    }
 
     #[test]
     fn test_upml_creation() {
@@ -835,34 +896,7 @@ impl EngineExtension for EngineExtTFSF {
 impl EngineExtTFSF {
     /// Get the signal value at the given index into the signal waveform.
     fn signal_value_at(&self, idx: usize) -> FDTD_FLOAT {
-        // Simplified: use the excitation signal computation directly
-        let t = idx as f64;
-        let val: f64 = match self.signal.exc_type {
-            ExcitationType::Gauss => {
-                let fc = self.signal.fc;
-                let sigma = 1.0 / (2.0 * std::f64::consts::PI * fc);
-                let t0 = 3.0 * sigma;
-                let dt = t - t0;
-                (-((dt / sigma).powi(2))).exp()
-            }
-            ExcitationType::Sinus => (2.0 * std::f64::consts::PI * self.signal.f0 * t).sin(),
-            ExcitationType::Dirac => {
-                if t == 0.0 {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
-            ExcitationType::Step => {
-                if t >= 0.0 {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
-            ExcitationType::Custom => 0.0,
-        };
-        val as FDTD_FLOAT
+        self.signal.voltage(idx)
     }
 }
 

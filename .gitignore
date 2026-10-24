@@ -46,3 +46,8 @@ CLAUDE.md
 .cursor*
 .windsurf*
 .copilot*
+
+# Rust build output and local test artifacts
+rust*/target/
+rust/output.h5
+rust/output.vtk

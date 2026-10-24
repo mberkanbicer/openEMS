@@ -209,6 +209,8 @@ pub struct OperatorBaseImpl {
     pub m_mesh_type: CoordinateSystem,
     pub num_lines: [u32; 3],
     pub grid_delta: f64,
+    /// CFL variant: 1 = `Rennings_1` (default), 3 = `Rennings_2`.
+    pub m_time_step_var: i32,
 }
 
 impl Default for OperatorBaseImpl {
@@ -233,6 +235,7 @@ impl OperatorBaseImpl {
             m_mesh_type: CoordinateSystem::Cartesian,
             num_lines: [0, 0, 0],
             grid_delta: 0.0,
+            m_time_step_var: 1,
         }
     }
 }

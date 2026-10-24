@@ -1,6 +1,97 @@
 //! Processing: post-processing (probes, dumps, SAR, NF2FF interface).
 //! Mirrors `Common/processing.h/cpp` and subclasses in the C++ codebase.
 
+use crate::array_nijk::FieldArray;
+use crate::hdf5::{Hdf5Error, Hdf5File, OPENEMS_HDF5_VERSION};
+
+/// Native file-type enum (`ProcessFields::FileType`).
+pub const VTK_FILETYPE: i32 = 0;
+/// Native file-type enum (`ProcessFields::FileType`).
+pub const HDF5_FILETYPE: i32 = 1;
+
+/// Field name for a native `DumpType` value
+/// (`ProcessFields::GetFieldNameByType`).
+pub fn field_name_by_type(type_: i32) -> String {
+    match type_ {
+        0 => "E-Field".to_string(),
+        1 => "H-Field".to_string(),
+        2 => "J-Field".to_string(),
+        3 => "RotH-Field".to_string(),
+        4 => "D-Field".to_string(),
+        5 => "B-Field".to_string(),
+        20 => "SAR-local".to_string(),
+        21 => "SAR_1g".to_string(),
+        22 => "SAR_10g".to_string(),
+        29 => "SAR_raw_data".to_string(),
+        _ => "unknown field".to_string(),
+    }
+}
+
+/// A complex accumulator for frequency-domain sampling.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ComplexPoint {
+    pub re: f64,
+    pub im: f64,
+}
+
+impl ComplexPoint {
+    pub fn magnitude(&self) -> f64 {
+        (self.re * self.re + self.im * self.im).sqrt()
+    }
+}
+
+/// Mesh and timestep metadata needed by processing objects to map coordinates
+/// to field indices.
+#[derive(Debug, Clone)]
+pub struct EngineMeta {
+    pub num_lines: [usize; 3],
+    /// Mesh line coordinates in metres.
+    pub disc_lines: [Vec<f64>; 3],
+    pub dt: f64,
+}
+
+impl EngineMeta {
+    /// Map a physical coordinate (metres) to the nearest mesh index.
+    pub fn index_from_coordinates(&self, coordinates: [f64; 3]) -> Option<[usize; 3]> {
+        let mut index = [0usize; 3];
+        for axis in 0..3 {
+            let lines = &self.disc_lines[axis];
+            if lines.len() < 2 {
+                return None;
+            }
+            if coordinates[axis] < lines[0] || coordinates[axis] > lines[lines.len() - 1] {
+                return None;
+            }
+            let mut best = 0usize;
+            let mut best_distance = f64::INFINITY;
+            for (candidate, line) in lines.iter().enumerate() {
+                let distance = (line - coordinates[axis]).abs();
+                if distance < best_distance {
+                    best_distance = distance;
+                    best = candidate;
+                }
+            }
+            index[axis] = best.min(self.num_lines[axis].saturating_sub(1));
+        }
+        Some(index)
+    }
+
+    pub fn coordinate(&self, axis: usize, index: usize) -> f64 {
+        self.disc_lines
+            .get(axis)
+            .and_then(|lines| lines.get(index))
+            .copied()
+            .unwrap_or(0.0)
+    }
+}
+
+/// Read-only view of the running engine passed to processing objects.
+pub struct EngineInterface<'a> {
+    pub meta: &'a EngineMeta,
+    pub volt: &'a FieldArray,
+    pub curr: &'a FieldArray,
+}
+
 /// Mesh type for processing (mirrors C++ `Processing::MeshType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshType {
@@ -59,6 +150,11 @@ pub trait Processing {
     /// Process data during simulation run. Returns next interval.
     fn process(&mut self, _num_ts: u32) -> i32 {
         0
+    }
+    /// Process data with access to the running engine fields.
+    /// The default forwards to [`Processing::process`].
+    fn process_fields(&mut self, num_ts: u32, _interface: &EngineInterface<'_>) -> i32 {
+        self.process(num_ts)
     }
     /// Process data after simulation has finished.
     fn post_process(&mut self) {}
@@ -164,6 +260,18 @@ impl ProcessingArray {
         next_process
     }
 
+    /// Invoke `process_fields` on all processings with engine access.
+    pub fn process_fields(&mut self, num_ts: u32, interface: &EngineInterface<'_>) -> i32 {
+        let mut next_process = self.max_interval as i32;
+        for proc in self.processings.iter_mut() {
+            let step = proc.process_fields(num_ts, interface);
+            if step > 0 && step < next_process {
+                next_process = step;
+            }
+        }
+        next_process
+    }
+
     /// Invoke `post_process` on all processings.
     pub fn post_process(&mut self) {
         for proc in self.processings.iter_mut() {
@@ -196,6 +304,11 @@ pub struct FieldProbe {
     name: String,
     processing_name: String,
     position: [f64; 3],
+    pub component: usize,
+    pub samples: Vec<f32>,
+    pub frequencies: Vec<f64>,
+    pub dft: Vec<ComplexPoint>,
+    fd_oversampling: u32,
     process_interval: u32,
     start_ts: u32,
     stop_ts: u32,
@@ -215,11 +328,15 @@ pub struct FieldProbe {
 
 impl FieldProbe {
     /// Create a new field probe.
-    pub fn new(name: &str, position: [f64; 3]) -> Self {
-        Self {
+    pub fn new(name: &str, position: [f64; 3]) -> Self {        Self {
             name: name.to_string(),
             processing_name: name.to_string(),
             position,
+            component: 0,
+            samples: Vec::new(),
+            frequencies: Vec::new(),
+            dft: Vec::new(),
+            fd_oversampling: 1,
             process_interval: 0,
             start_ts: 0,
             stop_ts: u32::MAX,
@@ -236,6 +353,29 @@ impl FieldProbe {
             m_start_inside: [false, false, false],
             m_stop_inside: [false, false, false],
         }
+    }
+
+    /// Select the field component (0=Ex, 1=Ey, 2=Ez for voltage probes).
+    pub fn set_component(&mut self, component: usize) {
+        if component < 3 {
+            self.component = component;
+        }
+    }
+
+    pub fn samples(&self) -> &[f32] {
+        &self.samples
+    }
+
+    pub fn frequencies(&self) -> &[f64] {
+        &self.frequencies
+    }
+
+    pub fn dft(&self) -> &[ComplexPoint] {
+        &self.dft
+    }
+
+    pub fn fd_oversampling(&self) -> u32 {
+        self.fd_oversampling
     }
 }
 
@@ -292,16 +432,23 @@ impl Processing for FieldProbe {
         }
     }
 
-    fn set_fd_oversampling(&mut self, _factor: u32) {
-        // Placeholder: frequency-domain sampling not yet implemented.
+    fn set_fd_oversampling(&mut self, factor: u32) {
+        if factor > 0 {
+            self.fd_oversampling = factor;
+        }
     }
 
-    fn add_frequency(&mut self, _freq: f64) {
-        // Placeholder: frequency-domain sampling not yet implemented.
+    fn add_frequency(&mut self, freq: f64) {
+        if freq > 0.0 && !self.frequencies.contains(&freq) {
+            self.frequencies.push(freq);
+            self.dft.push(ComplexPoint::default());
+        }
     }
 
-    fn add_frequencies(&mut self, _freqs: &[f64]) {
-        // Placeholder: frequency-domain sampling not yet implemented.
+    fn add_frequencies(&mut self, freqs: &[f64]) {
+        for &freq in freqs {
+            self.add_frequency(freq);
+        }
     }
 
     fn check_timestep(&mut self, num_ts: u32) -> bool {
@@ -337,20 +484,49 @@ impl Processing for FieldProbe {
     }
 
     fn pre_process(&mut self) {
-        // Placeholder: no pre-processing needed for a point probe.
+        // A point probe needs no pre-processing.
     }
 
     fn process(&mut self, num_ts: u32) -> i32 {
         if !self.enabled {
             return -1;
         }
-        // Placeholder: sample fields at position.
-        // Field access will be wired up when the engine exposes field getters.
+        // Legacy path without engine access; see `process_fields`.
+        self.get_next_interval(num_ts)
+    }
+
+    fn process_fields(&mut self, num_ts: u32, interface: &EngineInterface<'_>) -> i32 {
+        if !self.enabled {
+            return -1;
+        }
+        if self.check_timestep(num_ts)
+            || (self.process_interval == 0 && self.process_steps.is_empty())
+        {
+            if let Some(index) = interface.meta.index_from_coordinates(self.position) {
+                let sample =
+                    *interface.volt.get(self.component, index[0], index[1], index[2]);
+                self.samples.push(sample);
+                let time = num_ts as f64 * interface.meta.dt;
+                for (frequency, accumulator) in self.frequencies.iter().zip(self.dft.iter_mut()) {
+                    let argument = -2.0 * std::f64::consts::PI * frequency * time;
+                    accumulator.re += sample as f64 * argument.cos();
+                    accumulator.im += sample as f64 * argument.sin();
+                }
+            }
+        }
         self.get_next_interval(num_ts)
     }
 
     fn post_process(&mut self) {
-        // Placeholder: no post-processing needed for a point probe.
+        // A point probe needs no post-processing.
+    }
+
+    fn reset(&mut self) {
+        self.samples.clear();
+        for accumulator in &mut self.dft {
+            *accumulator = ComplexPoint::default();
+        }
+        self.ps_pos = 0;
     }
 
     fn set_enable(&mut self, val: bool) {
@@ -666,7 +842,7 @@ impl ProcessFields {
             start,
             stop,
             dump_type: 0, // E_FIELD_DUMP
-            file_type: 1, // VTK_FILETYPE
+            file_type: VTK_FILETYPE,
             sub_sampling: [1, 1, 1],
             opt_resolution: [0.0, 0.0, 0.0],
             dump_mode: 0,
@@ -730,16 +906,7 @@ impl ProcessFields {
     }
 
     pub fn get_field_name_by_type(type_: i32) -> String {
-        match type_ {
-            0 => "E-Field".to_string(),
-            1 => "H-Field".to_string(),
-            2 => "J-Field".to_string(),
-            3 => "D-Field".to_string(),
-            4 => "B-Field".to_string(),
-            5 => "B-Field".to_string(),
-            20 => "SAR-Local".to_string(),
-            _ => "Unknown".to_string(),
-        }
+        field_name_by_type(type_)
     }
 }
 
@@ -776,6 +943,10 @@ pub struct ProcessFieldsTD {
     sub_sampling: [i32; 3],
     opt_resolution: [f64; 3],
     dump_mode: i32,
+    process_interval: u32,
+    process_steps: Vec<u32>,
+    ps_pos: usize,
+    initialized: bool,
 }
 
 impl ProcessFieldsTD {
@@ -786,10 +957,14 @@ impl ProcessFieldsTD {
             start,
             stop,
             dump_type: 0, // E_FIELD_DUMP
-            file_type: 1, // VTK_FILETYPE
+            file_type: VTK_FILETYPE,
             sub_sampling: [1, 1, 1],
             opt_resolution: [0.0, 0.0, 0.0],
             dump_mode: 0,
+            process_interval: 1,
+            process_steps: Vec::new(),
+            ps_pos: 0,
+            initialized: false,
         }
     }
 
@@ -813,16 +988,56 @@ impl ProcessFieldsTD {
         self.file_type = val;
     }
 
-    pub fn set_sub_sampling(&mut self, val: i32, _: i32) {
-        self.sub_sampling[0] = val;
+    pub fn set_sub_sampling(&mut self, val: i32, dir: i32) {
+        if val < 1 {
+            return;
+        }
+        if (0..=2).contains(&dir) {
+            self.sub_sampling[dir as usize] = val;
+        } else {
+            self.sub_sampling = [val; 3];
+        }
+        self.opt_resolution = [0.0; 3];
     }
 
-    pub fn set_opt_resolution(&mut self, val: f64, _: i32) {
-        self.opt_resolution[0] = val;
+    pub fn set_opt_resolution(&mut self, val: f64, dir: i32) {
+        if !(val > 0.0) {
+            return;
+        }
+        if (0..=2).contains(&dir) {
+            self.opt_resolution[dir as usize] = val;
+        } else {
+            self.opt_resolution = [val; 3];
+        }
+        self.sub_sampling = [1; 3];
     }
 
     pub fn set_dump_mode(&mut self, val: i32) {
         self.dump_mode = val;
+    }
+
+    /// Mesh indices written by this dump, mirroring `ProcessFields::CalcMeshPos`.
+    /// A positive optical resolution wins over the integer sub-sampling rate.
+    pub fn dump_indices(&self, axis: usize, lines: &[f64]) -> Vec<usize> {
+        let count = lines.len();
+        if count == 0 {
+            return Vec::new();
+        }
+        if self.opt_resolution[axis] > 0.0 && count > 1 {
+            let resolution = self.opt_resolution[axis];
+            let mut indices = Vec::new();
+            let mut last = f64::NEG_INFINITY;
+            for (index, &coordinate) in lines.iter().enumerate() {
+                if indices.is_empty() || (coordinate - last).abs() >= resolution - 1e-15 {
+                    indices.push(index);
+                    last = coordinate;
+                }
+            }
+            indices
+        } else {
+            let stride = self.sub_sampling[axis].max(1) as usize;
+            (0..count).step_by(stride).collect()
+        }
     }
 
     pub fn set_dump_mode_2_node(&mut self) {
@@ -850,16 +1065,7 @@ impl ProcessFieldsTD {
     }
 
     pub fn get_field_name_by_type(type_: i32) -> String {
-        match type_ {
-            0 => "E-Field".to_string(),
-            1 => "H-Field".to_string(),
-            2 => "J-Field".to_string(),
-            3 => "D-Field".to_string(),
-            4 => "B-Field".to_string(),
-            5 => "B-Field".to_string(),
-            20 => "SAR-Local".to_string(),
-            _ => "Unknown".to_string(),
-        }
+        field_name_by_type(type_)
     }
 }
 
@@ -876,10 +1082,108 @@ impl Processing for ProcessFieldsTD {
         self.processing_name.clone()
     }
 
-    fn set_process_interval(&mut self, _interval: u32) {}
+    fn set_process_interval(&mut self, interval: u32) {
+        self.process_interval = interval;
+    }
 
     fn get_process_interval(&self) -> u32 {
+        self.process_interval
+    }
+
+    fn add_step(&mut self, step: u32) {
+        if !self.process_steps.contains(&step) {
+            self.process_steps.push(step);
+        }
+    }
+
+    fn add_steps(&mut self, steps: &[u32]) {
+        for &step in steps {
+            self.add_step(step);
+        }
+    }
+
+    fn check_timestep(&mut self, num_ts: u32) -> bool {
+        if self.ps_pos < self.process_steps.len() && self.process_steps[self.ps_pos] == num_ts {
+            self.ps_pos += 1;
+            return true;
+        }
+        self.process_interval > 0 && num_ts.is_multiple_of(self.process_interval)
+    }
+
+    fn process_fields(&mut self, num_ts: u32, interface: &EngineInterface<'_>) -> i32 {
+        if !self.check_timestep(num_ts) {
+            return 0;
+        }
+        let field = if self.dump_type == 1 {
+            interface.curr
+        } else {
+            interface.volt
+        };
+        let field_name = Self::get_field_name_by_type(self.dump_type);
+
+        // Dump mesh: native `CalcMeshPos` reduces the written grid by
+        // sub-sampling or optical resolution.
+        let indices = [
+            self.dump_indices(0, &interface.meta.disc_lines[0]),
+            self.dump_indices(1, &interface.meta.disc_lines[1]),
+            self.dump_indices(2, &interface.meta.disc_lines[2]),
+        ];
+        let dims = [indices[0].len(), indices[1].len(), indices[2].len()];
+        let coordinates: [Vec<f64>; 3] = [
+            indices[0]
+                .iter()
+                .map(|&index| interface.meta.disc_lines[0][index])
+                .collect(),
+            indices[1]
+                .iter()
+                .map(|&index| interface.meta.disc_lines[1][index])
+                .collect(),
+            indices[2]
+                .iter()
+                .map(|&index| interface.meta.disc_lines[2][index])
+                .collect(),
+        ];
+        let coordinate_refs: [&[f64]; 3] = [&coordinates[0], &coordinates[1], &coordinates[2]];
+        let reduced = extract_field(field, &indices);
+
+        if self.file_type == HDF5_FILETYPE {
+            // Native: /FieldData/TD/<8-digit timestep> + a `time` attribute.
+            let dataset = format!("{num_ts:08}");
+            let writer = HDF5FileWriter::new(&format!("{}.h5", self.name));
+            let result = (|| -> Result<(), Hdf5Error> {
+                if !self.initialized {
+                    writer.create(self.dump_type, false, true)?;
+                    writer.write_rect_mesh(dims, coordinate_refs, 0, 1.0)?;
+                    self.initialized = true;
+                }
+                writer.write_vector_field("/FieldData/TD", &dataset, &reduced, dims, true)?;
+                writer.write_time_attribute(
+                    &format!("/FieldData/TD/{dataset}"),
+                    (num_ts as f64 * interface.meta.dt) as f32,
+                )
+            })();
+            if let Err(error) = result {
+                eprintln!(
+                    "[openEMS] Failed to write time-domain HDF5 dump '{}': {error}",
+                    self.name
+                );
+            }
+        } else {
+            // Native VTK writer default pad length is 10.
+            let prefix = format!("{}_{num_ts:010}", self.name);
+            let writer = VTKFileWriter::new(&prefix);
+            if let Err(error) =
+                writer.write_structured_grid(&field_name, dims, coordinate_refs, &reduced)
+            {
+                eprintln!("[openEMS] Failed to write time-domain dump '{prefix}': {error}");
+            }
+        }
         0
+    }
+
+    fn reset(&mut self) {
+        self.ps_pos = 0;
+        self.initialized = false;
     }
 }
 
@@ -895,6 +1199,14 @@ pub struct ProcessFieldsFD {
     file_type: i32,
     fd_oversampling: u32,
     frequencies: Vec<f64>,
+    fd_interval: u32,
+    sample_count: u32,
+    process_interval: u32,
+    dims: Option<[usize; 3]>,
+    disc_lines: Option<[Vec<f64>; 3]>,
+    acc_re: Vec<Vec<f32>>,
+    acc_im: Vec<Vec<f32>>,
+    initialized: bool,
 }
 
 impl ProcessFieldsFD {
@@ -905,14 +1217,26 @@ impl ProcessFieldsFD {
             start,
             stop,
             dump_type: 0, // E_FIELD_DUMP
-            file_type: 1, // VTK_FILETYPE
+            file_type: VTK_FILETYPE,
             fd_oversampling: 4,
             frequencies: Vec::new(),
+            fd_interval: 0,
+            sample_count: 0,
+            process_interval: 1,
+            dims: None,
+            disc_lines: None,
+            acc_re: Vec::new(),
+            acc_im: Vec::new(),
+            initialized: false,
         }
     }
 
     pub fn get_processing_name(&self) -> String {
         self.processing_name.clone()
+    }
+
+    pub fn get_field_name_by_type(type_: i32) -> String {
+        field_name_by_type(type_)
     }
 
     pub fn get_dump_type(&self) -> i32 {
@@ -932,11 +1256,56 @@ impl ProcessFieldsFD {
     }
 
     pub fn add_frequency(&mut self, freq: f64) {
-        self.frequencies.push(freq);
+        if freq > 0.0 && !self.frequencies.contains(&freq) {
+            self.frequencies.push(freq);
+        }
     }
 
     pub fn get_frequencies(&self) -> &[f64] {
         &self.frequencies
+    }
+
+    /// Sampling interval in timesteps used for the running DFT.
+    pub fn fd_interval(&self) -> u32 {
+        self.fd_interval
+    }
+
+    /// Number of accumulated frequency-domain samples.
+    pub fn sample_count(&self) -> u32 {
+        self.sample_count
+    }
+
+    /// Accumulated real part for a frequency index in `(n, i, j, k)` order.
+    pub fn real_part(&self, index: usize) -> Option<&[f32]> {
+        self.acc_re.get(index).map(|values| values.as_slice())
+    }
+
+    /// Accumulated imaginary part for a frequency index in `(n, i, j, k)` order.
+    pub fn imag_part(&self, index: usize) -> Option<&[f32]> {
+        self.acc_im.get(index).map(|values| values.as_slice())
+    }
+
+    /// Compute the sampling interval from the timestep and the highest requested
+    /// frequency, mirroring `Processing::AddFrequency`'s Nyquist logic.
+    fn update_interval(&mut self, dt: f64) {
+        let highest = self.frequencies.iter().copied().fold(0.0f64, f64::max);
+        if highest <= 0.0 || dt <= 0.0 {
+            self.fd_interval = 1;
+            return;
+        }
+        let nyquist_steps = 1.0 / (2.0 * highest * dt);
+        let oversampling = self.fd_oversampling.max(1) as f64;
+        self.fd_interval = ((nyquist_steps / oversampling).round() as u32).max(1);
+    }
+
+    fn ensure_accumulators(&mut self, dims: [usize; 3]) {
+        let cells = 3 * dims[0] * dims[1] * dims[2];
+        if self.dims != Some(dims) || self.acc_re.len() != self.frequencies.len() {
+            self.dims = Some(dims);
+            self.acc_re = vec![vec![0.0f32; cells]; self.frequencies.len()];
+            self.acc_im = vec![vec![0.0f32; cells]; self.frequencies.len()];
+            self.sample_count = 0;
+        }
     }
 
     pub fn set_dump_type(&mut self, val: i32) {
@@ -977,18 +1346,216 @@ impl Processing for ProcessFieldsFD {
         self.processing_name.clone()
     }
 
-    fn set_process_interval(&mut self, _interval: u32) {}
+    fn set_process_interval(&mut self, interval: u32) {
+        self.process_interval = interval;
+    }
 
     fn get_process_interval(&self) -> u32 {
-        0
+        self.process_interval
     }
 
     fn set_fd_oversampling(&mut self, factor: u32) {
-        self.fd_oversampling = factor;
+        self.fd_oversampling = factor.max(1);
     }
 
     fn add_frequency(&mut self, freq: f64) {
-        self.frequencies.push(freq);
+        ProcessFieldsFD::add_frequency(self, freq);
+    }
+
+    fn add_frequencies(&mut self, freqs: &[f64]) {
+        for &freq in freqs {
+            ProcessFieldsFD::add_frequency(self, freq);
+        }
+    }
+
+    fn process_fields(&mut self, num_ts: u32, interface: &EngineInterface<'_>) -> i32 {
+        if self.frequencies.is_empty() {
+            return 0;
+        }
+        if self.fd_interval == 0 {
+            self.update_interval(interface.meta.dt);
+        }
+        let interval = self.fd_interval.max(1);
+        if !num_ts.is_multiple_of(interval) {
+            return 0;
+        }
+        let dims = interface.meta.num_lines;
+        self.ensure_accumulators(dims);
+        if self.disc_lines.is_none() {
+            self.disc_lines = Some(interface.meta.disc_lines.clone());
+        }
+        let field = if self.dump_type == 1 {
+            interface.curr
+        } else {
+            interface.volt
+        };
+        let [nx, ny, nz] = dims;
+        let time = num_ts as f64 * interface.meta.dt;
+        let scale = 2.0 * interface.meta.dt * interval as f64;
+        for (frequency, (re, im)) in self
+            .frequencies
+            .iter()
+            .zip(self.acc_re.iter_mut().zip(self.acc_im.iter_mut()))
+        {
+            let argument = -2.0 * std::f64::consts::PI * frequency * time;
+            let cosine = argument.cos() * scale;
+            let sine = argument.sin() * scale;
+            let mut index = 0usize;
+            for n in 0..3 {
+                for i in 0..nx {
+                    for j in 0..ny {
+                        for k in 0..nz {
+                            let value = *field.get(n, i, j, k) as f64;
+                            re[index] += (value * cosine) as f32;
+                            im[index] += (value * sine) as f32;
+                            index += 1;
+                        }
+                    }
+                }
+            }
+        }
+        self.sample_count += 1;
+        self.get_next_interval(num_ts)
+    }
+
+    fn get_next_interval(&self, num_ts: u32) -> i32 {
+        let interval = self.fd_interval.max(1);
+        let next = interval as i32 - (num_ts % interval) as i32;
+        next.max(1)
+    }
+
+    fn check_timestep(&mut self, num_ts: u32) -> bool {
+        num_ts.is_multiple_of(self.fd_interval.max(1))
+    }
+
+    fn post_process(&mut self) {
+        if self.frequencies.is_empty() || self.acc_re.is_empty() {
+            return;
+        }
+        let Some(dims) = self.dims else {
+            return;
+        };
+        if self.file_type == HDF5_FILETYPE {
+            self.dump_hdf5(dims);
+        } else {
+            self.dump_vtk(dims);
+        }
+    }
+
+    fn reset(&mut self) {
+        for values in &mut self.acc_re {
+            values.fill(0.0);
+        }
+        for values in &mut self.acc_im {
+            values.fill(0.0);
+        }
+        self.sample_count = 0;
+        self.initialized = false;
+        self.fd_interval = 0;
+    }
+}
+
+impl ProcessFieldsFD {
+    /// Format a frequency the way the native dumpers do: integral values are
+    /// written without a fractional part.
+    pub fn frequency_label(frequency: f64) -> String {
+        if frequency.fract() == 0.0 {
+            format!("{}", frequency as i64)
+        } else {
+            format!("{frequency}")
+        }
+    }
+
+    fn dump_hdf5(&mut self, dims: [usize; 3]) {
+        let writer = HDF5FileWriter::new(&format!("{}.h5", self.name));
+        let result = (|| -> Result<(), Hdf5Error> {
+            writer.create(self.dump_type, false, true)?;
+            if let Some(lines) = &self.disc_lines {
+                let references: [&[f64]; 3] = [&lines[0], &lines[1], &lines[2]];
+                writer.write_rect_mesh(dims, references, 0, 1.0)?;
+            }
+            writer.write_frequency_list(&self.frequencies)?;
+            for (index, frequency) in self.frequencies.iter().enumerate() {
+                writer.write_complex_field(
+                    "/FieldData/FD",
+                    &format!("f{index}"),
+                    &self.acc_re[index],
+                    &self.acc_im[index],
+                    dims,
+                    *frequency,
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!(
+                "[openEMS] Failed to write frequency-domain HDF5 dump '{}': {error}",
+                self.name
+            );
+        }
+    }
+
+    fn dump_vtk(&mut self, dims: [usize; 3]) {
+        let field_name = Self::get_field_name_by_type(self.dump_type);
+        let [nx, ny, nz] = dims;
+        let coordinates: [Vec<f64>; 3] = [
+            (0..nx).map(|index| index as f64).collect(),
+            (0..ny).map(|index| index as f64).collect(),
+            (0..nz).map(|index| index as f64).collect(),
+        ];
+        let coordinate_refs: [&[f64]; 3] = [&coordinates[0], &coordinates[1], &coordinates[2]];
+        for (index, frequency) in self.frequencies.iter().enumerate() {
+            let re = &self.acc_re[index];
+            let im = &self.acc_im[index];
+            let label = Self::frequency_label(*frequency);
+            // Magnitude and phase dumps.
+            let mut magnitude = FieldArray::new("magnitude", dims);
+            let mut phase = FieldArray::new("phase", dims);
+            for n in 0..3 {
+                for i in 0..nx {
+                    for j in 0..ny {
+                        for k in 0..nz {
+                            let position = n * nx * ny * nz + i * ny * nz + j * nz + k;
+                            let real = re[position] as f64;
+                            let imag = im[position] as f64;
+                            *magnitude.get_mut(n, i, j, k) = real.hypot(imag) as f32;
+                            *phase.get_mut(n, i, j, k) = imag.atan2(real) as f32;
+                        }
+                    }
+                }
+            }
+            let _ = VTKFileWriter::new(&format!("{}_f={label}_abs", self.name))
+                .write_structured_grid(&field_name, dims, coordinate_refs, &magnitude);
+            let _ = VTKFileWriter::new(&format!("{}_f={label}_arg", self.name))
+                .write_structured_grid(&field_name, dims, coordinate_refs, &phase);
+
+            // 21 phase snapshots, matching the native VTK FD dump.
+            for step in 0..21 {
+                let angle = 2.0 * std::f64::consts::PI * step as f64 / 21.0;
+                let cosine = angle.cos();
+                let sine = angle.sin();
+                let mut snapshot = FieldArray::new("phase-snapshot", dims);
+                for n in 0..3 {
+                    for i in 0..nx {
+                        for j in 0..ny {
+                            for k in 0..nz {
+                                let position = n * nx * ny * nz + i * ny * nz + j * nz + k;
+                                let real = re[position] as f64;
+                                let imag = im[position] as f64;
+                                *snapshot.get_mut(n, i, j, k) =
+                                    (real * cosine - imag * sine) as f32;
+                            }
+                        }
+                    }
+                }
+                let degrees = (angle * 180.0 / std::f64::consts::PI).round() as i32;
+                let _ = VTKFileWriter::new(&format!(
+                    "{}_f={label}_p={degrees:03}",
+                    self.name
+                ))
+                .write_structured_grid(&field_name, dims, coordinate_refs, &snapshot);
+            }
+        }
     }
 }
 
@@ -1013,7 +1580,7 @@ impl ProcessFieldsSAR {
             start,
             stop,
             dump_type: 20, // SAR_LOCAL_DUMP
-            file_type: 1,  // VTK_FILETYPE
+            file_type: VTK_FILETYPE,
             mass_density: 1000.0, // kg/m^3 (water)
         }
     }
@@ -1299,8 +1866,11 @@ impl Processing for SAR {
 }
 
 /// HDF5 file writer for field dumps.
-/// Mirrors the C++ `HDF5_File_Writer` concept.
-#[allow(dead_code)]
+/// Mirrors the C++ `HDF5_File_Writer` class.
+///
+/// Every write goes through [`crate::hdf5::Hdf5File`], which stores the data in
+/// the native openEMS layout. Without the `hdf5` feature the methods return
+/// [`Hdf5Error::Unsupported`]; no substitute format is produced.
 pub struct HDF5FileWriter {
     filename: String,
     precision: u32,
@@ -1326,28 +1896,153 @@ impl HDF5FileWriter {
         self.precision
     }
 
-    /// Write field data to HDF5 file.
-    /// Writes a simple binary format: magic "OHDF", version, field name, precision, data count, f64 data.
-    pub fn write_field(&self, field_name: &str, data: &[f64]) {
-        use std::io::Write;
-        let mut buf = Vec::new();
-        // Magic header
-        buf.write_all(b"OHDF").unwrap();
-        buf.write_all(&1u32.to_le_bytes()).unwrap(); // version
-        // Field name
-        let name_bytes = field_name.as_bytes();
-        buf.write_all(&(name_bytes.len() as u32).to_le_bytes()).unwrap();
-        buf.write_all(name_bytes).unwrap();
-        // Precision
-        buf.write_all(&self.precision.to_le_bytes()).unwrap();
-        // Data count
-        buf.write_all(&(data.len() as u32).to_le_bytes()).unwrap();
-        // Data
-        for &v in data {
-            buf.write_all(&v.to_le_bytes()).unwrap();
+    /// Create the file and write the root metadata attributes.
+    ///
+    /// `dump_type` follows the native `DumpType` enum, `dual_mesh` records the
+    /// interpolation mesh and `legacy_fmt` selects the Octave/MATLAB ordering.
+    pub fn create(&self, dump_type: i32, dual_mesh: bool, legacy_fmt: bool) -> Result<(), Hdf5Error> {
+        let file = Hdf5File::create(&self.filename)?;
+        file.write_f64_attribute("/", "openEMS_HDF5_version", OPENEMS_HDF5_VERSION)?;
+        file.write_i32_attribute("/", "dump_type", dump_type)?;
+        file.write_bool_attribute("/", "dual_mesh", dual_mesh)?;
+        if legacy_fmt {
+            file.write_bool_attribute("/", "legacy_fmt", true)?;
         }
-        std::fs::write(&self.filename, &buf).expect("failed to write HDF5 field file");
+        Ok(())
     }
+
+    /// Write the rectilinear mesh exactly like `HDF5_File_Writer::WriteRectMesh`.
+    pub fn write_rect_mesh(
+        &self,
+        num_lines: [usize; 3],
+        disc_lines: [&[f64]; 3],
+        mesh_type: i32,
+        scaling: f64,
+    ) -> Result<(), Hdf5Error> {
+        let file = Hdf5File::open(&self.filename, true)?;
+        file.create_group("/Mesh")?;
+        file.write_i32_attribute("/Mesh", "mesh_type", mesh_type)?;
+        file.write_f64_attribute("/Mesh", "mesh_scaling", scaling)?;
+        let names = ["x", "y", "z"];
+        for axis in 0..3 {
+            let mut values = Vec::with_capacity(num_lines[axis]);
+            for &line in disc_lines[axis].iter().take(num_lines[axis]) {
+                values.push(line * scaling);
+            }
+            file.write_f64_dataset("/Mesh", names[axis], &values)?;
+        }
+        Ok(())
+    }
+
+    /// Write a scalar real field as a 1-D dataset.
+    pub fn write_field(&self, field_name: &str, data: &[f64]) -> Result<(), Hdf5Error> {
+        let file = Hdf5File::open(&self.filename, true)?;
+        file.write_f64_dataset("/", field_name, data)
+    }
+
+    /// Write a vector field in native `NXYZ` or legacy `NZYX` order.
+    pub fn write_vector_field(
+        &self,
+        group: &str,
+        dataset: &str,
+        values: &FieldArray,
+        dims: [usize; 3],
+        legacy_fmt: bool,
+    ) -> Result<(), Hdf5Error> {
+        let file = Hdf5File::open(&self.filename, true)?;
+        let raw = field_values(values, dims);
+        if legacy_fmt {
+            let ordered = crate::hdf5::field_to_nzyx(&raw, dims);
+            file.write_f32_dataset_nd(
+                group,
+                dataset,
+                &[3, dims[2], dims[1], dims[0]],
+                &ordered,
+                Some("NZYX"),
+            )
+        } else {
+            let ordered = crate::hdf5::field_to_nxyz(&raw, dims);
+            file.write_f32_dataset_nd(
+                group,
+                dataset,
+                &[3, dims[0], dims[1], dims[2]],
+                &ordered,
+                Some("NXYZ"),
+            )
+        }
+    }
+
+    /// Write the real and imaginary parts of a complex field in legacy order.
+    pub fn write_complex_field(
+        &self,
+        group: &str,
+        dataset: &str,
+        re: &[f32],
+        im: &[f32],
+        dims: [usize; 3],
+        frequency: f64,
+    ) -> Result<(), Hdf5Error> {
+        let file = Hdf5File::open(&self.filename, true)?;
+        let real = crate::hdf5::field_to_nzyx(re, dims);
+        let imag = crate::hdf5::field_to_nzyx(im, dims);
+        let shape = [3, dims[2], dims[1], dims[0]];
+        let real_name = format!("{dataset}_real");
+        let imag_name = format!("{dataset}_imag");
+        file.write_f32_dataset_nd(group, &real_name, &shape, &real, Some("NZYX"))?;
+        file.write_f32_dataset_nd(group, &imag_name, &shape, &imag, Some("NZYX"))?;
+        let real_path = format!("{group}/{real_name}");
+        let imag_path = format!("{group}/{imag_name}");
+        file.write_f64_attribute(&real_path, "frequency", frequency)?;
+        file.write_f64_attribute(&imag_path, "frequency", frequency)?;
+        Ok(())
+    }
+
+    /// Write a dataset attribute with the native time stamp.
+    pub fn write_time_attribute(&self, path: &str, time: f32) -> Result<(), Hdf5Error> {
+        let file = Hdf5File::open(&self.filename, true)?;
+        file.write_f32_attribute_vector(path, "time", &[time])
+    }
+
+    /// Write the frequency list attribute of a frequency-domain dump.
+    pub fn write_frequency_list(&self, frequencies: &[f64]) -> Result<(), Hdf5Error> {
+        let file = Hdf5File::open(&self.filename, true)?;
+        let group = "/FieldData/FD";
+        file.create_group(group)?;
+        let values: Vec<f32> = frequencies.iter().map(|&value| value as f32).collect();
+        file.write_f32_attribute_vector(group, "frequency", &values)
+    }
+}
+
+/// Flatten a field array into `(n, i, j, k)` linear order.
+/// Copy the selected mesh indices out of a full field array, preserving the
+/// `(n, i, j, k)` component-major layout used by the writers.
+fn extract_field(values: &FieldArray, indices: &[Vec<usize>; 3]) -> FieldArray {
+    let dims = [indices[0].len(), indices[1].len(), indices[2].len()];
+    let mut out = FieldArray::new("dump", dims);
+    for n in 0..3 {
+        for (ii, &i) in indices[0].iter().enumerate() {
+            for (jj, &j) in indices[1].iter().enumerate() {
+                for (kk, &k) in indices[2].iter().enumerate() {
+                    *out.get_mut(n, ii, jj, kk) = *values.get(n, i, j, k);
+                }
+            }
+        }
+    }
+    out
+}
+fn field_values(values: &FieldArray, dims: [usize; 3]) -> Vec<f32> {
+    let [nx, ny, nz] = dims;
+    let mut out = Vec::with_capacity(3 * nx * ny * nz);
+    for n in 0..3 {
+        for i in 0..nx {
+            for j in 0..ny {
+                for k in 0..nz {
+                    out.push(*values.get(n, i, j, k));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// VTK file writer for field dumps.
@@ -1403,6 +2098,60 @@ impl VTKFileWriter {
             w(&format!("{:.precision$}", v, precision = self.precision as usize));
         }
         w("\n");
+    }
+
+    /// Write a real 3-D vector field on a rectilinear structured grid.
+    /// Supports non-uniform meshes by emitting explicit point coordinates.
+    pub fn write_structured_grid(
+        &self,
+        field_name: &str,
+        dims: [usize; 3],
+        coordinates: [&[f64]; 3],
+        values: &FieldArray,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+        let [nx, ny, nz] = dims;
+        let points = nx.saturating_mul(ny).saturating_mul(nz);
+        let filename = format!("{}.vtk", self.filename_prefix);
+        let mut file = std::fs::File::create(&filename)?;
+        let precision = self.precision as usize;
+        writeln!(file, "# vtk DataFile Version 3.0")?;
+        writeln!(file, "openEMS field data")?;
+        writeln!(file, "ASCII")?;
+        writeln!(file, "DATASET STRUCTURED_GRID")?;
+        writeln!(file, "DIMENSIONS {nx} {ny} {nz}")?;
+        writeln!(file, "POINTS {points} double")?;
+        for k in 0..nz {
+            for j in 0..ny {
+                for i in 0..nx {
+                    writeln!(
+                        file,
+                        "{:.precision$} {:.precision$} {:.precision$}",
+                        coordinates[0].get(i).copied().unwrap_or(0.0),
+                        coordinates[1].get(j).copied().unwrap_or(0.0),
+                        coordinates[2].get(k).copied().unwrap_or(0.0),
+                        precision = precision
+                    )?;
+                }
+            }
+        }
+        writeln!(file, "POINT_DATA {points}")?;
+        writeln!(file, "VECTORS {field_name} double")?;
+        for k in 0..nz {
+            for j in 0..ny {
+                for i in 0..nx {
+                    writeln!(
+                        file,
+                        "{:.precision$} {:.precision$} {:.precision$}",
+                        *values.get(0, i, j, k),
+                        *values.get(1, i, j, k),
+                        *values.get(2, i, j, k),
+                        precision = precision
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1607,7 +2356,7 @@ mod tests {
         let fields = ProcessFields::new("dump", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
         assert_eq!(fields.get_processing_name(), "common field processing");
         assert_eq!(fields.get_dump_type(), 0); // E_FIELD_DUMP
-        assert_eq!(fields.get_file_type(), 1); // VTK_FILETYPE
+        assert_eq!(fields.get_file_type(), VTK_FILETYPE);
     }
 
     #[test]
@@ -1620,8 +2369,8 @@ mod tests {
     #[test]
     fn test_process_fields_file_type() {
         let mut fields = ProcessFields::new("dump", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
-        fields.set_file_type(0); // HDF5_FILETYPE
-        assert_eq!(fields.get_file_type(), 0);
+        fields.set_file_type(HDF5_FILETYPE);
+        assert_eq!(fields.get_file_type(), HDF5_FILETYPE);
     }
 
     #[test]
@@ -1660,8 +2409,14 @@ mod tests {
         assert_eq!(ProcessFields::get_field_name_by_type(0), "E-Field");
         assert_eq!(ProcessFields::get_field_name_by_type(1), "H-Field");
         assert_eq!(ProcessFields::get_field_name_by_type(2), "J-Field");
+        assert_eq!(ProcessFields::get_field_name_by_type(3), "RotH-Field");
+        assert_eq!(ProcessFields::get_field_name_by_type(4), "D-Field");
         assert_eq!(ProcessFields::get_field_name_by_type(5), "B-Field");
-        assert_eq!(ProcessFields::get_field_name_by_type(20), "SAR-Local");
+        assert_eq!(ProcessFields::get_field_name_by_type(20), "SAR-local");
+        assert_eq!(ProcessFields::get_field_name_by_type(21), "SAR_1g");
+        assert_eq!(ProcessFields::get_field_name_by_type(22), "SAR_10g");
+        assert_eq!(ProcessFields::get_field_name_by_type(29), "SAR_raw_data");
+        assert_eq!(ProcessFields::get_field_name_by_type(99), "unknown field");
     }
 
     #[test]
@@ -1768,7 +2523,7 @@ mod tests {
         let td = ProcessFieldsTD::new("td_dump", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
         assert_eq!(td.get_processing_name(), "time-domain field dump");
         assert_eq!(td.get_dump_type(), 0); // E_FIELD_DUMP
-        assert_eq!(td.get_file_type(), 1); // VTK_FILETYPE
+        assert_eq!(td.get_file_type(), VTK_FILETYPE);
         assert!(td.need_conductivity());
         assert!(td.need_permittivity());
         assert!(td.need_permeability());
@@ -1879,8 +2634,13 @@ mod tests {
         assert_eq!(writer.get_precision(), 12);
         writer.set_precision(6);
         assert_eq!(writer.get_precision(), 6);
-        // write_field should not panic (placeholder).
-        writer.write_field("E-Field", &[1.0, 2.0, 3.0]);
+        // Without the `hdf5` feature every write reports the same explicit error
+        // instead of silently producing a private format.
+        #[cfg(not(feature = "hdf5"))]
+        assert_eq!(
+            writer.write_field("E-Field", &[1.0, 2.0, 3.0]),
+            Err(Hdf5Error::Unsupported)
+        );
     }
 
     #[test]
@@ -1892,5 +2652,460 @@ mod tests {
         assert_eq!(writer.get_precision(), 6);
         // write_field should not panic (placeholder).
         writer.write_field("E-Field", &[1.0, 2.0, 3.0]);
+    }
+}
+
+#[cfg(test)]
+mod engine_interface_tests {
+    use super::*;
+
+    #[test]
+    fn field_probe_samples_engine_fields() {
+        let lines = vec![0.0, 1.0, 2.0];
+        let meta = EngineMeta {
+            num_lines: [3, 3, 3],
+            disc_lines: [lines.clone(), lines.clone(), lines],
+            dt: 1.0e-12,
+        };
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        *volt.get_mut(0, 1, 1, 1) = 3.5;
+        let curr = FieldArray::new("curr", [3, 3, 3]);
+        let mut probe = FieldProbe::new("probe", [1.0, 1.0, 1.0]);
+        let interface = EngineInterface {
+            meta: &meta,
+            volt: &volt,
+            curr: &curr,
+        };
+        probe.process_fields(1, &interface);
+        assert_eq!(probe.samples(), &[3.5]);
+        // A position outside the mesh records nothing.
+        probe.set_name("outside");
+        let mut outside = FieldProbe::new("outside", [99.0, 0.0, 0.0]);
+        outside.process_fields(2, &interface);
+        assert!(outside.samples().is_empty());
+    }
+
+    #[test]
+    fn field_probe_accumulates_dft() {
+        let lines = vec![0.0, 1.0, 2.0];
+        let meta = EngineMeta {
+            num_lines: [3, 3, 3],
+            disc_lines: [lines.clone(), lines.clone(), lines],
+            dt: 1.0e-12,
+        };
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        let curr = FieldArray::new("curr", [3, 3, 3]);
+        let mut probe = FieldProbe::new("probe", [1.0, 1.0, 1.0]);
+        probe.add_frequency(10.0e9);
+        probe.add_frequency(5.0e9);
+        probe.add_frequency(10.0e9); // duplicate ignored
+        assert_eq!(probe.frequencies().len(), 2);
+        assert_eq!(probe.fd_oversampling(), 1);
+
+        let signal_frequency = 10.0e9;
+        let steps = 1_000usize; // 10 periods at dt = 1 ps
+        for step in 0..steps {
+            let time = step as f64 * meta.dt;
+            *volt.get_mut(0, 1, 1, 1) =
+                (2.0 * std::f64::consts::PI * signal_frequency * time).sin() as f32;
+            let interface = EngineInterface {
+                meta: &meta,
+                volt: &volt,
+                curr: &curr,
+            };
+            probe.process_fields(step as u32, &interface);
+        }
+
+        assert_eq!(probe.samples().len(), steps);
+        let on_bin = probe.dft()[0].magnitude();
+        let off_bin = probe.dft()[1].magnitude();
+        assert!(
+            on_bin > 100.0 * off_bin,
+            "DFT peak not at the signal frequency: on={on_bin:e}, off={off_bin:e}"
+        );
+        let expected = steps as f64 / 2.0;
+        assert!(
+            (on_bin - expected).abs() / expected < 1.0e-3,
+            "DFT amplitude {on_bin:e} vs expected {expected:e}"
+        );
+
+        probe.reset();
+        assert!(probe.samples().is_empty());
+        assert_eq!(probe.dft()[0], ComplexPoint::default());
+        assert_eq!(probe.frequencies().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod vtk_tests {
+    use super::*;
+
+    #[test]
+    fn process_fields_td_writes_real_vtk() {
+        let prefix = std::env::temp_dir().join(format!("oems_td_{}", std::process::id()));
+        let prefix = prefix.to_string_lossy().to_string();
+        let lines = vec![0.0, 1.0, 2.0];
+        let meta = EngineMeta {
+            num_lines: [3, 3, 3],
+            disc_lines: [lines.clone(), lines.clone(), lines],
+            dt: 1.0e-12,
+        };
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        *volt.get_mut(0, 1, 1, 1) = 5.0;
+        *volt.get_mut(1, 1, 1, 1) = 6.0;
+        *volt.get_mut(2, 1, 1, 1) = 7.0;
+        let curr = FieldArray::new("curr", [3, 3, 3]);
+        let interface = EngineInterface {
+            meta: &meta,
+            volt: &volt,
+            curr: &curr,
+        };
+        let mut dump = ProcessFieldsTD::new(&prefix, [0.0; 3], [2.0; 3]);
+        dump.process_fields(1, &interface);
+
+        let filename = format!("{prefix}_0000000001.vtk");
+        let content = std::fs::read_to_string(&filename).expect("VTK dump should exist");
+        assert!(content.contains("DATASET STRUCTURED_GRID"));
+        assert!(content.contains("DIMENSIONS 3 3 3"));
+        assert!(content.contains("POINTS 27 double"));
+        assert!(content.contains("VECTORS E-Field double"));
+        assert!(content.contains("5.000000000000"));
+        assert!(content.contains("7.000000000000"));
+        let _ = std::fs::remove_file(filename);
+    }
+}
+
+#[cfg(test)]
+mod fd_dump_tests {
+    use super::*;
+
+    fn meta(dt: f64) -> EngineMeta {
+        let lines = vec![0.0, 1.0, 2.0];
+        EngineMeta {
+            num_lines: [3, 3, 3],
+            disc_lines: [lines.clone(), lines.clone(), lines],
+            dt,
+        }
+    }
+
+    #[test]
+    fn frequency_domain_accumulates_a_known_tone() {
+        let meta = meta(1.0e-12);
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        let curr = FieldArray::new("curr", [3, 3, 3]);
+        let mut dump = ProcessFieldsFD::new("fd", [0.0; 3], [2.0; 3]);
+        dump.add_frequency(10.0e9);
+        dump.add_frequency(5.0e9);
+        dump.add_frequency(10.0e9); // duplicate ignored
+        assert_eq!(dump.get_frequencies().len(), 2);
+
+        let signal = 10.0e9;
+        let steps = 2_000u32;
+        for step in 0..steps {
+            let time = step as f64 * meta.dt;
+            *volt.get_mut(0, 1, 1, 1) =
+                (2.0 * std::f64::consts::PI * signal * time).sin() as f32;
+            let interface = EngineInterface {
+                meta: &meta,
+                volt: &volt,
+                curr: &curr,
+            };
+            dump.process_fields(step, &interface);
+        }
+
+        let samples = dump.sample_count();
+        assert!(samples > 100, "too few samples: {samples}");
+        let interval = dump.fd_interval() as f64;
+        let expected = (samples as f64) * meta.dt * interval;
+        let re = dump.real_part(0).expect("real");
+        let im = dump.imag_part(0).expect("imag");
+        let position = 1 * 3 * 3 + 1 * 3 + 1;
+        // Only the (1,1,1) cell is non-zero.
+        assert!(re[0].abs() < 1e-20);
+        let magnitude = (re[position] as f64).hypot(im[position] as f64);
+        assert!(
+            (magnitude - expected).abs() / expected < 1.0e-3,
+            "magnitude {magnitude:e} vs expected {expected:e}"
+        );
+        // The off-frequency bin is far smaller.
+        let off_re = dump.real_part(1).unwrap();
+        let off_im = dump.imag_part(1).unwrap();
+        let off = (off_re[position] as f64).hypot(off_im[position] as f64);
+        assert!(off < magnitude * 1.0e-2, "off bin {off:e} vs {magnitude:e}");
+    }
+
+    #[test]
+    fn fd_interval_follows_nyquist_and_oversampling() {
+        let mut dump = ProcessFieldsFD::new("fd", [0.0; 3], [1.0; 3]);
+        dump.set_fd_oversampling(4);
+        dump.add_frequency(10.0e9);
+        let meta = meta(1.0e-12);
+        let volt = FieldArray::new("volt", [3, 3, 3]);
+        let curr = FieldArray::new("curr", [3, 3, 3]);
+        let interface = EngineInterface {
+            meta: &meta,
+            volt: &volt,
+            curr: &curr,
+        };
+        dump.process_fields(0, &interface);
+        // nyquist = 1/(2*10e9*1e-12) = 50 steps; /4 = 12.5 -> 13
+        assert_eq!(dump.fd_interval(), 13);
+        dump.reset();
+        assert_eq!(dump.sample_count(), 0);
+        assert_eq!(dump.fd_interval(), 0);
+    }
+
+    #[test]
+    fn frequency_labels_match_native_formatting() {
+        assert_eq!(ProcessFieldsFD::frequency_label(1.0e9), "1000000000");
+        assert_eq!(ProcessFieldsFD::frequency_label(2.5e9), "2500000000");
+    }
+
+    #[test]
+    fn fd_vtk_dump_writes_magnitude_phase_and_snapshots() {
+        let directory = std::env::temp_dir().join(format!("oems_fd_{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let prefix = directory.join("fd");
+        let prefix = prefix.to_string_lossy().to_string();
+        let meta = meta(1.0e-12);
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        let curr = FieldArray::new("curr", [3, 3, 3]);
+        let mut dump = ProcessFieldsFD::new(&prefix, [0.0; 3], [2.0; 3]);
+        dump.add_frequency(1.0e9);
+        for step in 0..200u32 {
+            *volt.get_mut(0, 1, 1, 1) = (step as f32 * 0.1).sin();
+            let interface = EngineInterface {
+                meta: &meta,
+                volt: &volt,
+                curr: &curr,
+            };
+            dump.process_fields(step, &interface);
+        }
+        dump.post_process();
+        let abs = format!("{prefix}_f=1000000000_abs.vtk");
+        let arg = format!("{prefix}_f=1000000000_arg.vtk");
+        let phase = format!("{prefix}_f=1000000000_p=000.vtk");
+        for path in [&abs, &arg, &phase] {
+            assert!(std::path::Path::new(path).exists(), "missing {path}");
+            let text = std::fs::read_to_string(path).unwrap();
+            assert!(text.contains("DATASET STRUCTURED_GRID"));
+            assert!(text.contains("VECTORS E-Field double"));
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+#[cfg(all(test, feature = "hdf5"))]
+mod hdf5_dump_tests {
+    use super::*;
+
+    fn meta(dt: f64) -> EngineMeta {
+        let lines = vec![0.0, 1.0, 2.0];
+        EngineMeta {
+            num_lines: [3, 3, 3],
+            disc_lines: [lines.clone(), lines.clone(), lines],
+            dt,
+        }
+    }
+
+    fn temp_prefix(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("oems_{name}_{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn time_domain_dump_writes_native_hdf5_layout() {
+        let prefix = temp_prefix("td_h5");
+        let meta = meta(1.0e-12);
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        let curr = FieldArray::new("curr", [3, 3, 3]);
+        for n in 0..3 {
+            *volt.get_mut(n, 1, 1, 1) = n as f32 + 1.0;
+        }
+        let mut dump = ProcessFieldsTD::new(&prefix, [0.0; 3], [2.0; 3]);
+        dump.set_file_type(HDF5_FILETYPE);
+        let interface = EngineInterface {
+            meta: &meta,
+            volt: &volt,
+            curr: &curr,
+        };
+        dump.process_fields(1, &interface);
+        dump.process_fields(2, &interface);
+
+        let path = format!("{prefix}.h5");
+        let file = Hdf5File::open(&path, false).expect("open dump");
+        assert_eq!(
+            file.read_f64_attribute("/", "openEMS_HDF5_version").unwrap(),
+            OPENEMS_HDF5_VERSION
+        );
+        assert_eq!(file.read_i32_attribute("/", "dump_type").unwrap(), 0);
+        assert!(file.read_bool_attribute("/", "legacy_fmt").unwrap());
+        let (dims, x) = file.read_f64_dataset("/Mesh/x").unwrap();
+        assert_eq!(dims, vec![3]);
+        assert_eq!(x, vec![0.0, 1.0, 2.0]);
+        assert_eq!(file.read_i32_attribute("/Mesh", "mesh_type").unwrap(), 0);
+
+        let (dims, values) = file.read_f32_dataset("/FieldData/TD/00000001").unwrap();
+        // legacy NZYX ordering: [3][nz][ny][nx]
+        assert_eq!(dims, vec![3, 3, 3, 3]);
+        // The (1,1,1) cell of component 0 holds 1.0; index = n*27 + k*9 + j*3 + i
+        let index = 0 * 27 + 1 * 9 + 1 * 3 + 1;
+        assert_eq!(values[index], 1.0);
+        let component_y = 1 * 27 + 1 * 9 + 1 * 3 + 1;
+        assert_eq!(values[component_y], 2.0);
+        let component_z = 2 * 27 + 1 * 9 + 1 * 3 + 1;
+        assert_eq!(values[component_z], 3.0);
+        assert_eq!(
+            file.read_string_attribute("/FieldData/TD/00000001", "d_order").unwrap(),
+            "NZYX"
+        );
+        let time = file
+            .read_f32_attribute_vector("/FieldData/TD/00000001", "time")
+            .unwrap();
+        assert!((time[0] - 1.0e-12f32).abs() < 1.0e-18);
+        assert!(file.exists("/FieldData/TD/00000002"));
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn frequency_domain_dump_writes_native_hdf5_layout() {
+        let prefix = temp_prefix("fd_h5");
+        let meta = meta(1.0e-12);
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        let curr = FieldArray::new("curr", [3, 3, 3]);
+        let mut dump = ProcessFieldsFD::new(&prefix, [0.0; 3], [2.0; 3]);
+        dump.set_file_type(HDF5_FILETYPE);
+        dump.add_frequency(1.0e9);
+        for step in 0..400u32 {
+            let time = step as f64 * meta.dt;
+            *volt.get_mut(2, 2, 1, 1) =
+                (2.0 * std::f64::consts::PI * 1.0e9 * time).sin() as f32;
+            let interface = EngineInterface {
+                meta: &meta,
+                volt: &volt,
+                curr: &curr,
+            };
+            dump.process_fields(step, &interface);
+        }
+        dump.post_process();
+
+        let path = format!("{prefix}.h5");
+        let file = Hdf5File::open(&path, false).expect("open dump");
+        let frequencies = file
+            .read_f32_attribute_vector("/FieldData/FD", "frequency")
+            .unwrap();
+        assert_eq!(frequencies, vec![1.0e9]);
+        let (dims, re) = file
+            .read_f32_dataset("/FieldData/FD/f0_real")
+            .expect("legacy real dataset");
+        assert_eq!(dims, vec![3, 3, 3, 3]);
+        assert!(re.iter().all(|value| value.abs() < 1.0e-6));
+        let (imag_dims, im) = file
+            .read_f32_dataset("/FieldData/FD/f0_imag")
+            .expect("legacy imaginary dataset");
+        assert_eq!(imag_dims, dims);
+        assert_eq!(im.len(), re.len());
+        assert!(
+            im.iter().any(|value| value.abs() > 0.0),
+            "the sine tone must accumulate a non-zero imaginary part"
+        );
+        assert_eq!(
+            file.read_f64_attribute("/FieldData/FD/f0_real", "frequency")
+                .unwrap(),
+            1.0e9
+        );
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod dump_scheduling_tests {
+    use super::*;
+
+    fn meta() -> EngineMeta {
+        let lines = vec![0.0, 1.0, 2.0, 3.0, 4.0];
+        EngineMeta {
+            num_lines: [5, 5, 5],
+            disc_lines: [lines.clone(), lines.clone(), lines],
+            dt: 1.0e-12,
+        }
+    }
+
+    fn prefix(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("oems_{name}_{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn sub_sampling_and_optical_resolution_reduce_the_dump_mesh() {
+        let lines = vec![0.0, 1.0, 2.0, 3.0, 4.0];
+        let mut dump = ProcessFieldsTD::new("d", [0.0; 3], [4.0; 3]);
+        assert_eq!(dump.dump_indices(0, &lines), vec![0, 1, 2, 3, 4]);
+
+        dump.set_sub_sampling(2, -1);
+        assert_eq!(dump.dump_indices(0, &lines), vec![0, 2, 4]);
+        dump.set_sub_sampling(3, 1);
+        assert_eq!(dump.dump_indices(1, &lines), vec![0, 3]);
+        assert_eq!(dump.dump_indices(0, &lines), vec![0, 2, 4]);
+
+        dump.set_opt_resolution(2.5, -1);
+        assert_eq!(dump.dump_indices(0, &lines), vec![0, 3]);
+        assert_eq!(dump.sub_sampling, [1, 1, 1]);
+    }
+
+    #[test]
+    fn time_domain_dump_writes_the_native_timestep_sequence() {
+        let prefix = prefix("td_seq");
+        let meta = meta();
+        let mut volt = FieldArray::new("volt", [5, 5, 5]);
+        *volt.get_mut(2, 2, 2, 2) = 4.0;
+        let curr = FieldArray::new("curr", [5, 5, 5]);
+        let interface = EngineInterface {
+            meta: &meta,
+            volt: &volt,
+            curr: &curr,
+        };
+        let mut dump = ProcessFieldsTD::new(&prefix, [0.0; 3], [4.0; 3]);
+        dump.set_process_interval(2);
+        dump.process_fields(1, &interface);
+        dump.process_fields(2, &interface);
+        dump.process_fields(3, &interface);
+
+        let eleven = format!("{prefix}_0000000002.vtk");
+        assert!(std::path::Path::new(&eleven).exists(), "missing {eleven}");
+        let four = format!("{prefix}_0000000004.vtk");
+        assert!(!std::path::Path::new(&four).exists());
+        let _ = std::fs::remove_file(eleven);
+    }
+
+    #[test]
+    fn time_domain_dump_sub_sampling_changes_the_written_grid() {
+        let prefix = prefix("td_sub");
+        let meta = meta();
+        let mut volt = FieldArray::new("volt", [5, 5, 5]);
+        *volt.get_mut(2, 4, 4, 4) = 9.0;
+        let curr = FieldArray::new("curr", [5, 5, 5]);
+        let interface = EngineInterface {
+            meta: &meta,
+            volt: &volt,
+            curr: &curr,
+        };
+        let mut dump = ProcessFieldsTD::new(&prefix, [0.0; 3], [4.0; 3]);
+        dump.set_sub_sampling(2, -1);
+        dump.process_fields(1, &interface);
+
+        let filename = format!("{prefix}_0000000001.vtk");
+        let text = std::fs::read_to_string(&filename).expect("dump exists");
+        assert!(text.contains("DIMENSIONS 3 3 3"), "{text}");
+        assert!(text.contains("POINTS 27 double"));
+        assert!(text.contains("9.000000000000"));
+        let _ = std::fs::remove_file(filename);
     }
 }
