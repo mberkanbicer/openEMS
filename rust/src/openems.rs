@@ -451,11 +451,21 @@ impl OpenEMS {
             .excitation
             .as_deref()
             .map(|signal| op.build_excitation_extension(signal));
+        // Native `SetupFDTD`: periodic signals get steady-state detection.
+        let steady_state_extension = self
+            .excitation
+            .as_deref()
+            .map(|signal| signal.signal_period())
+            .filter(|&period| period > 0)
+            .and_then(|period| op.build_steady_state_extension(period));
 
         // Box as trait object for the engine (unsizing coercion).
         let op_dyn: Box<dyn OperatorBase> = Box::new(op);
         let mut engine = Engine::new(op_dyn);
         for extension in upml_extensions {
+            engine.add_extension(Box::new(extension));
+        }
+        if let Some(extension) = steady_state_extension {
             engine.add_extension(Box::new(extension));
         }
         if !mur_extension.faces.is_empty() {
@@ -528,6 +538,7 @@ impl OpenEMS {
 
         let mut ts = 0u32;
         let mut change: f64 = 1.0;
+        let mut max_energy: f64 = 0.0;
 
         while ts < ts_limit && change > end_crit && !self.check_abort_cond() {
             // Execute one timestep (voltage + current updates with extensions).
@@ -546,8 +557,22 @@ impl OpenEMS {
             }
 
             // Check steady-state end criteria.
-            if let Some(diff) = self.fdtd_eng.as_ref().unwrap().get_steady_state_diff() {
-                change = diff as f64;
+            // Steady-state end criterion: the extension metric when a periodic
+            // signal provides one, otherwise the native energy fallback
+            // (`currE / maxE`) evaluated on the progress cadence.
+            match self.fdtd_eng.as_ref().unwrap().get_steady_state_diff() {
+                Some(diff) => change = diff as f64,
+                None => {
+                    if ts.is_multiple_of(100) {
+                        let energy = self.fdtd_eng.as_ref().unwrap().fast_energy();
+                        if energy > max_energy {
+                            max_energy = energy;
+                        }
+                        if max_energy > 0.0 {
+                            change = energy / max_energy;
+                        }
+                    }
+                }
             }
 
             // Progress reporting every 100 steps.
@@ -1004,5 +1029,103 @@ mod pml_setup_tests {
             sim.set_pml_size(face, 40);
         }
         assert!(!sim.setup_fdtd());
+    }
+}
+
+#[cfg(test)]
+mod steady_state_wiring_tests {
+    use super::*;
+
+    fn mesh_xml() -> String {
+        let lines = |count: usize| {
+            (0..count)
+                .map(|index| index.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            r#"<ContinuousStructure CoordSystem="0">
+                <RectilinearGrid DeltaUnit="0.001">
+                    <XLines>{}</XLines>
+                    <YLines>{}</YLines>
+                    <ZLines>{}</ZLines>
+                </RectilinearGrid>
+                <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                <Properties>
+                    <Excitation Number="0" Enabled="1" Frequency="5e9" Delay="0" Type="0" Excite="1,0,0" PropDir="0,0,0">
+                        <Primitives>
+                            <Box Priority="0"><P1 X="10" Y="10" Z="10"/><P2 X="10" Y="11" Z="11"/></Box>
+                        </Primitives>
+                    </Excitation>
+                </Properties>
+            </ContinuousStructure>"#,
+            lines(21),
+            lines(21),
+            lines(21)
+        )
+    }
+
+    #[test]
+    fn periodic_excitation_registers_steady_state_detection() {
+        let mut sim = OpenEMS::new();
+        sim.set_csx_xml(mesh_xml());
+        sim.set_sinus_excite(5.0e9);
+        for face in 0..6 {
+            sim.set_bc_type(face, BC_PML);
+            sim.set_pml_size(face, 4);
+        }
+        sim.set_number_of_time_steps(20);
+        assert!(sim.setup_fdtd());
+        assert!(sim.run_fdtd());
+        assert!(
+            sim.fdtd_eng
+                .as_ref()
+                .unwrap()
+                .get_steady_state_diff()
+                .is_some(),
+            "the periodic excitation must register the steady-state metric"
+        );
+    }
+
+    #[test]
+    fn steady_state_end_criteria_stops_a_periodic_run_early() {
+        let mut sim = OpenEMS::new();
+        sim.set_csx_xml(mesh_xml());
+        sim.set_sinus_excite(5.0e9);
+        for face in 0..6 {
+            sim.set_bc_type(face, BC_PML);
+            sim.set_pml_size(face, 4);
+        }
+        sim.set_number_of_time_steps(4_000);
+        // A loose criterion so the test does not depend on the exact decay.
+        sim.set_end_criteria(0.5);
+        assert!(sim.setup_fdtd());
+        assert!(sim.run_fdtd());
+        let steps = sim.fdtd_eng.as_ref().unwrap().get_number_of_timesteps();
+        assert!(
+            steps < 4_000,
+            "steady-state criterion did not stop the run ({steps} steps)"
+        );
+    }
+
+    #[test]
+    fn aperiodic_excitation_uses_the_energy_end_criteria() {
+        let mut sim = OpenEMS::new();
+        sim.set_csx_xml(mesh_xml());
+        sim.set_gauss_excite(6.0e9, 6.0e9);
+        for face in 0..6 {
+            sim.set_bc_type(face, BC_PML);
+            sim.set_pml_size(face, 4);
+        }
+        sim.set_number_of_time_steps(400);
+        assert!(sim.setup_fdtd());
+        assert!(sim.run_fdtd());
+        // No steady-state extension for a pulsed signal.
+        assert!(sim
+            .fdtd_eng
+            .as_ref()
+            .unwrap()
+            .get_steady_state_diff()
+            .is_none());
     }
 }

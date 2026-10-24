@@ -56,6 +56,24 @@ impl Engine {
         None
     }
 
+    /// Sum of the squared voltage and current components over the interior
+    /// cells, mirroring `Engine_Interface_FDTD::CalcFastEnergy`.
+    pub fn fast_energy(&self) -> f64 {
+        let mut energy = 0.0;
+        for n in 0..3 {
+            for i in 0..self.num_lines[0].saturating_sub(1) {
+                for j in 0..self.num_lines[1].saturating_sub(1) {
+                    for k in 0..self.num_lines[2].saturating_sub(1) {
+                        let v = *self.volt_ptr.get(n, i, j, k) as f64;
+                        let c = *self.curr_ptr.get(n, i, j, k) as f64;
+                        energy += v * v + c * c;
+                    }
+                }
+            }
+        }
+        energy
+    }
+
     /// Execute pre-voltage extension updates (highest priority last).
     pub fn do_pre_voltage_updates(&mut self) {
         self.extensions

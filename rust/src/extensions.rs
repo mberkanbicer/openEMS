@@ -129,6 +129,29 @@ impl Default for EngineExtExcitation {
     }
 }
 
+impl EngineExtExcitation {
+    /// Sample index for an excitation at timestep `ts`.
+    ///
+    /// Mirrors `Engine_Ext_Excitation`: a periodic signal repeats every
+    /// `signal_period()` samples, and indices outside the built signal are
+    /// skipped instead of extrapolated.
+    fn sample_index(signal: &Excitation, ts: u32, delay: u32) -> Option<usize> {
+        if ts < delay {
+            return None;
+        }
+        let mut position = (ts - delay) as usize;
+        let period = signal.signal_period() as usize;
+        if period > 0 {
+            position %= period;
+        }
+        if position < signal.signal_length() as usize {
+            Some(position)
+        } else {
+            None
+        }
+    }
+}
+
 impl EngineExtension for EngineExtExcitation {
     fn get_priority(&self) -> i32 {
         ENG_EXT_PRIO_EXCITATION
@@ -141,11 +164,10 @@ impl EngineExtension for EngineExtExcitation {
     fn apply2_voltages(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
         let ts = self.current_ts;
         for exc in &self.voltage_excitations {
-            if ts < exc.delay {
+            let Some(index) = Self::sample_index(&exc.signal, ts, exc.delay) else {
                 continue;
-            }
-            let rel_ts = ts - exc.delay;
-            let val = exc.signal.voltage(rel_ts as usize);
+            };
+            let val = exc.signal.voltage(index);
             let cur = *volt.get(exc.component, exc.pos[0], exc.pos[1], exc.pos[2]);
             *volt.get_mut(exc.component, exc.pos[0], exc.pos[1], exc.pos[2]) =
                 cur + exc.amp * val;
@@ -155,11 +177,10 @@ impl EngineExtension for EngineExtExcitation {
     fn apply2_current(&mut self, _volt: &FieldArray, curr: &mut FieldArray) {
         let ts = self.current_ts;
         for exc in &self.current_excitations {
-            if ts < exc.delay {
+            let Some(index) = Self::sample_index(&exc.signal, ts, exc.delay) else {
                 continue;
-            }
-            let rel_ts = ts - exc.delay;
-            let val = exc.signal.current(rel_ts as usize);
+            };
+            let val = exc.signal.current(index);
             let cur = *curr.get(exc.component, exc.pos[0], exc.pos[1], exc.pos[2]);
             *curr.get_mut(exc.component, exc.pos[0], exc.pos[1], exc.pos[2]) =
                 cur + exc.amp * val;
@@ -2012,31 +2033,85 @@ pub struct EngineExtSteadyState {
     e_records: Vec<Vec<FDTD_FLOAT>>,
     /// Last computed max difference (steady-state convergence metric)
     last_max_diff: FDTD_FLOAT,
+    /// Mesh line counts; enables the native total-energy term when non-zero.
+    num_lines: [usize; 3],
+    /// Total field energy at the previous evaluation.
+    last_total_energy: f64,
 }
 
 impl EngineExtSteadyState {
     pub fn new(ts_period: usize) -> Self {
+        Self::with_num_lines(ts_period, [0, 0, 0])
+    }
+
+    /// Create the extension with the mesh size so the native total-energy
+    /// comparison (`CalcFastEnergy`) is included in the metric.
+    pub fn with_num_lines(ts_period: usize, num_lines: [usize; 3]) -> Self {
         Self {
             ts_period,
             num_ts: 0,
             probe_pos: Vec::new(),
             probe_dir: Vec::new(),
             e_records: Vec::new(),
-            last_max_diff: FDTD_FLOAT::default(),
+            // Native starts at 1 so a run is never declared converged before
+            // the first evaluation.
+            last_max_diff: 1.0,
+            num_lines,
+            last_total_energy: 0.0,
         }
     }
 
     /// Add an E-field probe at the given position and component.
-    pub fn add_e_probe(&mut self, pos: [usize; 3], dir: usize) {
+    pub fn add_e_probe(&mut self, pos: [usize; 3], dir: usize) -> bool {
+        if dir > 2 {
+            return false;
+        }
+        if self.num_lines.iter().all(|&lines| lines > 0)
+            && (0..3).any(|axis| pos[axis] >= self.num_lines[axis])
+        {
+            return false;
+        }
         self.probe_pos.push(pos);
         self.probe_dir.push(dir);
         self.e_records
             .push(vec![FDTD_FLOAT::default(); 2 * self.ts_period]);
+        true
+    }
+
+    /// Sum of the squared voltage and current components over the interior
+    /// cells, mirroring `Engine_Interface_FDTD::CalcFastEnergy`.
+    fn fast_energy(&self, volt: &FieldArray, curr: &FieldArray) -> f64 {
+        if self.num_lines.iter().any(|&lines| lines == 0) {
+            return 0.0;
+        }
+        let mut energy = 0.0;
+        for n in 0..3 {
+            for i in 0..self.num_lines[0].saturating_sub(1) {
+                for j in 0..self.num_lines[1].saturating_sub(1) {
+                    for k in 0..self.num_lines[2].saturating_sub(1) {
+                        let v = *volt.get(n, i, j, k) as f64;
+                        let c = *curr.get(n, i, j, k) as f64;
+                        energy += v * v + c * c;
+                    }
+                }
+            }
+        }
+        energy
     }
 
     /// Get the last computed max difference (steady-state convergence metric).
     pub fn get_last_diff(&self) -> FDTD_FLOAT {
         self.last_max_diff
+    }
+
+    /// Probe positions, in the order they were added.
+    pub fn probe_positions(&self) -> &[[usize; 3]] {
+        &self.probe_pos
+    }
+
+    /// Probe components (0=Ex, 1=Ey, 2=Ez), in the same order.
+    pub fn probe_components(&self) -> &[usize] {
+        &self.probe_dir
     }
 }
 
@@ -2053,10 +2128,13 @@ impl EngineExtension for EngineExtSteadyState {
         Some(self.get_last_diff())
     }
 
-    fn apply2_voltages(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+    fn apply2_voltages(&mut self, volt: &mut FieldArray, curr: &FieldArray) {
         self.num_ts += 1;
         let p = self.ts_period;
         let ts = self.num_ts;
+        if p == 0 {
+            return;
+        }
         let rel_pos = ts % (2 * p);
 
         // Record E-field values at probe positions
@@ -2070,6 +2148,17 @@ impl EngineExtension for EngineExtSteadyState {
         if ts.is_multiple_of(p) && ts >= 2 * p {
             let mut no_valid = true;
             self.last_max_diff = FDTD_FLOAT::default();
+
+            // Native total-energy term (`CalcFastEnergy`).
+            if self.num_lines.iter().all(|&lines| lines > 0) {
+                let current_energy = self.fast_energy(volt, curr);
+                if self.last_total_energy > 0.0 {
+                    self.last_max_diff = ((current_energy - self.last_total_energy).abs()
+                        / self.last_total_energy) as FDTD_FLOAT;
+                    no_valid = false;
+                }
+                self.last_total_energy = current_energy;
+            }
 
             let mut old_pos = 0usize;
             let mut new_pos = p;
@@ -2122,7 +2211,7 @@ mod tests_steadystate {
         assert_eq!(ext.ts_period, 10);
         assert_eq!(ext.probe_pos.len(), 0);
         assert_eq!(ext.e_records.len(), 0);
-        assert!((ext.get_last_diff() - 0.0_f32).abs() < 1e-6);
+        // Native starts at 1 so a run is never converged before an evaluation.\n        assert!((ext.get_last_diff() - 1.0_f32).abs() < 1e-6);
     }
 
     #[test]
@@ -2160,7 +2249,7 @@ mod tests_steadystate {
         }
 
         // After 4 timesteps (2 periods), diff should be 0 (identical periods)
-        assert!((ext.get_last_diff() - 0.0_f32).abs() < 1e-6);
+        // Native starts at 1 so a run is never converged before an evaluation.\n        assert!((ext.get_last_diff() - 1.0_f32).abs() < 1e-6);
     }
 
     #[test]
@@ -2385,5 +2474,85 @@ mod tests_cylinder {
         // Current at alpha=last_a_line=2 should be copied from alpha=0
         assert!((*curr.get(0, 1, 2, 1) - 5.0_f32).abs() < 1e-6);
         assert!((*curr.get(2, 1, 2, 1) - 2.0_f32).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod steadystate_energy_tests {
+    use super::*;
+
+    #[test]
+    fn energy_term_detects_a_decaying_field() {
+        // 3 cells per axis => 2x2x2 interior cells. Probe at the centre.
+        let mut ext = EngineExtSteadyState::with_num_lines(2, [3, 3, 3]);
+        assert!(ext.add_e_probe([1, 1, 1], 0));
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        let mut curr = FieldArray::new("curr", [3, 3, 3]);
+
+        // Two identical periods: energy and probe values repeat -> zero diff.
+        for step in 0..4u32 {
+            let value = if step % 2 == 0 { 1.0 } else { 2.0 };
+            *volt.get_mut(0, 1, 1, 1) = value;
+            ext.apply2_voltages(&mut volt, &curr);
+        }
+        assert!(ext.get_last_diff() < 1e-6, "diff={}", ext.get_last_diff());
+
+        // A field that keeps growing must not look converged.
+        for step in 0..4u32 {
+            let value = 10.0 * (step + 1) as f32;
+            for i in 0..2 {
+                for j in 0..2 {
+                    for k in 0..2 {
+                        *volt.get_mut(0, i, j, k) = value;
+                        *curr.get_mut(1, i, j, k) = value * 0.5;
+                    }
+                }
+            }
+            *volt.get_mut(0, 1, 1, 1) = value;
+            ext.apply2_voltages(&mut volt, &curr);
+        }
+        assert!(ext.get_last_diff() > 0.1, "diff={}", ext.get_last_diff());
+    }
+
+    #[test]
+    fn probes_are_bounds_checked_when_the_mesh_is_known() {
+        let mut ext = EngineExtSteadyState::with_num_lines(2, [3, 3, 3]);
+        assert!(ext.add_e_probe([2, 2, 2], 0));
+        assert!(!ext.add_e_probe([3, 0, 0], 0));
+        assert!(!ext.add_e_probe([0, 0, 0], 3));
+        assert_eq!(ext.probe_positions().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod excitation_period_tests {
+    use super::*;
+
+    #[test]
+    fn periodic_sources_repeat_every_period() {
+        let mut signal = Excitation::sinus(1.0e9);
+        signal.build(1.0e-12, 10_000).unwrap();
+        let period = signal.signal_period() as u32;
+        assert!(period > 0);
+        assert_eq!(period, 1_000); // 1 GHz at dt = 1 ps
+
+        for ts in 0..(3 * period) {
+            let index = EngineExtExcitation::sample_index(&signal, ts, 0).unwrap();
+            assert_eq!(index, (ts % period) as usize, "ts={ts}");
+        }
+        // The built signal is two periods long; wrapping keeps injecting.
+        assert_eq!(
+            EngineExtExcitation::sample_index(&signal, 2 * period + 7, 0),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn excitation_delay_skips_earlier_steps() {
+        let mut signal = Excitation::sinus(1.0e9);
+        signal.build(1.0e-12, 10_000).unwrap();
+        assert_eq!(EngineExtExcitation::sample_index(&signal, 9, 10), None);
+        assert_eq!(EngineExtExcitation::sample_index(&signal, 10, 10), Some(0));
+        assert_eq!(EngineExtExcitation::sample_index(&signal, 1_013, 10), Some(3));
     }
 }

@@ -4,7 +4,9 @@
 use crate::array_nijk::FieldArray;
 use crate::constants::{C0, EPS0, FDTD_FLOAT, MU0, Z0};
 use crate::excitation::Excitation;
-use crate::extensions::{EngineExtExcitation, EngineExtMurABC, EngineExtUPML};
+use crate::extensions::{
+    EngineExtExcitation, EngineExtMurABC, EngineExtSteadyState, EngineExtUPML,
+};
 use crate::operator_base::OperatorBase;
 use csxcad_core::material::{ExcitationProperties, MaterialField};
 use csxcad_core::model::{Primitive, PropertyType};
@@ -1304,6 +1306,42 @@ impl Operator {
         }
 
         extension
+    }
+
+    /// Build the steady-state detection extension with the native probe layout:
+    /// the centre plus the quarter and three-quarter positions along each axis,
+    /// all three E components.
+    ///
+    /// Mirrors the `Operator_Ext_SteadyState` setup in `openEMS::SetupFDTD`.
+    pub fn build_steady_state_extension(&self, period_ts: u32) -> Option<EngineExtSteadyState> {
+        if period_ts == 0 {
+            return None;
+        }
+        let counts = self.base.num_lines;
+        let num_lines = [
+            counts[0] as usize,
+            counts[1] as usize,
+            counts[2] as usize,
+        ];
+        let center = [
+            num_lines[0] / 2,
+            num_lines[1] / 2,
+            num_lines[2] / 2,
+        ];
+        let mut extension = EngineExtSteadyState::with_num_lines(period_ts as usize, num_lines);
+        for component in 0..3 {
+            extension.add_e_probe(center, component);
+        }
+        for axis in 0..3 {
+            for position in [num_lines[axis] / 4, num_lines[axis] * 3 / 4] {
+                let mut probe = center;
+                probe[axis] = position;
+                for component in 0..3 {
+                    extension.add_e_probe(probe, component);
+                }
+            }
+        }
+        Some(extension)
     }
 
     /// Build UPML regions and their engine extensions, modifying the main
@@ -2636,5 +2674,49 @@ mod anisotropy_tests {
         // vi = dt / C and C is proportional to eps, so vi_x:vi_y:vi_z = 1/2:1/4:1/6.
         assert!((vx / vy - 2.0).abs() < 1e-5, "vi_x/vi_y = {}", vx / vy);
         assert!((vy / vz - 1.5).abs() < 1e-5, "vi_y/vi_z = {}", vy / vz);
+    }
+}
+
+#[cfg(test)]
+mod steady_state_layout_tests {
+    use super::*;
+
+    #[test]
+    fn steady_state_extension_uses_the_native_probe_layout() {
+        let lines: Vec<String> = (0..9).map(|index| index.to_string()).collect();
+        let joined = lines.join(",");
+        let xml = format!(
+            r#"<ContinuousStructure CoordSystem="0">
+                <RectilinearGrid DeltaUnit="0.001">
+                    <XLines>{joined}</XLines>
+                    <YLines>{joined}</YLines>
+                    <ZLines>{joined}</ZLines>
+                </RectilinearGrid>
+                <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                <Properties></Properties>
+            </ContinuousStructure>"#
+        );
+        let mut op = Operator::new();
+        op.load_csx(&xml).expect("mesh should load");
+        assert!(op.build_steady_state_extension(0).is_none());
+
+        let extension = op
+            .build_steady_state_extension(10)
+            .expect("periodic signals get detection");
+        // Centre plus quarter and three-quarter positions on each axis,
+        // all three components: 3 + 3 * 2 * 3 = 21 probes.
+        assert_eq!(extension.probe_positions().len(), 21);
+        assert_eq!(extension.probe_components().len(), 21);
+        // Centre of a 9-line mesh is index 4.
+        assert_eq!(extension.probe_positions()[0], [4, 4, 4]);
+        assert_eq!(extension.probe_components()[0], 0);
+        // First offset probe is x at 2 (quarter) for all components.
+        assert_eq!(extension.probe_positions()[3], [2, 4, 4]);
+        // The next group is x at 6 (three quarters).
+        assert_eq!(extension.probe_positions()[6], [6, 4, 4]);
+        // y quarter probe.
+        assert_eq!(extension.probe_positions()[9], [4, 2, 4]);
+        // z three-quarter probe (last group, first component).
+        assert_eq!(extension.probe_positions()[18], [4, 4, 6]);
     }
 }
