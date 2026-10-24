@@ -83,6 +83,43 @@ impl Default for Excitation {
     }
 }
 
+impl Excitation {
+    /// Return the effective signal length in timesteps.
+    /// For non-periodic signals this is the duration after which the signal
+    /// has effectively decayed to zero. For periodic signals this is u32::MAX.
+    pub fn signal_length(&self) -> u32 {
+        match self.exc_type {
+            ExcitationType::Gauss => {
+                // Gaussian pulse: ~5 time constants, time constant ~ 1/(2*pi*fc)
+                // Convert to timesteps assuming ~1 GHz reference sample rate
+                if self.fc > 0.0 {
+                    (5.0e9 / self.fc) as u32
+                } else {
+                    1000
+                }
+            }
+            ExcitationType::Sinus => u32::MAX,
+            ExcitationType::Dirac => 1,
+            ExcitationType::Step => u32::MAX,
+            ExcitationType::Custom => u32::MAX,
+        }
+    }
+
+    /// Return the signal period in timesteps for periodic signals, or 0 for non-periodic.
+    pub fn signal_period(&self) -> u32 {
+        match self.exc_type {
+            ExcitationType::Sinus => {
+                if self.f0 > 0.0 {
+                    (1.0e9 / self.f0) as u32
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

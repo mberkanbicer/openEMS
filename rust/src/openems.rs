@@ -34,6 +34,8 @@ pub struct OpenEMS {
     pub time_step: f64,
     pub time_step_factor: f64,
     pub abort: bool,
+    pub num_threads: i32,
+    pub verbose_level: i32,
     /// CSXCAD XML geometry string. When set, `setup_fdtd()` parses it via
     /// `Operator::load_csx()` to populate the grid, materials, boundary
     /// conditions and per-cell materials.
@@ -64,6 +66,8 @@ impl OpenEMS {
             time_step: 0.0,
             time_step_factor: 1.0,
             abort: false,
+            num_threads: 1,
+            verbose_level: 0,
             csx_xml: None,
             processing_array: None,
         }
@@ -232,37 +236,97 @@ impl OpenEMS {
 
     /// Set the number of threads for multithreaded engine.
     pub fn set_number_of_threads(&mut self, val: i32) {
-        let _ = val; // stored for future multithreaded engine support
+        self.num_threads = val;
+        if self.verbose_level > 0 {
+            println!("[openEMS] Number of threads set to {}", val);
+        }
     }
 
     /// Set the verbose level for console output.
     pub fn set_verbose_level(&mut self, level: i32) {
-        let _ = level; // stored for future verbose output control
+        self.verbose_level = level;
+        if level > 0 {
+            println!("[openEMS] Verbose level set to {}", level);
+        }
     }
 
     /// Enable debug material output.
     pub fn debug_material(&mut self) {
-        // placeholder for future debug output
+        if let Some(ref eng) = self.fdtd_eng {
+            let op = &eng.op;
+            println!("[openEMS debug] Material:");
+            println!("  background eps_r: {}", op.get_background_eps_r());
+            println!("  background mue_r: {}", op.get_background_mue_r());
+            println!("  background kappa: {}", op.get_background_kappa());
+            println!("  background sigma: {}", op.get_background_sigma());
+            println!("  background density: {}", op.get_background_density());
+        } else {
+            println!("[openEMS debug] Material: engine not initialized");
+        }
     }
 
     /// Enable debug operator output.
     pub fn debug_operator(&mut self) {
-        // placeholder for future debug output
+        if let Some(ref eng) = self.fdtd_eng {
+            let op = &eng.op;
+            println!("[openEMS debug] Operator:");
+            println!("  grid delta: {} m", op.get_grid_delta());
+            println!("  timestep: {} s", op.get_timestep());
+            println!("  number of cells: {}", op.get_number_cells());
+            for n in 0..3 {
+                println!("  lines[{}]: {} ({})", n, op.get_number_of_lines(n as i32, true), op.get_dir_name(n as i32));
+            }
+        } else {
+            println!("[openEMS debug] Operator: engine not initialized");
+        }
     }
 
     /// Enable debug box output.
     pub fn debug_box(&mut self) {
-        // placeholder for future debug output
+        if let Some(ref eng) = self.fdtd_eng {
+            let op = &eng.op;
+            println!("[openEMS debug] Box/Grid:");
+            for n in 0..3 {
+                println!("  {} direction: {} lines, delta={}", op.get_dir_name(n as i32), op.get_number_of_lines(n as i32, true), op.get_grid_delta());
+            }
+        } else {
+            println!("[openEMS debug] Box: engine not initialized");
+        }
     }
 
     /// Enable debug PEC output.
     pub fn debug_pec(&mut self) {
-        // placeholder for future debug output
+        if let Some(ref eng) = self.fdtd_eng {
+            let op = &eng.op;
+            println!("[openEMS debug] PEC/Boundary Conditions:");
+            for i in 0..6 {
+                let bc = match self.bc_type[i] {
+                    BC_PEC => "PEC",
+                    BC_PMC => "PMC",
+                    BC_MUR => "MUR",
+                    BC_PML => "PML",
+                    _ => "unknown",
+                };
+                println!("  face {}: {}", i, bc);
+            }
+        } else {
+            println!("[openEMS debug] PEC: engine not initialized");
+        }
     }
 
     /// Enable debug CSX output.
     pub fn debug_csx(&mut self) {
-        // placeholder for future debug output
+        if let Some(ref xml) = self.csx_xml {
+            println!("[openEMS debug] CSXCAD XML ({} bytes):", xml.len());
+            for line in xml.lines().take(20) {
+                println!("  {}", line);
+            }
+            if xml.lines().count() > 20 {
+                println!("  ... ({} more lines)", xml.lines().count() - 20);
+            }
+        } else {
+            println!("[openEMS debug] CSX: no XML geometry loaded");
+        }
     }
 
     /// Check abort conditions.
@@ -293,10 +357,26 @@ impl OpenEMS {
                 }
             }
         } else {
-            // Configure a uniform grid (placeholder values).
-            op.base.grid_delta = 1.0e-3; // 1 mm
-            op.base.num_lines = [10, 10, 10];
+            // Configure a uniform grid based on the excitation frequency.
+            // Rule of thumb: at least 20 cells per wavelength at f0.
+            let c0: f64 = 299_792_458.0; // speed of light in m/s
+            let f0 = self.excitation.as_ref().map(|e| e.f0).unwrap_or(1.0e9);
+            let wavelength = c0 / f0;
+            let cells_per_wavelength = 20.0;
+            let grid_delta = wavelength / cells_per_wavelength;
+            // Grid extends a few wavelengths in each direction.
+            let num_wavelengths = 3.0;
+            let num_lines = ((num_wavelengths * wavelength) / grid_delta).round() as u32;
+            let num_lines = num_lines.max(10); // minimum grid size
+
+            op.base.grid_delta = grid_delta;
+            op.base.num_lines = [num_lines, num_lines, num_lines];
             op.base.d_t = 0.0; // will be computed by calc_timestep
+
+            if self.verbose_level > 0 {
+                println!("[openEMS] Grid: {} lines x {} lines x {} lines, delta={:.6} m (f0={:.1} Hz, lambda={:.3} m)",
+                    num_lines, num_lines, num_lines, grid_delta, f0, wavelength);
+            }
         }
 
         // Set boundary conditions (CSXCAD may have already set them via load_csx;

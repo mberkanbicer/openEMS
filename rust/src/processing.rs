@@ -1326,9 +1326,27 @@ impl HDF5FileWriter {
         self.precision
     }
 
-    /// Write field data to HDF5 file (placeholder: no-op).
-    pub fn write_field(&self, _field_name: &str, _data: &[f64]) {
-        // Placeholder: HDF5 backend not yet linked.
+    /// Write field data to HDF5 file.
+    /// Writes a simple binary format: magic "OHDF", version, field name, precision, data count, f64 data.
+    pub fn write_field(&self, field_name: &str, data: &[f64]) {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        // Magic header
+        buf.write_all(b"OHDF").unwrap();
+        buf.write_all(&1u32.to_le_bytes()).unwrap(); // version
+        // Field name
+        let name_bytes = field_name.as_bytes();
+        buf.write_all(&(name_bytes.len() as u32).to_le_bytes()).unwrap();
+        buf.write_all(name_bytes).unwrap();
+        // Precision
+        buf.write_all(&self.precision.to_le_bytes()).unwrap();
+        // Data count
+        buf.write_all(&(data.len() as u32).to_le_bytes()).unwrap();
+        // Data
+        for &v in data {
+            buf.write_all(&v.to_le_bytes()).unwrap();
+        }
+        std::fs::write(&self.filename, &buf).expect("failed to write HDF5 field file");
     }
 }
 
@@ -1360,9 +1378,31 @@ impl VTKFileWriter {
         self.precision
     }
 
-    /// Write field data to VTK file (placeholder: no-op).
-    pub fn write_field(&self, _field_name: &str, _data: &[f64]) {
-        // Placeholder: VTK backend not yet linked.
+    /// Write field data to VTK legacy format file.
+    /// Writes a STRUCTURED_POINTS dataset with the field as point data.
+    pub fn write_field(&self, field_name: &str, data: &[f64]) {
+        use std::io::Write;
+        let n = data.len();
+        let filename = format!("{}.vtk", self.filename_prefix);
+        let mut file = std::fs::File::create(&filename).expect("failed to create VTK file");
+        let mut w = |s: &str| file.write_all(s.as_bytes()).unwrap();
+        w("# vtk DataFile Version 3.0\n");
+        w("Field data from openEMS\n");
+        w("ASCII\n");
+        w("DATASET STRUCTURED_POINTS\n");
+        w(&format!("DIMENSIONS {} 1 1\n", n));
+        w("ORIGIN 0 0 0\n");
+        w("SPACING 1 1 1\n");
+        w(&format!("POINT_DATA {}\n", n));
+        w("FIELD FieldData 1\n");
+        w(&format!("{} 1 {} double\n", field_name, n));
+        for (i, &v) in data.iter().enumerate() {
+            if i > 0 {
+                w(" ");
+            }
+            w(&format!("{:.precision$}", v, precision = self.precision as usize));
+        }
+        w("\n");
     }
 }
 

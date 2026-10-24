@@ -697,8 +697,8 @@ impl EngineExtension for EngineExtTFSF {
     }
 
     fn do_post_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
-        let signal_length = 1u32; // placeholder; in full implementation this comes from the signal
-        let signal_period = 0u32;
+        let signal_length = self.signal.signal_length();
+        let signal_period = self.signal.signal_period();
 
         for n in 0..3 {
             let n_p = (n + 1) % 3;
@@ -763,8 +763,8 @@ impl EngineExtension for EngineExtTFSF {
     }
 
     fn do_post_current_updates(&mut self, _volt: &FieldArray, curr: &mut FieldArray) {
-        let signal_length = 1u32;
-        let signal_period = 0u32;
+        let signal_length = self.signal.signal_length();
+        let signal_period = self.signal.signal_period();
 
         for n in 0..3 {
             if !self.active_dir[n][0] && !self.active_dir[n][1] {
