@@ -9,8 +9,8 @@ use pyo3::{pyclass, pymethods, pymodule, Bound, FromPyObject, Py};
 use openems_core::openems::{BC_PEC, BC_PMC, BC_MUR, BC_PML, OpenEMS};
 
 /// Helper: extract a Rust type from a Python object using FromPyObject.
-fn extract<'py, T: FromPyObject<'py>>(val: &Bound<'py, PyAny>) -> PyResult<T> {
-    val.extract::<T>()
+fn extract<'a, 'py, T: FromPyObject<'a, 'py>>(val: &'a Bound<'py, PyAny>) -> PyResult<T> {
+    val.extract::<T>().map_err(Into::into)
 }
 
 fn extract_str<'py>(val: &Bound<'py, PyAny>) -> PyResult<String> {

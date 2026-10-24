@@ -6,7 +6,7 @@ license = "GPL-3.0-or-later"
 description = "Python bindings for the openEMS FDTD solver"
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3 = { version = "0.30", features = ["extension-module"] }
 openems-core = { path = "../rust" }
 
 [lib]
