@@ -6,7 +6,7 @@
 //! The backend links against the system HDF5 C library (`hdf5`) and is only
 //! compiled with the `hdf5` feature. Without the feature the public API stays
 //! available but every operation reports [`Hdf5Error::Unsupported`]; no
-//! substitute or placeholder file format is ever written.
+//! substitute file format is ever written.
 //!
 //! Layout written (identical to the native writer):
 //!

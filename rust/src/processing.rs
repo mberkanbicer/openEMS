@@ -124,8 +124,8 @@ pub trait Processing {
     fn set_process_interval(&mut self, interval: u32);
     /// Get the process interval.
     fn get_process_interval(&self) -> u32;
-    /// Set process start/stop time in seconds.
-    fn set_process_start_stop_time(&mut self, _start: f64, _stop: f64) {}
+    /// Set process start/stop time in seconds for a given timestep.
+    fn set_process_start_stop_time(&mut self, _start: f64, _stop: f64, _d_t: f64) {}
     /// Add a processing step (timestep at which to process).
     fn add_step(&mut self, _step: u32) {}
     /// Add multiple processing steps.
@@ -420,10 +420,14 @@ impl Processing for FieldProbe {
         self.process_interval
     }
 
-    fn set_process_start_stop_time(&mut self, start: f64, stop: f64) {
-        // Placeholder timestep (1 ps). In the full integration this should
-        // come from the engine/operator via `get_timestep()`.
-        let d_t: f64 = 1.0e-12;
+    fn set_process_start_stop_time(&mut self, start: f64, stop: f64, d_t: f64) {
+        // the caller supplies the timestep (native SetProcessStartStopTime
+        // converts with the operator timestep)
+        if !d_t.is_finite() || d_t <= 0.0 {
+            self.start_ts = 0;
+            self.stop_ts = u32::MAX;
+            return;
+        }
         self.start_ts = if start > 0.0 {
             (start / d_t).floor() as u32
         } else {
@@ -2266,8 +2270,8 @@ mod tests {
     #[test]
     fn test_field_probe_start_stop_time() {
         let mut probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
-        // With placeholder d_t = 1e-12: start_ts = 1000, stop_ts = 5000
-        probe.set_process_start_stop_time(1e-9, 5e-9);
+        // with d_t = 1e-12: start_ts = 1000, stop_ts = 5000
+        probe.set_process_start_stop_time(1e-9, 5e-9, 1e-12);
         // With no steps and no interval, check_timestep returns false.
         // Set an interval to enable time-based processing.
         probe.set_process_interval(100);
@@ -2281,7 +2285,7 @@ mod tests {
     fn test_field_probe_start_stop_invalid() {
         let mut probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
         // stop <= start should disable processing
-        probe.set_process_start_stop_time(5e-9, 1e-9);
+        probe.set_process_start_stop_time(5e-9, 1e-9, 1e-12);
         assert_eq!(probe.start_ts, 0);
         assert_eq!(probe.stop_ts, u32::MAX);
     }
@@ -2321,7 +2325,7 @@ mod tests {
     #[test]
     fn test_field_probe_dump_box_to_file() {
         let probe = FieldProbe::new("probe1", [0.0, 0.0, 0.0]);
-        // Placeholder implementation should not panic.
+        // the default processing box dump is empty for a bare probe
         probe.dump_box_to_file("/tmp/test_probe", false);
         probe.dump_box_to_file("/tmp/test_probe_dual", true);
     }
@@ -2670,7 +2674,7 @@ mod tests {
         assert_eq!(writer.get_precision(), 12);
         writer.set_precision(6);
         assert_eq!(writer.get_precision(), 6);
-        // write_field should not panic (placeholder).
+        // write_field writes a structured-points file
         writer.write_field("E-Field", &[1.0, 2.0, 3.0]);
     }
 }

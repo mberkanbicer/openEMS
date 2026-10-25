@@ -271,7 +271,7 @@ impl OpenEMS {
         self.csx_xml = Some(xml);
     }
 
-    /// Clear the CSXCAD XML geometry (falls back to default placeholder grid).
+    /// Clear the CSXCAD XML geometry (falls back to the default grid).
     pub fn clear_csx_xml(&mut self) {
         self.csx_xml = None;
     }

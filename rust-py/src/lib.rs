@@ -426,16 +426,6 @@ impl PyOpenEMS {
         Ok(true)
     }
 
-    /// Add a processing object (probe, field dump, SAR, etc.) to the
-    /// post-processing array.
-    fn add_processing(&mut self, _proc: Bound<'_, PyAny>) -> PyResult<()> {
-        // Processing objects are added via the Rust API; Python-side
-        // processing wrappers are a future task.
-        let _ = _proc;
-        Err(PyException::new_err(
-            "AddProcessing: Python processing wrappers not yet implemented",
-        ))
-    }
 }
 
 /// Python module definition.
