@@ -76,6 +76,54 @@ impl EngineMeta {
         Some(index)
     }
 
+    /// Dual-mesh (cell-centre) position of one line.
+    ///
+    /// Mirrors the native `GetDiscLine(..., dual=true)`. Reserved for the
+    /// native dual-mesh probe snapping, which is tracked separately.
+    #[allow(dead_code)]
+    pub fn dual_line(&self, axis: usize, index: usize) -> f64 {
+        let lines = &self.disc_lines[axis];
+        let count = self.num_lines[axis];
+        if lines.len() < 2 {
+            return index as f64 + 0.5;
+        }
+        if index + 1 < count && index + 1 < lines.len() {
+            0.5 * (lines[index] + lines[index + 1])
+        } else if index > 0 {
+            lines[index] + 0.5 * (lines[index] - lines[index - 1])
+        } else {
+            lines[index]
+        }
+    }
+
+    /// Map a physical coordinate to the nearest dual-mesh index.
+    #[allow(dead_code)]
+    pub fn index_from_dual_coordinates(&self, coordinates: [f64; 3]) -> Option<[usize; 3]> {
+        let mut index = [0usize; 3];
+        for axis in 0..3 {
+            let count = self.num_lines[axis];
+            if count == 0 || self.disc_lines[axis].len() < 2 {
+                return None;
+            }
+            let first = self.dual_line(axis, 0);
+            let last = self.dual_line(axis, count - 1);
+            if coordinates[axis] < first.min(last) || coordinates[axis] > first.max(last) {
+                return None;
+            }
+            let mut best = 0usize;
+            let mut best_distance = f64::INFINITY;
+            for candidate in 0..count {
+                let distance = (self.dual_line(axis, candidate) - coordinates[axis]).abs();
+                if distance < best_distance {
+                    best_distance = distance;
+                    best = candidate;
+                }
+            }
+            index[axis] = best;
+        }
+        Some(index)
+    }
+
     pub fn coordinate(&self, axis: usize, index: usize) -> f64 {
         self.disc_lines
             .get(axis)

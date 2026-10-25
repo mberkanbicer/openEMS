@@ -51,3 +51,7 @@ CLAUDE.md
 rust*/target/
 rust/output.h5
 rust/output.vtk
+
+# Rust CLI binary linked next to openEMS.sh for the Octave interface
+/openEMS
+

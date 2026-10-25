@@ -3,3 +3,7 @@
 
 *.cpp             text eol=lf
 *.h               text eol=lf
+
+# Shell scripts must keep LF endings regardless of the checkout platform.
+*.sh text eol=lf
+

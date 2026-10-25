@@ -42,6 +42,8 @@ pub struct ProcessIntegral {
     norm_dir: i32,
     enabled: bool,
     header_written: bool,
+    /// Sample the current at the half timestep (native `SetDualTime`).
+    dual_time: bool,
     calculator: Box<dyn IntegralCalculator>,
 }
 
@@ -72,6 +74,7 @@ impl ProcessIntegral {
             norm_dir: -1,
             enabled: true,
             header_written: false,
+            dual_time: false,
             calculator,
         }
     }
@@ -106,6 +109,15 @@ impl ProcessIntegral {
 
     pub fn get_normal_dir(&self) -> i32 {
         self.norm_dir
+    }
+
+    /// Sample at the half timestep (native `SetDualTime`).
+    pub fn set_dual_time(&mut self, val: bool) {
+        self.dual_time = val;
+    }
+
+    pub fn get_dual_time(&self) -> bool {
+        self.dual_time
     }
 
     /// Latest integral values (before the weight is applied).
@@ -316,7 +328,7 @@ impl Processing for ProcessIntegral {
         }
         self.results = self.calculator.calc(num_ts, interface);
 
-        let time = num_ts as f64 * interface.meta.dt;
+        let time = (num_ts as f64 + if self.dual_time { 0.5 } else { 0.0 }) * interface.meta.dt;
         if self.process_interval > 0 && num_ts.is_multiple_of(self.process_interval) {
             self.append_td_row(time);
         }
@@ -744,6 +756,64 @@ mod port_integral_tests {
         assert_eq!(current.calc(1, &interface), vec![10.0]);
     }
 }
+/// Point field probe (`ProcessFieldProbe`): all three components at one cell.
+pub struct FieldProbeIntegral {
+    pub position: [f64; 3],
+    /// 0 = electric field, 1 = magnetic field.
+    pub field_type: usize,
+    snapped: Option<[usize; 3]>,
+}
+
+impl FieldProbeIntegral {
+    pub fn new(position: [f64; 3], field_type: usize) -> Self {
+        Self {
+            position,
+            field_type: field_type.min(1),
+            snapped: None,
+        }
+    }
+
+    fn index(&mut self, meta: &EngineMeta) -> Option<[usize; 3]> {
+        if let Some(index) = self.snapped {
+            return Some(index);
+        }
+        let index = meta.index_from_coordinates(self.position)?;
+        self.snapped = Some(index);
+        Some(index)
+    }
+}
+
+impl IntegralCalculator for FieldProbeIntegral {
+    fn number_of_integrals(&self) -> usize {
+        3
+    }
+
+    fn integral_name(&self, row: usize) -> String {
+        let names = if self.field_type == 0 {
+            ["Ex/(V/m)", "Ey/(V/m)", "Ez/(V/m)"]
+        } else {
+            ["Hx/(A/m)", "Hy/(A/m)", "Hz/(A/m)"]
+        };
+        names.get(row).copied().unwrap_or("unknown").to_string()
+    }
+
+    fn calc(&mut self, _num_ts: u32, interface: &EngineInterface<'_>) -> Vec<f64> {
+        let Some(index) = self.index(interface.meta) else {
+            return vec![0.0; 3];
+        };
+        let field = if self.field_type == 0 {
+            interface.volt
+        } else {
+            interface.curr
+        };
+        (0..3)
+            .map(|component| {
+                *field.get(component, index[0], index[1], index[2]) as f64
+            })
+            .collect()
+    }
+}
+
 /// Mode-matching surface integral (`ProcessModeMatch`).
 ///
 /// Computes the overlap of the running E- or H-field on a plane with a

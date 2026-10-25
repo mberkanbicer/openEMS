@@ -14,6 +14,9 @@ use crate::operator_extension::{
 use crate::processing::{
     EngineInterface, EngineMeta, Processing, ProcessingArray,
 };
+use crate::processing_integral::{
+    CurrentIntegral, FieldProbeIntegral, ModeMatchIntegral, ProcessIntegral, VoltageIntegral,
+};
 use std::sync::Arc;
 
 /// Boundary condition types (mirroring C++).
@@ -911,7 +914,167 @@ impl OpenEMS {
         self.fdtd_eng = Some(Box::new(engine));
         self.fdtd_op = None; // operator is owned by the engine
 
+        // Native `SetupProcessing`: every `ProbeBox` property becomes a
+        // processing object that streams its time-domain data to a file.
+        self.setup_csx_probes(&xml);
+
         true
+    }
+
+    /// Create the probe processings from the CSX `ProbeBox` properties.
+    ///
+    /// Mirrors `openEMS::SetupProcessing` for probe boxes: voltage probes use a
+    /// line integral, current probes a surface integral, field probes all three
+    /// components at one cell, and mode-match probes an overlap integral.
+    fn setup_csx_probes(&mut self, xml: &str) {
+        let Ok(structure) = csxcad_core::model::Structure::from_xml_str(xml) else {
+            return;
+        };
+        let Some(engine) = self.fdtd_eng.as_ref() else {
+            return;
+        };
+        let dt = engine.op.get_timestep();
+        let grid_delta = engine.op.get_grid_delta();
+        let f_max = self
+            .excitation
+            .as_ref()
+            .map(|signal| signal.f_max)
+            .unwrap_or(0.0);
+        let nyquist = if f_max > 0.0 && dt > 0.0 {
+            (1.0 / f_max / 2.0 / dt).floor() as u32
+        } else {
+            0
+        };
+        let interval = if nyquist > 0 {
+            (nyquist / self.over_sampling.max(1)).max(1)
+        } else {
+            1
+        };
+
+        let mut array = self
+            .processing_array
+            .take()
+            .unwrap_or_else(|| ProcessingArray::new(u32::MAX));
+        let mut created = 0usize;
+        for property in structure.properties_by_type(csxcad_core::model::PropertyType::ProbeBox)
+        {
+            let Some(probe) = property.probe() else {
+                continue;
+            };
+            let multiple = property.primitive_count() > 1;
+            for (index, primitive) in property.primitives().iter().enumerate() {
+                let name = if multiple {
+                    format!("{}_{}", property.name(), index)
+                } else {
+                    property.name().to_string()
+                };
+                let Ok(bounds) = primitive.bounding_box(None, true) else {
+                    continue;
+                };
+                let start = [
+                    bounds[0] * grid_delta,
+                    bounds[2] * grid_delta,
+                    bounds[4] * grid_delta,
+                ];
+                let stop = [
+                    bounds[1] * grid_delta,
+                    bounds[3] * grid_delta,
+                    bounds[5] * grid_delta,
+                ];
+
+                let calculator: Box<dyn crate::processing_integral::IntegralCalculator> =
+                    match probe.probe_type() {
+                        0 => {
+                            let Ok(dimension) = primitive.dimension(None) else {
+                                continue;
+                            };
+                            let Some(shape) = primitive.box_shape() else {
+                                eprintln!(
+                                    "[openEMS] SetupProcessing: probe '{}' is not a box, skipping",
+                                    property.name()
+                                );
+                                continue;
+                            };
+                            if dimension != 1 {
+                                eprintln!(
+                                    "[openEMS] SetupProcessing: probe '{}' is not a line, skipping",
+                                    property.name()
+                                );
+                                continue;
+                            }
+                            let Ok(coordinates) = shape.evaluated_coordinates(None) else {
+                                continue;
+                            };
+                            let line_start = coordinates[0].map(|value| value * grid_delta);
+                            let line_stop = coordinates[1].map(|value| value * grid_delta);
+                            Box::new(VoltageIntegral::new(line_start, line_stop))
+                        }
+                        1 => Box::new(CurrentIntegral::new(
+                            start,
+                            stop,
+                            probe.normal_direction(),
+                        )),
+                        2 | 3 => {
+                            let centre = [
+                                0.5 * (start[0] + stop[0]),
+                                0.5 * (start[1] + stop[1]),
+                                0.5 * (start[2] + stop[2]),
+                            ];
+                            Box::new(FieldProbeIntegral::new(
+                                centre,
+                                usize::from(probe.probe_type() == 3),
+                            ))
+                        }
+                        10 | 11 => {
+                            let mut integral = ModeMatchIntegral::new(start, stop);
+                            integral.set_field_type(usize::from(probe.probe_type() == 11));
+                            for component in 0..3 {
+                                if let Some(function) = probe.mode_function(component) {
+                                    integral.set_weight_function(component, function);
+                                }
+                            }
+                            integral.set_weight_origin(probe.mode_origin());
+                            Box::new(integral)
+                        }
+                        other => {
+                            eprintln!(
+                                "[openEMS] SetupFDTD: Warning: Probe type {} of property '{}' is unknown...",
+                                other,
+                                property.name()
+                            );
+                            continue;
+                        }
+                    };
+
+                let mut processing =
+                    ProcessIntegral::new(&name, &name, start, stop, calculator);
+                if probe.probe_type() == 1 || probe.probe_type() == 3 {
+                    processing.set_dual_time(true);
+                }
+                processing.set_weight(probe.weight());
+                processing.set_normal_dir(probe.normal_direction());
+                processing.set_process_interval(interval);
+                processing.add_frequencies(probe.fd_samples());
+                let oversampling = probe.oversampling();
+                if oversampling > 0 {
+                    processing.set_fd_oversampling(oversampling as u32);
+                }
+                if probe.start_time() > 0.0 || probe.stop_time() > 0.0 {
+                    processing.set_process_start_stop_time(
+                        probe.start_time(),
+                        probe.stop_time(),
+                        dt,
+                    );
+                }
+                processing.init_process();
+                array.add_processing(Box::new(processing));
+                created += 1;
+            }
+        }
+        self.processing_array = Some(array);
+        if created > 0 && self.verbose_level > 0 {
+            println!("[openEMS] {} probe processing(s) configured", created);
+        }
     }
 
     /// Run the FDTD simulation for the configured number of time steps.
