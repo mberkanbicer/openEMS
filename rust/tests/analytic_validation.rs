@@ -9,7 +9,7 @@ use openems_core::engine::Engine;
 use openems_core::excitation::Excitation;
 use openems_core::extensions::EngineExtExcitation;
 use openems_core::operator::Operator;
-use openems_core::{BC_PEC, BC_PMC, BC_PML};
+use openems_core::{BC_PEC, BC_PML};
 use std::sync::Arc;
 
 const DELTA: f64 = 1.0e-3;
@@ -83,6 +83,33 @@ fn add_point_source(
     signal.build(dt, max_ts).expect("signal should build");
     let mut extension = EngineExtExcitation::new();
     extension.add_voltage_excitation(component, pos, 0, 1.0, Arc::new(signal));
+    engine.add_extension(Box::new(extension));
+}
+
+/// Add a uniform sheet source over the whole cross-section at `x`.
+///
+/// With PEC side walls this excites only the TEM mode, so the setup behaves as
+/// a parallel-plate transmission line and the closed-form reflection
+/// coefficients apply.
+fn add_sheet_source(
+    engine: &mut Engine,
+    component: usize,
+    x: usize,
+    ny: usize,
+    nz: usize,
+    signal: Excitation,
+    dt: f64,
+    max_ts: u32,
+) {
+    let mut signal = signal;
+    signal.build(dt, max_ts).expect("signal should build");
+    let signal = Arc::new(signal);
+    let mut extension = EngineExtExcitation::new();
+    for j in 0..ny {
+        for k in 0..nz {
+            extension.add_voltage_excitation(component, [x, j, k], 0, 1.0, signal.clone());
+        }
+    }
     engine.add_extension(Box::new(extension));
 }
 
@@ -222,3 +249,5 @@ fn dielectric_propagation_speed_matches_c_over_sqrt_eps() {
         "measured dielectric speed {measured:.4e} m/s vs {expected:.4e} m/s"
     );
 }
+
+

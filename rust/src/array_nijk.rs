@@ -27,6 +27,24 @@ impl<T> ArrayNIJK<T> {
         self.extent
     }
 
+    /// Raw pointer to the first element (read-only).
+    ///
+    /// Used by the threaded update kernels, which partition the `i` range;
+    /// the caller must uphold the aliasing rules described at the call site.
+    pub fn as_ptr(&self) -> *const T {
+        self.data.as_ptr()
+    }
+
+    /// Raw pointer to the first element (mutable).
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.data.as_mut_ptr()
+    }
+
+    /// Element strides in the flat buffer, `[n, i, j, k]`.
+    pub fn strides(&self) -> [usize; 4] {
+        self.stride
+    }
+
     /// Return the number of components (N dimension, always 3).
     pub fn n_components(&self) -> usize {
         self.extent[0]

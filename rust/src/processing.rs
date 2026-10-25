@@ -219,6 +219,26 @@ impl ProcessingArray {
         self.processings.push(proc);
     }
 
+    /// Set the process interval of every processing that has not chosen one.
+    ///
+    /// Mirrors the native global `OverSampling` default: probes and dumps with
+    /// an explicit interval keep it, the rest sample at `interval`.
+    pub fn set_global_interval(&mut self, interval: u32) {
+        for proc in self.processings.iter_mut() {
+            if proc.get_process_interval() == 0 {
+                proc.set_process_interval(interval);
+            }
+        }
+    }
+
+    /// Process intervals in registration order (diagnostics and tests).
+    pub fn process_intervals(&self) -> Vec<u32> {
+        self.processings
+            .iter()
+            .map(|proc| proc.get_process_interval())
+            .collect()
+    }
+
     /// Initialize all processings.
     pub fn init_all(&mut self) {
         for proc in self.processings.iter_mut() {

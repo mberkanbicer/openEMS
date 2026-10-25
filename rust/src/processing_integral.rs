@@ -744,3 +744,357 @@ mod port_integral_tests {
         assert_eq!(current.calc(1, &interface), vec![10.0]);
     }
 }
+/// Mode-matching surface integral (`ProcessModeMatch`).
+///
+/// Computes the overlap of the running E- or H-field on a plane with a
+/// user-given mode template `(E_nP, E_nPP)` and reports both the modal
+/// amplitude (row 0) and the mode purity `value^2 / ∫|field|^2 dA` (row 1).
+pub struct ModeMatchIntegral {
+    pub start: [f64; 3],
+    pub stop: [f64; 3],
+    /// 0 = electric field, 1 = magnetic field.
+    pub field_type: usize,
+    /// Mode template expressions, indexed by field component.
+    pub weight_functions: [String; 3],
+    /// Local coordinate origin applied before evaluating the template.
+    pub weight_origin: [f64; 3],
+    snapped: Option<SnappedSurface>,
+}
+
+struct SnappedSurface {
+    normal: usize,
+    start: [usize; 3],
+    stop: [usize; 3],
+    num: [usize; 2],
+    /// Normalized mode values per component: `[component][posP][posPP]`.
+    mode: [Vec<f64>; 2],
+}
+
+impl ModeMatchIntegral {
+    /// Create a mode-matching surface between `start` and `stop` (metres).
+    pub fn new(start: [f64; 3], stop: [f64; 3]) -> Self {
+        Self {
+            start,
+            stop,
+            field_type: 0,
+            weight_functions: std::array::from_fn(|_| "0".to_string()),
+            weight_origin: [0.0; 3],
+            snapped: None,
+        }
+    }
+
+    /// Set one weight function (`x, y, z, rho, a, r, t` variables).
+    pub fn set_weight_function(&mut self, component: usize, function: &str) {
+        if component < 3 {
+            self.weight_functions[component] = function.to_string();
+            self.snapped = None;
+        }
+    }
+
+    /// Set the field type: 0 = E, 1 = H.
+    pub fn set_field_type(&mut self, field_type: usize) {
+        self.field_type = field_type.min(1);
+        self.snapped = None;
+    }
+
+    /// Set the local coordinate origin used by the template.
+    pub fn set_weight_origin(&mut self, origin: [f64; 3]) {
+        self.weight_origin = origin;
+        self.snapped = None;
+    }
+
+    fn snap(&mut self, meta: &EngineMeta) -> Option<&SnappedSurface> {
+        if self.snapped.is_some() {
+            return self.snapped.as_ref();
+        }
+        let mut lower = self.start;
+        let mut upper = self.stop;
+        for axis in 0..3 {
+            if lower[axis] > upper[axis] {
+                std::mem::swap(&mut lower[axis], &mut upper[axis]);
+            }
+        }
+        let start = meta.index_from_coordinates(lower)?;
+        let stop = meta.index_from_coordinates(upper)?;
+        let mut start = start;
+        let mut stop = stop;
+        let dual = self.field_type == 1;
+        let mut normal = None;
+        let mut dimension = 0;
+        for axis in 0..3 {
+            if start[axis] > stop[axis] {
+                std::mem::swap(&mut start[axis], &mut stop[axis]);
+            }
+            if start[axis] == 0 {
+                start[axis] += 1;
+            }
+            if stop[axis] == meta.num_lines[axis].saturating_sub(1) {
+                stop[axis] = stop[axis].saturating_sub(1);
+            } else if dual && stop[axis] > start[axis] + 1 {
+                stop[axis] -= 1;
+            }
+            if stop[axis] != start[axis] {
+                dimension += 1;
+            } else {
+                normal = Some(axis);
+            }
+        }
+        let normal = normal?;
+        if dimension != 2 {
+            return None;
+        }
+        let n_p = (normal + 1) % 3;
+        let n_pp = (normal + 2) % 3;
+        let num = [
+            stop[n_p] - start[n_p] + 1,
+            stop[n_pp] - start[n_pp] + 1,
+        ];
+
+        // Parse the two transverse templates.
+        let mut parsers = [fparser::Parser::new(), fparser::Parser::new()];
+        for (index, parser) in parsers.iter_mut().enumerate() {
+            let component = (normal + index + 1) % 3;
+            if parser
+                .parse(&self.weight_functions[component], "x,y,z,rho,a,r,t", false)
+                .is_err()
+            {
+                return None;
+            }
+        }
+
+        let mut mode = [
+            vec![0.0; num[0] * num[1]],
+            vec![0.0; num[0] * num[1]],
+        ];
+        let mut norm = 0.0f64;
+        for pos_p in 0..num[0] {
+            for pos_pp in 0..num[1] {
+                let mut pos = [0usize; 3];
+                pos[normal] = start[normal];
+                pos[n_p] = start[n_p] + pos_p;
+                pos[n_pp] = start[n_pp] + pos_pp;
+                let x = disc_line(meta, 0, pos[0], if normal == 0 { dual } else { false });
+                let y = disc_line(meta, 1, pos[1], if normal == 1 { dual } else { false });
+                let z = disc_line(meta, 2, pos[2], if normal == 2 { dual } else { false });
+                let lx = x - self.weight_origin[0];
+                let ly = y - self.weight_origin[1];
+                let lz = z - self.weight_origin[2];
+                let rho = (lx * lx + ly * ly).sqrt();
+                let angle = ly.atan2(lx);
+                let r = (lx * lx + ly * ly + lz * lz).sqrt();
+                let theta = if rho != 0.0 {
+                    std::f64::consts::FRAC_PI_2 - (lz / rho).atan()
+                } else {
+                    0.0
+                };
+                let values = [lx, ly, lz, rho, angle, r, theta];
+                let area = node_area(meta, normal, pos, dual);
+                for component in 0..2 {
+                    let value = parsers[component].eval(&values).unwrap_or(0.0);
+                    let value = if value.is_finite() { value } else { 0.0 };
+                    mode[component][pos_p * num[1] + pos_pp] = value;
+                    norm += value * value * area;
+                }
+            }
+        }
+        let norm = norm.sqrt();
+        if norm > 0.0 {
+            for component in 0..2 {
+                for value in &mut mode[component] {
+                    *value /= norm;
+                }
+            }
+        }
+        self.snapped = Some(SnappedSurface {
+            normal,
+            start,
+            stop,
+            num,
+            mode,
+        });
+        self.snapped.as_ref()
+    }
+}
+
+impl IntegralCalculator for ModeMatchIntegral {
+    fn number_of_integrals(&self) -> usize {
+        2
+    }
+
+    fn integral_name(&self, row: usize) -> String {
+        match (row, self.field_type) {
+            (0, 0) => "voltage".to_string(),
+            (0, _) => "current".to_string(),
+            _ => "mode_purity".to_string(),
+        }
+    }
+
+    fn calc(&mut self, _num_ts: u32, interface: &EngineInterface<'_>) -> Vec<f64> {
+        let field_type = self.field_type;
+        let dual = field_type == 1;
+        let Some(surface) = self.snap(interface.meta) else {
+            return vec![0.0, 0.0];
+        };
+        let normal = surface.normal;
+        let n_p = (normal + 1) % 3;
+        let n_pp = (normal + 2) % 3;
+        let start = surface.start;
+        let num = surface.num;
+        let mut value = 0.0f64;
+        let mut purity = 0.0f64;
+        for pos_p in 0..num[0] {
+            for pos_pp in 0..num[1] {
+                let mut pos = [0usize; 3];
+                pos[normal] = start[normal];
+                pos[n_p] = start[n_p] + pos_p;
+                pos[n_pp] = start[n_pp] + pos_pp;
+                let area = node_area(interface.meta, normal, pos, dual);
+                let index = pos_p * num[1] + pos_pp;
+                for component in 0..2 {
+                    let field_component = (normal + component + 1) % 3;
+                    let field = if field_type == 0 {
+                        *interface.volt.get(field_component, pos[0], pos[1], pos[2]) as f64
+                    } else {
+                        *interface.curr.get(field_component, pos[0], pos[1], pos[2]) as f64
+                    };
+                    value += field * surface.mode[component][index] * area;
+                    purity += field * field * area;
+                }
+            }
+        }
+        let mode_purity = if purity != 0.0 {
+            value * value / purity
+        } else {
+            0.0
+        };
+        vec![value, mode_purity]
+    }
+}
+
+/// Mesh line in metres, with the native dual-node extension at the upper end.
+fn disc_line(meta: &EngineMeta, axis: usize, pos: usize, dual: bool) -> f64 {
+    let lines = &meta.disc_lines[axis];
+    let count = lines.len();
+    if count == 0 {
+        return 0.0;
+    }
+    let index = pos.min(count - 1);
+    if !dual {
+        return lines[index];
+    }
+    if index + 1 < count {
+        0.5 * (lines[index] + lines[index + 1])
+    } else if index > 0 {
+        lines[index] + 0.5 * (lines[index] - lines[index - 1])
+    } else {
+        lines[index]
+    }
+}
+
+/// Native `GetDiscDelta` in metres.
+fn disc_delta(meta: &EngineMeta, axis: usize, pos: usize, dual: bool) -> f64 {
+    if dual {
+        if pos > 0 {
+            disc_line(meta, axis, pos, true) - disc_line(meta, axis, pos - 1, true)
+        } else {
+            disc_line(meta, axis, 1, false) - disc_line(meta, axis, 0, false)
+        }
+    } else if pos + 1 < meta.num_lines[axis] {
+        disc_line(meta, axis, pos + 1, false) - disc_line(meta, axis, pos, false)
+    } else if pos > 0 {
+        disc_line(meta, axis, pos, false) - disc_line(meta, axis, pos - 1, false)
+    } else {
+        0.0
+    }
+}
+
+/// Native `GetNodeWidth`: `GetEdgeLength(axis, pos, !dual)`.
+fn node_width(meta: &EngineMeta, axis: usize, pos: [usize; 3], dual: bool) -> f64 {
+    disc_delta(meta, axis, pos[axis], !dual)
+}
+
+/// Native `GetNodeArea`.
+fn node_area(meta: &EngineMeta, normal: usize, pos: [usize; 3], dual: bool) -> f64 {
+    let n_p = (normal + 1) % 3;
+    let n_pp = (normal + 2) % 3;
+    node_width(meta, n_p, pos, dual) * node_width(meta, n_pp, pos, dual)
+}
+
+
+
+#[cfg(test)]
+mod mode_match_tests {
+    use super::*;
+    use crate::array_nijk::FieldArray;
+
+    fn meta() -> EngineMeta {
+        let lines: Vec<f64> = (0..5).map(|index| index as f64 * 1.0e-3).collect();
+        EngineMeta {
+            num_lines: [5, 5, 5],
+            disc_lines: [lines.clone(), lines.clone(), lines],
+            dt: 1.0e-12,
+        }
+    }
+
+    #[test]
+    fn a_field_proportional_to_the_mode_has_unit_purity() {
+        let meta = meta();
+        let mut volt = FieldArray::new("volt", [5, 5, 5]);
+        let mut integral = ModeMatchIntegral::new([0.0, 0.0, 2.0e-3], [4.0e-3, 4.0e-3, 2.0e-3]);
+        // Constant E_x mode on a z-normal surface.
+        integral.set_weight_function(0, "1");
+        integral.set_weight_function(1, "0");
+        let interface = EngineInterface {
+            meta: &meta,
+            volt: &volt,
+            curr: &FieldArray::new("curr", [5, 5, 5]),
+        };
+        let results = integral.calc(0, &interface);
+        // Normalize the mode by evaluating the table first.
+        assert_eq!(results[0], 0.0);
+
+        // Fill the field with 3 times the normalized mode.
+        let surface = integral.snap(&meta).expect("surface");
+        let normal = surface.normal;
+        let n_p = (normal + 1) % 3;
+        let n_pp = (normal + 2) % 3;
+        for pos_p in 0..surface.num[0] {
+            for pos_pp in 0..surface.num[1] {
+                let mut pos = [0usize; 3];
+                pos[normal] = surface.start[normal];
+                pos[n_p] = surface.start[n_p] + pos_p;
+                pos[n_pp] = surface.start[n_pp] + pos_pp;
+                let index = pos_p * surface.num[1] + pos_pp;
+                *volt.get_mut(n_p, pos[0], pos[1], pos[2]) =
+                    (3.0 * surface.mode[0][index]) as f32;
+            }
+        }
+        let interface = EngineInterface {
+            meta: &meta,
+            volt: &volt,
+            curr: &FieldArray::new("curr", [5, 5, 5]),
+        };
+        let results = integral.calc(0, &interface);
+        assert!((results[0] - 3.0).abs() < 1.0e-6, "amplitude {}", results[0]);
+        assert!(
+            (results[1] - 1.0).abs() < 1.0e-6,
+            "purity {}",
+            results[1]
+        );
+    }
+
+    #[test]
+    fn a_box_without_a_flat_surface_is_disabled() {
+        let mut meta = meta();
+        meta.num_lines = [5, 5, 5];
+        let mut integral = ModeMatchIntegral::new([1.0e-3, 1.0e-3, 1.0e-3], [3.0e-3, 3.0e-3, 3.0e-3]);
+        integral.set_weight_function(0, "1");
+        let empty = FieldArray::new("volt", [5, 5, 5]);
+        let interface = EngineInterface {
+            meta: &meta,
+            volt: &empty,
+            curr: &FieldArray::new("curr", [5, 5, 5]),
+        };
+        assert_eq!(integral.calc(0, &interface), vec![0.0, 0.0]);
+    }
+}

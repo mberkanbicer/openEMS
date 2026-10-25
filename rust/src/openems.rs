@@ -166,7 +166,7 @@ impl OpenEMS {
 
     /// Set the oversampling factor for time-domain dumps/probes.
     pub fn set_over_sampling(&mut self, val: u32) {
-        self.over_sampling = val;
+        self.over_sampling = val.max(1);
     }
 
     /// Set cell constant material mode.
@@ -486,7 +486,29 @@ impl OpenEMS {
                 boundary_size,
             }));
         }
-        // Lorentz and Debye materials need the finished EC coefficients to size\n        // their Drude/Lorentz elements. Native adds Lorentz first.\n        let has_lorentz = op.structure.as_ref().is_some_and(|structure| {\n            (0..structure.property_count())\n                .any(|index| structure.property_by_index(index).is_some_and(|p| p.lorentz_material().is_some()))\n        });\n        if has_lorentz {\n            registry.add(Box::new(LorentzOperatorExtension));\n        }\n        // Debye materials need the finished EC coefficients to size their poles.\n        let has_debye = op.structure.as_ref().is_some_and(|structure| {\n            (0..structure.property_count())\n                .any(|index| structure.property_by_index(index).is_some_and(|p| p.debye_material().is_some()))\n        });\n        if has_debye {\n            registry.add(Box::new(DebyeOperatorExtension));\n        }\n        // Lumped RLC loads rewrite the EC capacitance/conductance and add an
+        // Lorentz and Debye materials need the finished EC coefficients to size
+        // their Drude/Lorentz elements. Native adds Lorentz first.
+        let has_lorentz = op.structure.as_ref().is_some_and(|structure| {
+            (0..structure.property_count()).any(|index| {
+                structure
+                    .property_by_index(index)
+                    .is_some_and(|property| property.lorentz_material().is_some())
+            })
+        });
+        if has_lorentz {
+            registry.add(Box::new(LorentzOperatorExtension));
+        }
+        let has_debye = op.structure.as_ref().is_some_and(|structure| {
+            (0..structure.property_count()).any(|index| {
+                structure
+                    .property_by_index(index)
+                    .is_some_and(|property| property.debye_material().is_some())
+            })
+        });
+        if has_debye {
+            registry.add(Box::new(DebyeOperatorExtension));
+        }
+        // Lumped RLC loads rewrite the EC capacitance/conductance and add an
         // ADE that runs after the sheet model, as in the native setup order.
         let has_lumped_element = op.structure.as_ref().is_some_and(|structure| {
             (0..structure.property_count()).any(|index| {
@@ -517,6 +539,7 @@ impl OpenEMS {
         // Box as trait object for the engine (unsizing coercion).
         let op_dyn: Box<dyn OperatorBase> = Box::new(op);
         let mut engine = Engine::new(op_dyn);
+        engine.set_number_of_threads(self.num_threads);
         for extension in engine_extensions {
             engine.add_extension(extension);
         }
@@ -538,6 +561,30 @@ impl OpenEMS {
         // the processing state is mutable.
         let mut processing = self.processing_array.take();
         if let Some(ref mut pa) = processing {
+            // Native global oversampling: probes and dumps without an explicit
+            // interval sample at Nyquist/oversampling.
+            let dt = self
+                .fdtd_eng
+                .as_ref()
+                .expect("engine checked above")
+                .op
+                .get_timestep();
+            let f_max = self
+                .excitation
+                .as_ref()
+                .map(|signal| signal.f_max)
+                .unwrap_or(0.0);
+            let nyquist = if f_max > 0.0 && dt > 0.0 {
+                (1.0 / f_max / 2.0 / dt).floor() as u32
+            } else {
+                0
+            };
+            if nyquist > 0 {
+                let interval = nyquist / self.over_sampling.max(1);
+                if interval > 0 {
+                    pa.set_global_interval(interval);
+                }
+            }
             pa.pre_process();
         }
 
@@ -1337,5 +1384,120 @@ mod tfsf_wiring_tests {
             scattered < 0.1 * incident,
             "scattered field {scattered:e} is too large vs incident {incident:e}"
         );
+    }
+}
+
+#[cfg(test)]
+mod option_wiring_tests {
+    use super::*;
+    use crate::processing::FieldProbe;
+
+    fn mesh() -> String {
+        let lines = |count: usize| {
+            (0..count)
+                .map(|index| index.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            r#"<ContinuousStructure CoordSystem="0">
+                <RectilinearGrid DeltaUnit="0.001">
+                    <XLines>{}</XLines>
+                    <YLines>{}</YLines>
+                    <ZLines>{}</ZLines>
+                </RectilinearGrid>
+                <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                <Properties>
+                    <Excitation Number="0" Enabled="1" Frequency="2e9" Delay="0" Type="0" Excite="0,1,0">
+                        <Primitives><Box Priority="0"><P1 X="10" Y="10" Z="10"/><P2 X="11" Y="11" Z="11"/></Box></Primitives>
+                    </Excitation>
+                </Properties>
+            </ContinuousStructure>"#,
+            lines(21),
+            lines(21),
+            lines(21)
+        )
+    }
+
+    fn configure(threads: i32) -> OpenEMS {
+        let mut sim = OpenEMS::new();
+        sim.set_csx_xml(mesh());
+        sim.set_gauss_excite(2.0e9, 1.0e9);
+        for face in 0..6 {
+            sim.set_bc_type(face, BC_MUR);
+        }
+        sim.set_number_of_threads(threads);
+        sim.set_number_of_time_steps(20);
+        assert!(sim.setup_fdtd());
+        sim
+    }
+
+    #[test]
+    fn threaded_update_matches_the_serial_kernel_bit_for_bit() {
+        let mut serial = configure(1);
+        let mut threaded = configure(4);
+        assert_eq!(threaded.fdtd_eng.as_ref().unwrap().num_threads, 4);
+        assert!(serial.run_fdtd());
+        assert!(threaded.run_fdtd());
+        let serial_engine = serial.fdtd_eng.as_ref().unwrap();
+        let threaded_engine = threaded.fdtd_eng.as_ref().unwrap();
+        for n in 0..3 {
+            for i in 0..serial_engine.num_lines[0] {
+                for j in 0..serial_engine.num_lines[1] {
+                    for k in 0..serial_engine.num_lines[2] {
+                        assert_eq!(
+                            serial_engine.volt_ptr.get(n, i, j, k).to_bits(),
+                            threaded_engine.volt_ptr.get(n, i, j, k).to_bits(),
+                            "volt mismatch at ({n},{i},{j},{k})"
+                        );
+                        assert_eq!(
+                            serial_engine.curr_ptr.get(n, i, j, k).to_bits(),
+                            threaded_engine.curr_ptr.get(n, i, j, k).to_bits(),
+                            "curr mismatch at ({n},{i},{j},{k})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn over_sampling_sets_the_default_probe_interval() {
+        let mut sim = configure(1);
+        sim.set_over_sampling(2);
+        sim.add_processing(Box::new(FieldProbe::new("probe", [0.010, 0.010, 0.010])));
+        let dt = sim.fdtd_eng.as_ref().unwrap().op.get_timestep();
+        let f_max = sim.excitation.as_ref().unwrap().f_max;
+        let nyquist = (1.0 / f_max / 2.0 / dt).floor() as u32;
+        assert!(sim.run_fdtd());
+        let intervals = sim.processing_array.as_ref().unwrap().process_intervals();
+        assert_eq!(intervals.len(), 1);
+        assert_eq!(intervals[0], nyquist / 2);
+        assert!(intervals[0] > 0);
+    }
+
+    #[test]
+    fn max_time_stops_the_run_before_the_requested_timesteps() {
+        let mut sim = configure(1);
+        let dt = sim.fdtd_eng.as_ref().unwrap().op.get_timestep();
+        sim.set_number_of_time_steps(1000);
+        sim.set_max_time(10.0 * dt);
+        assert!(sim.run_fdtd());
+        assert_eq!(sim.fdtd_eng.as_ref().unwrap().get_number_of_timesteps(), 10);
+    }
+
+    #[test]
+    fn abort_before_the_run_executes_no_timestep() {
+        let mut sim = configure(1);
+        sim.set_abort(true);
+        assert!(sim.run_fdtd());
+        assert_eq!(sim.fdtd_eng.as_ref().unwrap().get_number_of_timesteps(), 0);
+    }
+
+    #[test]
+    fn over_sampling_must_be_positive() {
+        let mut sim = OpenEMS::new();
+        sim.set_over_sampling(0);
+        assert_eq!(sim.over_sampling, 1);
     }
 }

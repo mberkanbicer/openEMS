@@ -20,12 +20,14 @@ pub mod excitation;
 pub mod extensions;
 pub mod hdf5;
 pub mod lumped_rlc;
+pub mod nf2ff;
 pub mod openems;
 pub mod operator;
 pub mod operator_base;
 pub mod operator_extension;
 pub mod processing;
 pub mod processing_integral;
+pub mod sar;
 
 // Re-export the main solver and boundary condition types at the crate root
 // so dependents can use `openems_core::{OpenEMS, BC_PEC, ...}`.

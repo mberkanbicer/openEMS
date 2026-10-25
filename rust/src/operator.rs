@@ -216,6 +216,18 @@ impl Operator {
         let mut structure = csxcad_core::model::Structure::from_xml_str(xml)
             .map_err(|e| format!("CSXCAD XML parse error: {}", e))?;
 
+        // The cylindrical operator variants (`Operator_Cylinder`,
+        // `Operator_CylinderMultiGrid`) are not ported yet; see ADR 0002.
+        // Silently treating a cylindrical model as Cartesian would produce a
+        // physically different simulation, so reject it explicitly.
+        if structure.coordinate_system() == csxcad_core::grid::CoordinateSystem::Cylindrical {
+            return Err(
+                "cylindrical coordinates (CSX CoordSystem=1) are not implemented in the Rust \
+                 operator; see docs/migration/adr/0002-wave-a-scope.md"
+                    .to_string(),
+            );
+        }
+
         // --- Grid ---
         // Keep the native representation: discLines hold drawing units and
         // grid_delta is the unit in metres. Non-uniform spacing is preserved.
@@ -5269,5 +5281,41 @@ mod lorentz_tests {
         assert!(
             (extension.v_lor_ade[0][component][index] as f64 - v_lor).abs() / v_lor.abs() < 1e-5
         );
+    }
+}
+
+#[cfg(test)]
+mod coordinate_system_tests {
+    use super::*;
+
+    fn mesh(coordinate_system: u32) -> String {
+        let lines: Vec<String> = (0..5).map(|index| index.to_string()).collect();
+        let joined = lines.join(",");
+        format!(
+            r#"<ContinuousStructure CoordSystem="{coordinate_system}">
+                <RectilinearGrid DeltaUnit="0.001">
+                    <XLines>{joined}</XLines>
+                    <YLines>{joined}</YLines>
+                    <ZLines>{joined}</ZLines>
+                </RectilinearGrid>
+                <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                <Properties/>
+            </ContinuousStructure>"#
+        )
+    }
+
+    #[test]
+    fn cylindrical_coordinates_are_rejected_loudly() {
+        let mut op = Operator::new();
+        let error = op
+            .load_csx(&mesh(1))
+            .expect_err("cylindrical CSX must be rejected");
+        assert!(
+            error.contains("cylindrical"),
+            "the error must name the unsupported feature: {error}"
+        );
+        // A Cartesian model still loads.
+        let mut op = Operator::new();
+        op.load_csx(&mesh(0)).expect("Cartesian CSX must load");
     }
 }
