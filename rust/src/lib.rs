@@ -19,6 +19,7 @@ pub mod engine;
 pub mod excitation;
 pub mod extensions;
 pub mod hdf5;
+pub mod lumped_rlc;
 pub mod openems;
 pub mod operator;
 pub mod operator_base;

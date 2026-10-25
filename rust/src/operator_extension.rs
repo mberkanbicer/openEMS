@@ -423,3 +423,104 @@ impl OperatorExtension for ConductingSheetOperatorExtension {
             .collect())
     }
 }
+
+/// Series/parallel lumped RLC loads (`Operator_Ext_LumpedRLC`).
+pub struct LumpedRLCOperatorExtension {
+    /// Highest frequency of interest, used for the stability capacitance floor.
+    pub f_max: f64,
+}
+
+impl OperatorExtension for LumpedRLCOperatorExtension {
+    fn name(&self) -> &'static str {
+        "LumpedRLC"
+    }
+
+    fn priority(&self) -> i32 {
+        crate::extensions::ENG_EXT_PRIO_LUMPED_RLC
+    }
+
+    fn build(
+        &mut self,
+        operator: &mut Operator,
+    ) -> Result<Vec<Box<dyn EngineExtension>>, String> {
+        Ok(operator
+            .build_lumped_rlc_extension(self.f_max)?
+            .into_iter()
+            .map(|extension| Box::new(extension) as Box<dyn EngineExtension>)
+            .collect())
+    }
+}
+
+/// Total-field / scattered-field plane-wave excitation (`Operator_Ext_TFSF`).
+pub struct TfsfOperatorExtension {
+    pub signal: Arc<Excitation>,
+}
+
+impl OperatorExtension for TfsfOperatorExtension {
+    fn name(&self) -> &'static str {
+        "TFSF"
+    }
+
+    fn priority(&self) -> i32 {
+        crate::extensions::ENG_EXT_PRIO_TFSF
+    }
+
+    fn build(
+        &mut self,
+        operator: &mut Operator,
+    ) -> Result<Vec<Box<dyn EngineExtension>>, String> {
+        Ok(operator
+            .build_tfsf_extension(self.signal.as_ref())?
+            .into_iter()
+            .map(|extension| Box::new(extension) as Box<dyn EngineExtension>)
+            .collect())
+    }
+}
+
+/// Debye dispersive materials (`Operator_Ext_DebyeMaterial`).
+pub struct DebyeOperatorExtension;
+
+impl OperatorExtension for DebyeOperatorExtension {
+    fn name(&self) -> &'static str {
+        "Debye"
+    }
+
+    fn priority(&self) -> i32 {
+        crate::extensions::ENG_EXT_PRIO_DISPERSIVE_DEBYE
+    }
+
+    fn build(
+        &mut self,
+        operator: &mut Operator,
+    ) -> Result<Vec<Box<dyn EngineExtension>>, String> {
+        Ok(operator
+            .build_debye_extension()?
+            .into_iter()
+            .map(|extension| Box::new(extension) as Box<dyn EngineExtension>)
+            .collect())
+    }
+}
+
+/// Lorentz (Drude-Lorentz) dispersive materials (`Operator_Ext_LorentzMaterial`).
+pub struct LorentzOperatorExtension;
+
+impl OperatorExtension for LorentzOperatorExtension {
+    fn name(&self) -> &'static str {
+        "Lorentz"
+    }
+
+    fn priority(&self) -> i32 {
+        crate::extensions::ENG_EXT_PRIO_DISPERSIVE_LORENTZ
+    }
+
+    fn build(
+        &mut self,
+        operator: &mut Operator,
+    ) -> Result<Vec<Box<dyn EngineExtension>>, String> {
+        Ok(operator
+            .build_lorentz_extension()?
+            .into_iter()
+            .map(|extension| Box::new(extension) as Box<dyn EngineExtension>)
+            .collect())
+    }
+}

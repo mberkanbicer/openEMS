@@ -6,8 +6,10 @@ use crate::excitation::Excitation;
 use crate::operator::Operator;
 use crate::operator_base::OperatorBase;
 use crate::operator_extension::{
-    ConductingSheetOperatorExtension, ExcitationOperatorExtension, MurOperatorExtension,
-    OperatorExtensionRegistry, SteadyStateOperatorExtension, UpmlOperatorExtension,
+    ConductingSheetOperatorExtension, DebyeOperatorExtension, ExcitationOperatorExtension,
+    LorentzOperatorExtension, LumpedRLCOperatorExtension, MurOperatorExtension,
+    OperatorExtensionRegistry, SteadyStateOperatorExtension, TfsfOperatorExtension,
+    UpmlOperatorExtension,
 };
 use crate::processing::{
     EngineInterface, EngineMeta, Processing, ProcessingArray,
@@ -447,6 +449,9 @@ impl OpenEMS {
             registry.add(Box::new(ExcitationOperatorExtension {
                 signal: Arc::new(signal.clone()),
             }));
+            registry.add(Box::new(TfsfOperatorExtension {
+                signal: Arc::new(signal.clone()),
+            }));
         }
         if op.base.m_bc.iter().any(|&boundary| boundary == BC_PML) {
             registry.add(Box::new(UpmlOperatorExtension {
@@ -480,6 +485,23 @@ impl OpenEMS {
                 f_max,
                 boundary_size,
             }));
+        }
+        // Lorentz and Debye materials need the finished EC coefficients to size\n        // their Drude/Lorentz elements. Native adds Lorentz first.\n        let has_lorentz = op.structure.as_ref().is_some_and(|structure| {\n            (0..structure.property_count())\n                .any(|index| structure.property_by_index(index).is_some_and(|p| p.lorentz_material().is_some()))\n        });\n        if has_lorentz {\n            registry.add(Box::new(LorentzOperatorExtension));\n        }\n        // Debye materials need the finished EC coefficients to size their poles.\n        let has_debye = op.structure.as_ref().is_some_and(|structure| {\n            (0..structure.property_count())\n                .any(|index| structure.property_by_index(index).is_some_and(|p| p.debye_material().is_some()))\n        });\n        if has_debye {\n            registry.add(Box::new(DebyeOperatorExtension));\n        }\n        // Lumped RLC loads rewrite the EC capacitance/conductance and add an
+        // ADE that runs after the sheet model, as in the native setup order.
+        let has_lumped_element = op.structure.as_ref().is_some_and(|structure| {
+            (0..structure.property_count()).any(|index| {
+                structure
+                    .property_by_index(index)
+                    .is_some_and(|property| property.lumped_element().is_some())
+            })
+        });
+        if has_lumped_element {
+            let f_max = self
+                .excitation
+                .as_ref()
+                .map(|signal| signal.f_max)
+                .unwrap_or(0.0);
+            registry.add(Box::new(LumpedRLCOperatorExtension { f_max }));
         }
         registry.add(Box::new(MurOperatorExtension {
             phase_velocity: self.mur_v_ph,
@@ -1147,5 +1169,173 @@ mod steady_state_wiring_tests {
             .unwrap()
             .get_steady_state_diff()
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod lumped_rlc_wiring_tests {
+    use super::*;
+
+    fn mesh_with_element() -> String {
+        let lines = |count: usize| {
+            (0..count)
+                .map(|index| index.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            r#"<ContinuousStructure CoordSystem="0">
+                <RectilinearGrid DeltaUnit="0.001">
+                    <XLines>{}</XLines>
+                    <YLines>{}</YLines>
+                    <ZLines>{}</ZLines>
+                </RectilinearGrid>
+                <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                <Properties>
+                    <Excitation Name="src" Number="0" Enabled="1" Frequency="5e9" Delay="0" Type="0" Excite="0,1,0">
+                        <Primitives><Box Priority="0"><P1 X="10" Y="10" Z="10"/><P2 X="11" Y="11" Z="11"/></Box></Primitives>
+                    </Excitation>
+                    <LumpedElement Name="load" Direction="0" LEtype="1" R="50" L="1e-9" C="1e-12" Caps="0">
+                        <Primitives><Box Priority="1"><P1 X="5" Y="5" Z="5"/><P2 X="10" Y="6" Z="6"/></Box></Primitives>
+                    </LumpedElement>
+                </Properties>
+            </ContinuousStructure>"#,
+            lines(21),
+            lines(21),
+            lines(21)
+        )
+    }
+
+    #[test]
+    fn lumped_element_is_registered_and_the_run_stays_finite() {
+        let mut sim = OpenEMS::new();
+        sim.set_csx_xml(mesh_with_element());
+        sim.set_gauss_excite(5.0e9, 5.0e9);
+        for face in 0..6 {
+            sim.set_bc_type(face, BC_MUR);
+        }
+        sim.set_number_of_time_steps(30);
+        assert!(sim.setup_fdtd(), "setup with a lumped element must succeed");
+        let names = sim
+            .fdtd_eng
+            .as_ref()
+            .expect("engine built")
+            .extension_names();
+        assert!(
+            names.contains(&"lumped_rlc"),
+            "lumped RLC extension is missing: {names:?}"
+        );
+        assert!(sim.run_fdtd());
+        let energy = sim.fdtd_eng.as_ref().unwrap().fast_energy();
+        assert!(energy.is_finite(), "energy is not finite: {energy}");
+    }
+}
+
+#[cfg(test)]
+mod tfsf_wiring_tests {
+    use super::*;
+    use crate::constants::C0;
+
+    fn plane_wave_mesh(frequency: f64) -> String {
+        let lines = |count: usize| {
+            (0..count)
+                .map(|index| index.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            r#"<ContinuousStructure CoordSystem="0">
+                <RectilinearGrid DeltaUnit="0.001">
+                    <XLines>{}</XLines>
+                    <YLines>{}</YLines>
+                    <ZLines>{}</ZLines>
+                </RectilinearGrid>
+                <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                <Properties>
+                    <Excitation Name="plane" Number="0" Enabled="1" Type="10" Frequency="{frequency}" Excite="0,1,0" PropDir="1,0,0">
+                        <Primitives><Box Priority="0"><P1 X="5" Y="5" Z="5"/><P2 X="35" Y="15" Z="15"/></Box></Primitives>
+                    </Excitation>
+                </Properties>
+            </ContinuousStructure>"#,
+            lines(41),
+            lines(21),
+            lines(21)
+        )
+    }
+
+    #[test]
+    fn plane_wave_tfsf_propagates_at_the_numeric_phase_velocity() {
+        let frequency = 20.0e9;
+        let mut sim = OpenEMS::new();
+        sim.set_csx_xml(plane_wave_mesh(frequency));
+        sim.set_sinus_excite(frequency);
+        for face in 0..6 {
+            sim.set_bc_type(face, BC_MUR);
+        }
+        sim.set_number_of_time_steps(2_000);
+        assert!(sim.setup_fdtd(), "plane-wave setup must succeed");
+        let names = sim.fdtd_eng.as_ref().unwrap().extension_names();
+        assert!(names.contains(&"TFSF"), "TFSF extension is missing: {names:?}");
+        assert!(sim.run_fdtd());
+
+        let engine = sim.fdtd_eng.as_ref().unwrap();
+        // Spatial snapshot along x at the cross-section centre.
+        let mut samples = Vec::new();
+        for x in 6..=34usize {
+            samples.push((x as f64 * 1.0e-3, *engine.volt_ptr.get(1, x, 10, 10) as f64));
+        }
+
+        // Fit E(x) = a sin(k x) + b cos(k x) by scanning k around the
+        // analytic free-space value.
+        let k0 = std::f64::consts::TAU * frequency / C0;
+        let mut best = (f64::INFINITY, k0);
+        let mut k = 0.70 * k0;
+        while k <= 1.30 * k0 {
+            let mut ss = 0.0;
+            let mut cc = 0.0;
+            let mut sc = 0.0;
+            let mut ys = 0.0;
+            let mut yc = 0.0;
+            for &(x, value) in &samples {
+                let (s, c) = ((k * x).sin(), (k * x).cos());
+                ss += s * s;
+                cc += c * c;
+                sc += s * c;
+                ys += value * s;
+                yc += value * c;
+            }
+            let determinant = ss * cc - sc * sc;
+            if determinant.abs() > 1.0e-12 {
+                let a = (ys * cc - yc * sc) / determinant;
+                let b = (yc * ss - ys * sc) / determinant;
+                let mut residual = 0.0;
+                for &(x, value) in &samples {
+                    let model = a * (k * x).sin() + b * (k * x).cos();
+                    residual += (value - model) * (value - model);
+                }
+                if residual < best.0 {
+                    best = (residual, k);
+                }
+            }
+            k += 0.002 * k0;
+        }
+        let measured_velocity = std::f64::consts::TAU * frequency / best.1;
+        // At 20 GHz and 1 mm cells the numerical phase velocity is ~0.994 c.
+        let relative = (measured_velocity - C0).abs() / C0;
+        assert!(
+            relative < 0.03,
+            "phase velocity {measured_velocity:e} m/s (relative {relative:e})"
+        );
+
+        // Amplitude inside the total-field box and in the scattered region.
+        let incident = samples.iter().map(|(_, value)| value.abs()).fold(0.0, f64::max);
+        assert!(incident > 0.0, "no incident field inside the TFSF box");
+        let scattered = (2..5)
+            .map(|x| (*engine.volt_ptr.get(1, x, 10, 10) as f64).abs())
+            .fold(0.0, f64::max);
+        assert!(
+            scattered < 0.1 * incident,
+            "scattered field {scattered:e} is too large vs incident {incident:e}"
+        );
     }
 }

@@ -5,8 +5,10 @@ use crate::array_nijk::FieldArray;
 use crate::constants::{C0, EPS0, FDTD_FLOAT, MU0, Z0};
 use crate::excitation::Excitation;
 use crate::extensions::{
-    ConductingSheetCoeffs, EngineExtConductingSheet, EngineExtExcitation, EngineExtMurABC,
-    EngineExtSteadyState, EngineExtUPML,
+    ConductingSheetCoeffs, EngineExtConductingSheet, EngineExtDebyeMaterial, EngineExtExcitation,
+    EngineExtLorentzMaterial, EngineExtLumpedRLC, EngineExtMurABC, EngineExtSteadyState,
+    EngineExtTFSF, EngineExtUPML,
+    LumpedRLCCoeffs,
 };
 use crate::operator_base::OperatorBase;
 use csxcad_core::material::{ConductingSheetProperties, ExcitationProperties, MaterialField};
@@ -67,6 +69,17 @@ pub struct Operator {
     pub vi_ptr: Option<FieldArray>,
     pub ii_ptr: Option<FieldArray>,
     pub iv_ptr: Option<FieldArray>,
+    /// Equivalent-circuit capacitance per component and cell (`EC_C`).
+    /// Kept alongside the update coefficients because extensions (lumped RLC,
+    /// conducting sheet) rewrite the cell capacitance before recomputing
+    /// `vv`/`vi`, exactly like native `Operator::EC_C`.
+    pub ec_c: Vec<FDTD_FLOAT>,
+    /// Equivalent-circuit conductance per component and cell (`EC_G`).
+    pub ec_g: Vec<FDTD_FLOAT>,
+    /// Equivalent-circuit inductance per component and cell (`EC_L`).
+    pub ec_l: Vec<FDTD_FLOAT>,
+    /// Equivalent-circuit resistance per component and cell (`EC_R`).
+    pub ec_r: Vec<FDTD_FLOAT>,
     /// Per-cell material grid, indexed as [n][i][j][k] flattened.
     /// When Some, overrides the background material for EC coefficient computation.
     pub material_grid: Option<Vec<CellMaterial>>,
@@ -83,9 +96,21 @@ impl Operator {
             vi_ptr: None,
             ii_ptr: None,
             iv_ptr: None,
+            ec_c: Vec::new(),
+            ec_g: Vec::new(),
+            ec_l: Vec::new(),
+            ec_r: Vec::new(),
             material_grid: None,
             structure: None,
         }
+    }
+
+    /// Index into the flat per-component EC arrays.
+    pub fn ec_index(n: usize, i: usize, j: usize, k: usize, counts: [u32; 3]) -> usize {
+        let nx = counts[0] as usize;
+        let ny = counts[1] as usize;
+        let nz = counts[2] as usize;
+        n * nx * ny * nz + i * ny * nz + j * nz + k
     }
 
     /// Allocate the EC coefficient field arrays and the per-cell material grid.
@@ -97,9 +122,16 @@ impl Operator {
         self.vi_ptr = Some(FieldArray::new("vi", extent));
         self.ii_ptr = Some(FieldArray::new("ii", extent));
         self.iv_ptr = Some(FieldArray::new("iv", extent));
+        // Native keeps the four per-cell EC values; extensions may rewrite the
+        // capacitance/conductance and must be able to recompute the update
+        // coefficients for a single edge (`Calc_ECOperatorPos`).
+        let num_cells = num_lines[0] * num_lines[1] * num_lines[2];
+        self.ec_c = vec![0.0; 3 * num_cells];
+        self.ec_g = vec![0.0; 3 * num_cells];
+        self.ec_l = vec![0.0; 3 * num_cells];
+        self.ec_r = vec![0.0; 3 * num_cells];
         // Allocate per-cell material grid (one entry per cell and direction,
         // initialized from the background material). Indexed as [n][i][j][k].
-        let num_cells = num_lines[0] * num_lines[1] * num_lines[2];
         let background = CellMaterial {
             eps_r: self.base.m_bg_eps_r,
             mue_r: self.base.m_bg_mue_r,
@@ -284,7 +316,11 @@ impl Operator {
                 .property_by_index(prop)
                 .ok_or_else(|| "invalid property index".to_string())?;
             match property.property_type() {
-                PropertyType::Material => {
+                PropertyType::Material
+                | PropertyType::DispersiveMaterial
+                | PropertyType::LorentzMaterial
+                | PropertyType::DebyeMaterial
+                | PropertyType::DiscreteMaterial => {
                     let mat = property
                         .material()
                         .ok_or_else(|| "material property missing material data".to_string())?;
@@ -608,6 +644,11 @@ impl Operator {
                             0.0
                         };
 
+                        let index = Self::ec_index(n, i, j, k, counts);
+                        self.ec_c[index] = c;
+                        self.ec_g[index] = g;
+                        self.ec_l[index] = l;
+                        self.ec_r[index] = r;
                         // PEC edges inside a metal primitive have no electric
                         // update, matching native `Calc_PEC` (vv/vi only).
                         if is_pec {
@@ -637,6 +678,54 @@ impl Operator {
                     }
                 }
             }
+        }
+    }
+
+    /// Recompute the update coefficients for one edge from its (possibly
+    /// rewritten) `EC_C`/`EC_G`/`EC_L`/`EC_R`. Mirrors native
+    /// `Operator::Calc_ECOperatorPos`.
+    pub fn calc_ec_operator_pos(&mut self, n: usize, pos: [usize; 3]) {
+        let counts = self.base.num_lines;
+        let index = Self::ec_index(n, pos[0], pos[1], pos[2], counts);
+        if index >= self.ec_c.len() {
+            return;
+        }
+        let dt = self.base.d_t;
+        let c = self.ec_c[index] as f64;
+        let g = self.ec_g[index] as f64;
+        let l = self.ec_l[index] as f64;
+        let r = self.ec_r[index] as f64;
+
+        let (vv, vi) = if c > 0.0 {
+            let denominator = 1.0 + dt * g / 2.0 / c;
+            (
+                ((1.0 - dt * g / 2.0 / c) / denominator) as FDTD_FLOAT,
+                ((dt / c) / denominator) as FDTD_FLOAT,
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        let (ii, iv) = if l > 0.0 {
+            let denominator = 1.0 + dt * r / 2.0 / l;
+            (
+                ((1.0 - dt * r / 2.0 / l) / denominator) as FDTD_FLOAT,
+                ((dt / l) / denominator) as FDTD_FLOAT,
+            )
+        } else {
+            (0.0, 0.0)
+        };
+
+        if let Some(array) = self.vv_ptr.as_mut() {
+            *array.get_mut(n, pos[0], pos[1], pos[2]) = vv;
+        }
+        if let Some(array) = self.vi_ptr.as_mut() {
+            *array.get_mut(n, pos[0], pos[1], pos[2]) = vi;
+        }
+        if let Some(array) = self.ii_ptr.as_mut() {
+            *array.get_mut(n, pos[0], pos[1], pos[2]) = ii;
+        }
+        if let Some(array) = self.iv_ptr.as_mut() {
+            *array.get_mut(n, pos[0], pos[1], pos[2]) = iv;
         }
     }
 
@@ -947,6 +1036,161 @@ impl Operator {
     }
 
     // ----- private helpers -----
+
+    /// Snap one coordinate to a mesh line index. Mirrors native
+    /// `Operator::SnapToMeshLine`.
+    ///
+    /// Returns the index and whether the coordinate was inside the mesh.
+    pub fn snap_to_mesh_line(&self, axis: usize, coord: f64, dual: bool) -> (u32, bool) {
+        let counts = self.base.num_lines;
+        let n = counts[axis] as usize;
+        if n == 0 {
+            return (0, false);
+        }
+        let line = |pos: usize, dual_mesh: bool| {
+            disc_line_value(&self.base.disc_lines[axis], n, pos, dual_mesh)
+        };
+        if coord < line(0, false) {
+            return (0, false);
+        }
+        if coord > line(n - 1, false) {
+            return ((n - 1) as u32, false);
+        }
+        if !dual {
+            for pos in 0..n {
+                if coord <= line(pos, true) {
+                    return (pos as u32, true);
+                }
+            }
+        } else {
+            for pos in 1..n {
+                if coord <= line(pos, false) {
+                    return ((pos - 1) as u32, true);
+                }
+            }
+        }
+        (0, true)
+    }
+
+    /// Snap a coordinate triple to the mesh. Mirrors native
+    /// `Operator::SnapToMesh`; `full_mesh` is accepted for call compatibility
+    /// and, like native `Operator::GetNumberOfLines`, does not change the line
+    /// count.
+    pub fn snap_to_mesh_native(
+        &self,
+        coord: [f64; 3],
+        dual: bool,
+        _full_mesh: bool,
+    ) -> ([u32; 3], [bool; 3]) {
+        let mut index = [0u32; 3];
+        let mut inside = [false; 3];
+        for axis in 0..3 {
+            let (snapped, is_inside) = self.snap_to_mesh_line(axis, coord[axis], dual);
+            index[axis] = snapped;
+            inside[axis] = is_inside;
+        }
+        (index, inside)
+    }
+
+    /// Snap a box to the mesh. Mirrors native `Operator::SnapBox2Mesh` for the
+    /// three supported snap methods:
+    ///
+    /// * `0` — keep the snapped indices,
+    /// * `1` — expand the box outward by one line where that keeps the snapped
+    ///   coordinate inside the original box,
+    /// * `2` — shrink the box inward by one line.
+    ///
+    /// A negative result means the box lies outside the domain (`-2`) or that
+    /// the snap method is unknown (`-1`).
+    pub fn snap_box_to_mesh_native(
+        &self,
+        start: [f64; 3],
+        stop: [f64; 3],
+        dual: bool,
+        full_mesh: bool,
+        snap_method: i32,
+    ) -> (
+        i32,
+        [u32; 3],
+        [u32; 3],
+        [bool; 3],
+        [bool; 3],
+    ) {
+        let mut lower = [0.0f64; 3];
+        let mut upper = [0.0f64; 3];
+        for axis in 0..3 {
+            lower[axis] = start[axis].min(stop[axis]);
+            upper[axis] = start[axis].max(stop[axis]);
+            let counts = self.base.num_lines;
+            let n = counts[axis] as usize;
+            let minimum = disc_line_value(&self.base.disc_lines[axis], n, 0, false);
+            let maximum = disc_line_value(&self.base.disc_lines[axis], n, n - 1, false);
+            if (lower[axis] < minimum && upper[axis] < minimum)
+                || (lower[axis] > maximum && upper[axis] > maximum)
+            {
+                return (
+                    -2,
+                    [0; 3],
+                    [0; 3],
+                    [false; 3],
+                    [false; 3],
+                );
+            }
+        }
+        let (mut ui_start, start_in) = self.snap_to_mesh_native(lower, dual, full_mesh);
+        let (mut ui_stop, stop_in) = self.snap_to_mesh_native(upper, dual, full_mesh);
+
+        let mut dimension = 0i32;
+        match snap_method {
+            0 => {
+                for axis in 0..3 {
+                    if ui_stop[axis] > ui_start[axis] {
+                        dimension += 1;
+                    }
+                }
+            }
+            1 | 2 => {
+                let counts = self.base.num_lines;
+                for axis in 0..3 {
+                    let n = counts[axis] as usize;
+                    if ui_stop[axis] > ui_start[axis] {
+                        let line = |pos: u32| {
+                            disc_line_value(
+                                &self.base.disc_lines[axis],
+                                n,
+                                pos as usize,
+                                dual,
+                            )
+                        };
+                        if snap_method == 1 {
+                            if line(ui_start[axis]) > lower[axis] && ui_start[axis] > 0 {
+                                ui_start[axis] -= 1;
+                            }
+                            if line(ui_stop[axis]) < upper[axis]
+                                && (ui_stop[axis] as usize) < n - 1
+                            {
+                                ui_stop[axis] += 1;
+                            }
+                        } else {
+                            if line(ui_start[axis]) < lower[axis]
+                                && (ui_start[axis] as usize) < n - 1
+                            {
+                                ui_start[axis] += 1;
+                            }
+                            if line(ui_stop[axis]) > upper[axis] && ui_stop[axis] > 0 {
+                                ui_stop[axis] -= 1;
+                            }
+                        }
+                    }
+                    if ui_stop[axis] > ui_start[axis] {
+                        dimension += 1;
+                    }
+                }
+            }
+            _ => return (-1, ui_start, ui_stop, start_in, stop_in),
+        }
+        (dimension, ui_start, ui_stop, start_in, stop_in)
+    }
 
     fn get_ec_c(&self, n: i32, i: usize, j: usize, k: usize) -> f64 {
         let dir = n.rem_euclid(3) as usize;
@@ -1532,6 +1776,1430 @@ impl Operator {
                 *vi.get_mut(n, pos[0], pos[1], pos[2]) = model.vi as f32;
             }
             extension.set_position(index, pos, &coefficients);
+        }
+        Ok(Some(extension))
+    }
+
+    /// Build the Lorentz (Drude–Lorentz) dispersive extension.
+    ///
+    /// Mirrors `Operator_Ext_LorentzMaterial::BuildExtension`: per dispersion
+    /// order and per edge, the plasma frequency builds the Drude inductance /
+    /// capacitance, the relaxation time the series resistance, and the Lorentz
+    /// pole frequency the resonant element. Cells active at different orders
+    /// share one position list; per-order coefficients are zero where inactive.
+    pub fn build_lorentz_extension(
+        &mut self,
+    ) -> Result<Option<EngineExtLorentzMaterial>, String> {
+        let Some(structure) = self.structure.as_ref() else {
+            return Ok(None);
+        };
+        let params = structure.parameters().clone();
+        let coordinate_system = structure.coordinate_system();
+        let dt = self.base.d_t;
+        if dt <= 0.0 {
+            return Err("Lorentz materials need a positive timestep".to_string());
+        }
+
+        let mut pole_count = 0usize;
+        for index in 0..structure.property_count() {
+            if let Some(property) = structure.property_by_index(index) {
+                if let Some(lorentz) = property.lorentz_material() {
+                    pole_count = pole_count.max(lorentz.order());
+                }
+            }
+        }
+        if pole_count == 0 {
+            return Ok(None);
+        }
+
+        struct Candidate<'a> {
+            priority: i32,
+            lorentz: &'a csxcad_core::material::LorentzMaterialProperties,
+            isotropic: bool,
+            primitive: &'a Primitive,
+        }
+        let mut candidates: Vec<Candidate<'_>> = Vec::new();
+        for index in 0..structure.property_count() {
+            let Some(property) = structure.property_by_index(index) else {
+                continue;
+            };
+            let Some(lorentz) = property.lorentz_material() else {
+                continue;
+            };
+            let isotropic = property.material().map_or(true, |m| m.is_isotropic());
+            for primitive in property.primitives() {
+                candidates.push(Candidate {
+                    priority: primitive.priority(),
+                    lorentz,
+                    isotropic,
+                    primitive,
+                });
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let material_at = |coordinate: [f64; 3]| -> Option<&Candidate<'_>> {
+            let mut winner: Option<&Candidate<'_>> = None;
+            let mut winner_priority = i32::MIN;
+            for candidate in &candidates {
+                if winner.is_some() && candidate.priority <= winner_priority {
+                    continue;
+                }
+                if candidate
+                    .primitive
+                    .is_inside(coordinate, Some(&params))
+                    .unwrap_or(false)
+                {
+                    winner = Some(candidate);
+                    winner_priority = candidate.priority;
+                }
+            }
+            winner
+        };
+        let parameter = |candidate: &Candidate<'_>,
+                         parameter: csxcad_core::material::LorentzParameter,
+                         order: usize,
+                         component: usize,
+                         coordinate: [f64; 3]|
+         -> f64 {
+            candidate
+                .lorentz
+                .weighted_value(
+                    parameter,
+                    order,
+                    if candidate.isotropic { 0 } else { component },
+                    Some(&params),
+                    coordinate,
+                    coordinate_system,
+                )
+                .ok()
+                .flatten()
+                .unwrap_or(0.0)
+        };
+
+        // Union of all active cells across orders, preserving first-seen order.
+        let mut union: Vec<[usize; 3]> = Vec::new();
+        let mut union_index: std::collections::HashMap<[usize; 3], usize> =
+            std::collections::HashMap::new();
+        struct OrderData {
+            positions: Vec<(usize, Coefficients)>,
+        }
+        struct Coefficients {
+            v_int: [FDTD_FLOAT; 3],
+            v_ext: [FDTD_FLOAT; 3],
+            v_lor: [FDTD_FLOAT; 3],
+            i_int: [FDTD_FLOAT; 3],
+            i_ext: [FDTD_FLOAT; 3],
+            i_lor: [FDTD_FLOAT; 3],
+        }
+        let counts = self.base.num_lines;
+        let mut orders: Vec<OrderData> = Vec::with_capacity(pole_count);
+
+        for order in 0..pole_count {
+            let mut data = OrderData {
+                positions: Vec::new(),
+            };
+            for i in 0..counts[0] as usize {
+                for j in 0..counts[1] as usize {
+                    for k in 0..counts[2] as usize {
+                        let pos = [i, j, k];
+                        let mut coefficients = Coefficients {
+                            v_int: [1.0; 3],
+                            v_ext: [0.0; 3],
+                            v_lor: [0.0; 3],
+                            i_int: [1.0; 3],
+                            i_ext: [0.0; 3],
+                            i_lor: [0.0; 3],
+                        };
+                        let mut active = false;
+                        for n in 0..3 {
+                            // ----- electric side -----
+                            let vi = self.vi_at(n, pos);
+                            let coordinate = yee_coordinates(
+                                &self.base.disc_lines,
+                                counts,
+                                n,
+                                pos,
+                                false,
+                            );
+                            let index = Self::ec_index(n, i, j, k, counts);
+                            if vi != 0.0 {
+                                if let Some(candidate) = material_at(coordinate) {
+                                    let w_plasma = parameter(
+                                        candidate,
+                                        csxcad_core::material::LorentzParameter::EpsilonPlasmaFrequency,
+                                        order,
+                                        n,
+                                        coordinate,
+                                    ) * std::f64::consts::TAU;
+                                    let mut l_d = 0.0;
+                                    let mut r_d = 0.0;
+                                    let mut c_l = 0.0;
+                                    if w_plasma > 0.0 {
+                                        let ec_c = *self.ec_c.get(index).unwrap_or(&0.0) as f64;
+                                        if ec_c > 0.0 {
+                                            l_d = 1.0 / (w_plasma * w_plasma * ec_c);
+                                            active = true;
+                                        }
+                                    }
+                                    let t_relax = parameter(
+                                        candidate,
+                                        csxcad_core::material::LorentzParameter::EpsilonRelaxTime,
+                                        order,
+                                        n,
+                                        coordinate,
+                                    );
+                                    if t_relax > 0.0 && l_d > 0.0 {
+                                        r_d = l_d / t_relax;
+                                    }
+                                    let w_lor = parameter(
+                                        candidate,
+                                        csxcad_core::material::LorentzParameter::EpsilonLorentzPoleFrequency,
+                                        order,
+                                        n,
+                                        coordinate,
+                                    ) * std::f64::consts::TAU;
+                                    if w_lor > 0.0 && l_d > 0.0 {
+                                        c_l = 1.0 / (w_lor * w_lor * l_d);
+                                    }
+                                    if l_d > 0.0 {
+                                        coefficients.v_int[n] =
+                                            ((2.0 * l_d - dt * r_d) / (2.0 * l_d + dt * r_d))
+                                                as FDTD_FLOAT;
+                                        coefficients.v_ext[n] =
+                                            (dt / (l_d + dt * r_d / 2.0) * vi as f64)
+                                                as FDTD_FLOAT;
+                                    }
+                                    if c_l > 0.0 {
+                                        coefficients.v_lor[n] =
+                                            (dt / c_l / vi as f64) as FDTD_FLOAT;
+                                    }
+                                }
+                            }
+
+                            // ----- magnetic side -----
+                            let iv = self.iv_at(n, pos);
+                            let coordinate = yee_coordinates(
+                                &self.base.disc_lines,
+                                counts,
+                                n,
+                                pos,
+                                true,
+                            );
+                            if iv != 0.0 {
+                                if let Some(candidate) = material_at(coordinate) {
+                                    let w_plasma = parameter(
+                                        candidate,
+                                        csxcad_core::material::LorentzParameter::MuePlasmaFrequency,
+                                        order,
+                                        n,
+                                        coordinate,
+                                    ) * std::f64::consts::TAU;
+                                    let mut c_d = 0.0;
+                                    let mut g_d = 0.0;
+                                    let mut l_l = 0.0;
+                                    if w_plasma > 0.0 {
+                                        let ec_l = *self.ec_l.get(index).unwrap_or(&0.0) as f64;
+                                        if ec_l > 0.0 {
+                                            c_d = 1.0 / (w_plasma * w_plasma * ec_l);
+                                            active = true;
+                                        }
+                                    }
+                                    let t_relax = parameter(
+                                        candidate,
+                                        csxcad_core::material::LorentzParameter::MueRelaxTime,
+                                        order,
+                                        n,
+                                        coordinate,
+                                    );
+                                    if t_relax > 0.0 && c_d > 0.0 {
+                                        g_d = c_d / t_relax;
+                                    }
+                                    let w_lor = parameter(
+                                        candidate,
+                                        csxcad_core::material::LorentzParameter::MueLorentzPoleFrequency,
+                                        order,
+                                        n,
+                                        coordinate,
+                                    ) * std::f64::consts::TAU;
+                                    if w_lor > 0.0 && c_d > 0.0 {
+                                        l_l = 1.0 / (w_lor * w_lor * c_d);
+                                    }
+                                    if c_d > 0.0 {
+                                        coefficients.i_int[n] =
+                                            ((2.0 * c_d - dt * g_d) / (2.0 * c_d + dt * g_d))
+                                                as FDTD_FLOAT;
+                                        coefficients.i_ext[n] =
+                                            (dt / (c_d + dt * g_d / 2.0) * iv as f64)
+                                                as FDTD_FLOAT;
+                                    }
+                                    if l_l > 0.0 {
+                                        coefficients.i_lor[n] =
+                                            (dt / l_l / iv as f64) as FDTD_FLOAT;
+                                    }
+                                }
+                            }
+                        }
+                        if !active {
+                            continue;
+                        }
+                        let position_index = *union_index.entry(pos).or_insert_with(|| {
+                            union.push(pos);
+                            union.len() - 1
+                        });
+                        data.positions.push((position_index, coefficients));
+                    }
+                }
+            }
+            orders.push(data);
+        }
+
+        if union.is_empty() {
+            return Ok(None);
+        }
+
+        let mut extension = EngineExtLorentzMaterial::new(pole_count, union.len());
+        for (index, &pos) in union.iter().enumerate() {
+            extension.set_position(index, pos);
+        }
+        for (order, data) in orders.iter().enumerate() {
+            let mut voltage_on = false;
+            let mut current_on = false;
+            for (position_index, coefficients) in &data.positions {
+                extension.set_order_coefficients(
+                    *position_index,
+                    order,
+                    &coefficients.v_int,
+                    &coefficients.v_ext,
+                    &coefficients.v_lor,
+                    &coefficients.i_int,
+                    &coefficients.i_ext,
+                    &coefficients.i_lor,
+                );
+                if coefficients.v_int != [1.0; 3] || coefficients.v_ext != [0.0; 3] {
+                    voltage_on = true;
+                }
+                if coefficients.i_int != [1.0; 3] || coefficients.i_ext != [0.0; 3] {
+                    current_on = true;
+                }
+            }
+            extension.set_order_active(order, voltage_on, current_on);
+        }
+        Ok(Some(extension))
+    }
+
+    /// Build the Debye dispersive extension from the CSX `DebyeMaterial`
+    /// properties.
+    ///
+    /// Mirrors `Operator_Ext_DebyeMaterial::BuildExtension`: the maximum pole
+    /// count comes from the properties, each edge samples the highest-priority
+    /// containing material, and a pole whose relaxation time is shorter than
+    /// three timesteps is skipped (the trapezoidal update is not stable).
+    pub fn build_debye_extension(
+        &mut self,
+    ) -> Result<Option<EngineExtDebyeMaterial>, String> {
+        let Some(structure) = self.structure.as_ref() else {
+            return Ok(None);
+        };
+        let params = structure.parameters().clone();
+        let coordinate_system = structure.coordinate_system();
+        let dt = self.base.d_t;
+        if dt <= 0.0 {
+            return Err("Debye materials need a positive timestep".to_string());
+        }
+
+        let mut pole_count = 0usize;
+        for index in 0..structure.property_count() {
+            if let Some(property) = structure.property_by_index(index) {
+                if let Some(debye) = property.debye_material() {
+                    pole_count = pole_count.max(debye.order());
+                }
+            }
+        }
+        if pole_count == 0 {
+            return Ok(None);
+        }
+
+        struct Candidate<'a> {
+            priority: i32,
+            debye: &'a csxcad_core::material::DebyeMaterialProperties,
+            isotropic: bool,
+            primitive: &'a Primitive,
+        }
+        let mut candidates: Vec<Candidate<'_>> = Vec::new();
+        for index in 0..structure.property_count() {
+            let Some(property) = structure.property_by_index(index) else {
+                continue;
+            };
+            let Some(debye) = property.debye_material() else {
+                continue;
+            };
+            for primitive in property.primitives() {
+                candidates.push(Candidate {
+                    priority: primitive.priority(),
+                    debye,
+                    isotropic: property.material().map_or(true, |m| m.is_isotropic()),
+                    primitive,
+                });
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let debye_at = |coordinate: [f64; 3]| -> Option<&Candidate<'_>> {
+            let mut winner: Option<&Candidate<'_>> = None;
+            let mut winner_priority = i32::MIN;
+            for candidate in &candidates {
+                if winner.is_some() && candidate.priority <= winner_priority {
+                    continue;
+                }
+                if candidate
+                    .primitive
+                    .is_inside(coordinate, Some(&params))
+                    .unwrap_or(false)
+                {
+                    winner = Some(candidate);
+                    winner_priority = candidate.priority;
+                }
+            }
+            winner
+        };
+
+        const DEBYE_MIN_TAU_PER_DT: f64 = 3.0;
+        let counts = self.base.num_lines;
+        let mut warn_once = true;
+        let mut positions: Vec<[usize; 3]> = Vec::new();
+        let mut relax: Vec<[Vec<f64>; 3]> = Vec::new();
+        let mut drive: Vec<[Vec<f64>; 3]> = Vec::new();
+        let mut solve: Vec<[f64; 3]> = Vec::new();
+
+        for i in 0..counts[0] as usize {
+            for j in 0..counts[1] as usize {
+                for k in 0..counts[2] as usize {
+                    let pos = [i, j, k];
+                    let mut any = false;
+                    let mut cell_relax: [Vec<f64>; 3] =
+                        [vec![0.0; pole_count], vec![0.0; pole_count], vec![0.0; pole_count]];
+                    let mut cell_drive: [Vec<f64>; 3] =
+                        [vec![0.0; pole_count], vec![0.0; pole_count], vec![0.0; pole_count]];
+                    let mut cell_solve = [1.0f64; 3];
+                    for n in 0..3 {
+                        let vi = self.vi_at(n, pos);
+                        if vi == 0.0 {
+                            continue;
+                        }
+                        let coordinate = yee_coordinates(
+                            &self.base.disc_lines,
+                            counts,
+                            n,
+                            pos,
+                            false,
+                        );
+                        let Some(candidate) = debye_at(coordinate) else {
+                            continue;
+                        };
+                        let area = edge_area_value(
+                            &self.base.disc_lines,
+                            counts,
+                            n,
+                            pos,
+                            false,
+                            self.base.grid_delta,
+                        );
+                        let length = edge_length_value(
+                            &self.base.disc_lines,
+                            counts,
+                            n,
+                            pos,
+                            false,
+                            self.base.grid_delta,
+                        );
+                        if length <= 0.0 {
+                            continue;
+                        }
+                        let area_per_length = area / length;
+                        let order = candidate.debye.order().min(pole_count);
+                        // Native `CSPropMaterial::GetValue` pins the component
+                        // to 0 for isotropic properties.
+                        let component = if candidate.isotropic { 0 } else { n };
+                        let mut sum = 0.0f64;
+                        for pole in 0..order {
+                            let delta_eps = candidate
+                                .debye
+                                .weighted_epsilon_delta(
+                                    pole,
+                                    component,
+                                    Some(&params),
+                                    coordinate,
+                                    coordinate_system,
+                                )
+                                .ok()
+                                .flatten()
+                                .unwrap_or(0.0);
+                            let tau = candidate
+                                .debye
+                                .weighted_epsilon_relax_time(
+                                    pole,
+                                    component,
+                                    Some(&params),
+                                    coordinate,
+                                    coordinate_system,
+                                )
+                                .ok()
+                                .flatten()
+                                .unwrap_or(0.0);
+                            if delta_eps <= 0.0 || tau <= 0.0 {
+                                continue;
+                            }
+                            if tau < DEBYE_MIN_TAU_PER_DT * dt {
+                                if warn_once {
+                                    warn_once = false;
+                                    eprintln!(
+                                        "[openEMS] Debye: relaxation time {tau:e}s needs at least \
+                                         3 timesteps (dt={dt:e}s); the pole is skipped"
+                                    );
+                                }
+                                continue;
+                            }
+                            let c_l = EPS0 * delta_eps * area_per_length;
+                            cell_relax[n][pole] = (2.0 * tau - dt) / (2.0 * tau + dt);
+                            cell_drive[n][pole] = c_l * vi as f64 / (2.0 * tau + dt);
+                            sum += cell_drive[n][pole];
+                            any = true;
+                        }
+                        cell_solve[n] = 1.0 / (1.0 + sum);
+                    }
+                    if !any {
+                        continue;
+                    }
+                    positions.push(pos);
+                    relax.push(cell_relax);
+                    drive.push(cell_drive);
+                    solve.push(cell_solve);
+                }
+            }
+        }
+
+        if positions.is_empty() {
+            return Ok(None);
+        }
+        let mut extension = EngineExtDebyeMaterial::new(pole_count, positions.len());
+        for index in 0..positions.len() {
+            extension.set_position(index, positions[index]);
+            for n in 0..3 {
+                let relax_f32: Vec<FDTD_FLOAT> =
+                    relax[index][n].iter().map(|&value| value as FDTD_FLOAT).collect();
+                let drive_f32: Vec<FDTD_FLOAT> =
+                    drive[index][n].iter().map(|&value| value as FDTD_FLOAT).collect();
+                extension.set_position_component(
+                    index,
+                    n,
+                    &relax_f32,
+                    &drive_f32,
+                    solve[index][n] as FDTD_FLOAT,
+                );
+            }
+        }
+        Ok(Some(extension))
+    }
+
+    /// Numerical phase velocity along `prop_dir` for a plane wave at
+    /// `frequency`. Mirrors native `Operator::CalcNumericPhaseVelocity`.
+    pub fn calc_numeric_phase_velocity(
+        &self,
+        start: [usize; 3],
+        stop: [usize; 3],
+        prop_dir: [f64; 3],
+        frequency: f64,
+    ) -> f64 {
+        let mut average = [0.0f64; 3];
+        let c0 = C0 / (self.base.m_bg_eps_r * self.base.m_bg_mue_r).sqrt();
+        for n in 0..3 {
+            let distance = (disc_line_value(
+                &self.base.disc_lines[n],
+                self.base.num_lines[n] as usize,
+                start[n],
+                false,
+            ) - disc_line_value(
+                &self.base.disc_lines[n],
+                self.base.num_lines[n] as usize,
+                stop[n],
+                false,
+            ))
+            .abs()
+                * self.base.grid_delta;
+            let cells = (stop[n] as f64 - start[n] as f64).abs();
+            average[n] = if cells > 0.0 { distance / cells } else { 0.0 };
+        }
+
+        // A Cartesian propagation direction has an analytic solution.
+        for n in 0..3 {
+            let n_p = (n + 1) % 3;
+            let n_pp = (n + 2) % 3;
+            if prop_dir[n].abs() == 1.0 && prop_dir[n_p] == 0.0 && prop_dir[n_pp] == 0.0 {
+                if average[0] <= 0.0 {
+                    return c0;
+                }
+                let kx = (average[0] / c0 / self.base.d_t
+                    * (std::f64::consts::TAU * frequency * self.base.d_t / 2.0).sin())
+                .asin()
+                    * 2.0
+                    / average[0];
+                if kx != 0.0 {
+                    return std::f64::consts::TAU * frequency / kx;
+                }
+                return c0;
+            }
+        }
+
+        // Otherwise solve the dispersion relation with Newton's method.
+        let k0 = std::f64::consts::TAU * frequency / c0;
+        let mut k = k0;
+        let rhs = (std::f64::consts::TAU * frequency * self.base.d_t / 2.0).sin()
+            / c0
+            / self.base.d_t;
+        let rhs = rhs * rhs;
+        let mut old_phase_velocity = 0.0f64;
+        let mut phase_velocity = c0;
+        let tolerance = 1.0e-6;
+        let mut iterations = 0;
+        while (old_phase_velocity - phase_velocity).abs() > tolerance {
+            iterations += 1;
+            old_phase_velocity = phase_velocity;
+            let mut f = 0.0;
+            let mut df = 0.0;
+            for n in 0..3 {
+                if average[n] == 0.0 {
+                    continue;
+                }
+                let half = prop_dir[n] * k * average[n] / 2.0;
+                f += (half.sin() / average[n]).powi(2);
+                df += prop_dir[n] * half.sin() * half.cos() / average[n];
+            }
+            f -= rhs;
+            if df != 0.0 {
+                k -= f / df;
+            }
+            if k < k0 {
+                k = k0;
+            }
+            phase_velocity = std::f64::consts::TAU * frequency / k;
+            if iterations > 99 {
+                eprintln!(
+                    "[openEMS] CalcNumericPhaseVelocity: Newton iteration did not converge"
+                );
+                break;
+            }
+        }
+        phase_velocity
+    }
+
+    /// Build the TFSF extension from a plane-wave CSX excitation.
+    ///
+    /// Mirrors `Operator_Ext_TFSF::BuildExtension`: exactly one box primitive,
+    /// a valid propagation direction and polarization, and the native delay /
+    /// amplitude layout on all six faces.
+    pub fn build_tfsf_extension(
+        &mut self,
+        signal: &Excitation,
+    ) -> Result<Option<EngineExtTFSF>, String> {
+        let Some(structure) = self.structure.as_ref() else {
+            return Ok(None);
+        };
+        let params = structure.parameters().clone();
+        let mut candidate: Option<(Primitive, f64, [f64; 3], [f64; 3])> = None;
+        for index in 0..structure.property_count() {
+            let Some(property) = structure.property_by_index(index) else {
+                continue;
+            };
+            let Some(excitation) = property.excitation() else {
+                continue;
+            };
+            if excitation.excitation_type() != 10 || !excitation.is_enabled() {
+                continue;
+            }
+            if property.primitives().len() != 1 {
+                eprintln!(
+                    "[openEMS] TFSF: plane wave excitation must have exactly one primitive; skipped"
+                );
+                continue;
+            }
+            let primitive = &property.primitives()[0];
+            if !matches!(
+                primitive.shape(),
+                csxcad_core::model::PrimitiveShape::Box(_)
+            ) {
+                eprintln!("[openEMS] TFSF: plane wave primitive is not a box; skipped");
+                continue;
+            }
+            if candidate.is_some() {
+                eprintln!("[openEMS] TFSF: more than one plane wave excitation; using the first");
+                break;
+            }
+            let frequency = excitation.frequency(Some(&params)).unwrap_or(0.0);
+            let mut direction = [0.0f64; 3];
+            for component in 0..3 {
+                direction[component] = excitation
+                    .propagation_direction(component, Some(&params))
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0.0);
+            }
+            let mut amplitude = [0.0f64; 3];
+            for component in 0..3 {
+                amplitude[component] = excitation
+                    .excitation(component, Some(&params))
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0.0);
+            }
+            candidate = Some((primitive.clone(), frequency, direction, amplitude));
+        }
+        let Some((primitive, frequency, mut prop_dir, mut e_amp)) = candidate else {
+            return Ok(None);
+        };
+
+        let norm = (prop_dir[0] * prop_dir[0]
+            + prop_dir[1] * prop_dir[1]
+            + prop_dir[2] * prop_dir[2])
+            .sqrt();
+        if norm == 0.0 {
+            eprintln!("[openEMS] TFSF: plane wave propagation direction is zero; disabled");
+            return Ok(None);
+        }
+        for component in 0..3 {
+            prop_dir[component] /= norm;
+        }
+
+        let bounds = primitive
+            .bounding_box(Some(&params), false)
+            .map_err(|error| format!("TFSF box: {error}"))?;
+        let start_coordinate = [bounds[0], bounds[2], bounds[4]];
+        let stop_coordinate = [bounds[1], bounds[3], bounds[5]];
+        let (dimension, start, stop, _start_in, _stop_in) =
+            self.snap_box_to_mesh_native(start_coordinate, stop_coordinate, false, true, 0);
+        if dimension != 3 {
+            eprintln!(
+                "[openEMS] TFSF: plane wave box dimension is {dimension}, expected 3; disabled"
+            );
+            return Ok(None);
+        }
+        let start = start.map(|value| value as usize);
+        let stop = stop.map(|value| value as usize);
+
+        let ref_index = (self.base.m_bg_eps_r * self.base.m_bg_mue_r).sqrt();
+        let phase_velocity = if frequency <= 0.0 {
+            C0 / ref_index
+        } else {
+            self.calc_numeric_phase_velocity(start, stop, prop_dir, frequency)
+        };
+        let phase_velocity = if phase_velocity < 0.0
+            || phase_velocity > C0 / ref_index
+            || !phase_velocity.is_finite()
+        {
+            eprintln!("[openEMS] TFSF: invalid phase velocity, resetting to c0");
+            C0 / ref_index
+        } else {
+            phase_velocity
+        };
+
+        let dot = e_amp[0] * prop_dir[0] + e_amp[1] * prop_dir[1] + e_amp[2] * prop_dir[2];
+        let e_norm = e_amp[0] * e_amp[0] + e_amp[1] * e_amp[1] + e_amp[2] * e_amp[2];
+        if e_norm == 0.0 {
+            eprintln!("[openEMS] TFSF: plane wave polarization is zero; disabled");
+            return Ok(None);
+        }
+        // Native computes acos(E·d / |E|²); preserved for compatibility.
+        let cosine = (dot / e_norm).clamp(-1.0, 1.0);
+        let degrees = cosine.acos() / std::f64::consts::PI * 180.0;
+        if degrees == 0.0 {
+            eprintln!("[openEMS] TFSF: propagation and polarization are parallel; disabled");
+            return Ok(None);
+        }
+        if (degrees - 90.0).abs() > 1.0e-9 {
+            for component in 0..3 {
+                e_amp[component] -= prop_dir[component] * dot;
+            }
+            eprintln!(
+                "[openEMS] TFSF: polarization is not orthogonal; projected to ({}, {}, {})",
+                e_amp[0], e_amp[1], e_amp[2]
+            );
+        }
+
+        let mut h_amp = [0.0f64; 3];
+        for n in 0..3 {
+            let n_p = (n + 1) % 3;
+            let n_pp = (n + 2) % 3;
+            h_amp[n] = (prop_dir[n_p] * e_amp[n_pp] - prop_dir[n_pp] * e_amp[n_p])
+                / (Z0 * (self.base.m_bg_mue_r / self.base.m_bg_eps_r).sqrt());
+        }
+
+        let mut inc_low = [true; 3];
+        let mut active_dir = [[false; 2]; 3];
+        let mut origin = [0.0f64; 3];
+        let mut num_lines = [0usize; 3];
+        let total_lines = self.base.num_lines;
+        for n in 0..3 {
+            num_lines[n] = stop[n] - start[n] + 1;
+            inc_low[n] = prop_dir[n] >= 0.0;
+            active_dir[n][0] = start[n] != 0;
+            active_dir[n][1] = stop[n] != total_lines[n] as usize - 1;
+            let ui_origin = if inc_low[n] {
+                start[n].saturating_sub(1)
+            } else {
+                stop[n] + 1
+            };
+            origin[n] = disc_line_value(
+                &self.base.disc_lines[n],
+                total_lines[n] as usize,
+                ui_origin,
+                false,
+            );
+        }
+
+        let mut extension = EngineExtTFSF::new();
+        extension.set_region(start, stop);
+        extension.set_signal(signal.clone());
+        for n in 0..3 {
+            for face in 0..2 {
+                if active_dir[n][face] {
+                    extension.activate_face(n, face as i32);
+                }
+            }
+        }
+        extension.allocate();
+
+        let unit = self.base.grid_delta;
+        let dt = self.base.d_t;
+        if dt <= 0.0 {
+            return Err("TFSF requires a positive timestep".to_string());
+        }
+        let mut max_delay = 0u32;
+        let mut pos = [0usize; 3];
+
+        for n in 0..3 {
+            let n_p = (n + 1) % 3;
+            let n_pp = (n + 2) % 3;
+            if !active_dir[n][0] && !active_dir[n][1] {
+                continue;
+            }
+            let mut ui_pos = 0usize;
+            for first in 0..num_lines[n_p] {
+                pos[n_p] = start[n_p] + first;
+                for second in 0..num_lines[n_pp] {
+                    pos[n_pp] = start[n_pp] + second;
+
+                    // ----- current updates -----
+                    if active_dir[n][0] {
+                        pos[n] = start[n];
+                        let coordinate = yee_coordinates(
+                            &self.base.disc_lines,
+                            self.base.num_lines,
+                            n_p,
+                            pos,
+                            false,
+                        );
+                        let distance = (0..3)
+                            .map(|axis| {
+                                ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs()
+                            })
+                            .sum::<f64>();
+                        let delay = distance * unit / phase_velocity / dt;
+                        max_delay = max_delay.max(delay as u32);
+                        extension.curr_delay[n][0][1][ui_pos] = delay.floor() as u32;
+                        extension.curr_delay_delta[n][0][1][ui_pos] =
+                            (delay - delay.floor()) as FDTD_FLOAT;
+                        extension.curr_amp[n][0][1][ui_pos] = (e_amp[n_p]
+                            * edge_length_value(
+                                &self.base.disc_lines,
+                                self.base.num_lines,
+                                n_p,
+                                pos,
+                                false,
+                                self.base.grid_delta,
+                            )) as FDTD_FLOAT;
+
+                        let coordinate = yee_coordinates(
+                            &self.base.disc_lines,
+                            self.base.num_lines,
+                            n_pp,
+                            pos,
+                            false,
+                        );
+                        let distance = (0..3)
+                            .map(|axis| {
+                                ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs()
+                            })
+                            .sum::<f64>();
+                        let delay = distance * unit / phase_velocity / dt;
+                        max_delay = max_delay.max(delay as u32);
+                        extension.curr_delay[n][0][0][ui_pos] = delay.floor() as u32;
+                        extension.curr_delay_delta[n][0][0][ui_pos] =
+                            (delay - delay.floor()) as FDTD_FLOAT;
+                        extension.curr_amp[n][0][0][ui_pos] = (e_amp[n_pp]
+                            * edge_length_value(
+                                &self.base.disc_lines,
+                                self.base.num_lines,
+                                n_pp,
+                                pos,
+                                false,
+                                self.base.grid_delta,
+                            )) as FDTD_FLOAT;
+
+                        if pos[n] > 0 {
+                            pos[n] -= 1;
+                        }
+                        let iv_p = self.iv_at(n_p, pos);
+                        let iv_pp = self.iv_at(n_pp, pos);
+                        extension.curr_amp[n][0][0][ui_pos] *= iv_p;
+                        extension.curr_amp[n][0][1][ui_pos] *= iv_pp;
+                    }
+
+                    if active_dir[n][1] {
+                        pos[n] = stop[n];
+                        let coordinate = yee_coordinates(
+                            &self.base.disc_lines,
+                            self.base.num_lines,
+                            n_p,
+                            pos,
+                            false,
+                        );
+                        let distance = (0..3)
+                            .map(|axis| {
+                                ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs()
+                            })
+                            .sum::<f64>();
+                        let delay = distance * unit / phase_velocity / dt;
+                        max_delay = max_delay.max(delay as u32);
+                        extension.curr_delay[n][1][1][ui_pos] = delay.floor() as u32;
+                        extension.curr_delay_delta[n][1][1][ui_pos] =
+                            (delay - delay.floor()) as FDTD_FLOAT;
+                        extension.curr_amp[n][1][1][ui_pos] = (e_amp[n_p]
+                            * edge_length_value(
+                                &self.base.disc_lines,
+                                self.base.num_lines,
+                                n_p,
+                                pos,
+                                false,
+                                self.base.grid_delta,
+                            )) as FDTD_FLOAT;
+
+                        let coordinate = yee_coordinates(
+                            &self.base.disc_lines,
+                            self.base.num_lines,
+                            n_pp,
+                            pos,
+                            false,
+                        );
+                        let distance = (0..3)
+                            .map(|axis| {
+                                ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs()
+                            })
+                            .sum::<f64>();
+                        let delay = distance * unit / phase_velocity / dt;
+                        max_delay = max_delay.max(delay as u32);
+                        extension.curr_delay[n][1][0][ui_pos] = delay.floor() as u32;
+                        extension.curr_delay_delta[n][1][0][ui_pos] =
+                            (delay - delay.floor()) as FDTD_FLOAT;
+                        extension.curr_amp[n][1][0][ui_pos] = (e_amp[n_pp]
+                            * edge_length_value(
+                                &self.base.disc_lines,
+                                self.base.num_lines,
+                                n_pp,
+                                pos,
+                                false,
+                                self.base.grid_delta,
+                            )) as FDTD_FLOAT;
+
+                        let iv_p = self.iv_at(n_p, pos);
+                        let iv_pp = self.iv_at(n_pp, pos);
+                        extension.curr_amp[n][1][0][ui_pos] *= iv_p;
+                        extension.curr_amp[n][1][1][ui_pos] *= iv_pp;
+                    }
+
+                    if active_dir[n][0] {
+                        extension.curr_amp[n][0][0][ui_pos] *= -1.0;
+                    }
+                    if active_dir[n][1] {
+                        extension.curr_amp[n][1][1][ui_pos] *= -1.0;
+                    }
+                    if pos[n_p] == stop[n_p] {
+                        if active_dir[n][0] {
+                            extension.curr_amp[n][0][1][ui_pos] = 0.0;
+                        }
+                        if active_dir[n][1] {
+                            extension.curr_amp[n][1][1][ui_pos] = 0.0;
+                        }
+                    }
+                    if pos[n_pp] == stop[n_pp] {
+                        if active_dir[n][0] {
+                            extension.curr_amp[n][0][0][ui_pos] = 0.0;
+                        }
+                        if active_dir[n][1] {
+                            extension.curr_amp[n][1][0][ui_pos] = 0.0;
+                        }
+                    }
+
+                    // ----- voltage updates -----
+                    if active_dir[n][0] {
+                        pos[n] = start[n].saturating_sub(1);
+                        let coordinate = yee_coordinates(
+                            &self.base.disc_lines,
+                            self.base.num_lines,
+                            n_p,
+                            pos,
+                            true,
+                        );
+                        let distance = (0..3)
+                            .map(|axis| {
+                                ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs()
+                            })
+                            .sum::<f64>();
+                        let delay = distance * unit / phase_velocity / dt + 1.0;
+                        max_delay = max_delay.max(delay as u32);
+                        extension.volt_delay[n][0][1][ui_pos] = delay.floor() as u32;
+                        extension.volt_delay_delta[n][0][1][ui_pos] =
+                            (delay - delay.floor()) as FDTD_FLOAT;
+                        extension.volt_amp[n][0][1][ui_pos] = (h_amp[n_p]
+                            * edge_length_value(
+                                &self.base.disc_lines,
+                                self.base.num_lines,
+                                n_p,
+                                pos,
+                                true,
+                                self.base.grid_delta,
+                            )) as FDTD_FLOAT;
+
+                        let coordinate = yee_coordinates(
+                            &self.base.disc_lines,
+                            self.base.num_lines,
+                            n_pp,
+                            pos,
+                            true,
+                        );
+                        let distance = (0..3)
+                            .map(|axis| {
+                                ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs()
+                            })
+                            .sum::<f64>();
+                        let delay = distance * unit / phase_velocity / dt + 1.0;
+                        max_delay = max_delay.max(delay as u32);
+                        extension.volt_delay[n][0][0][ui_pos] = delay.floor() as u32;
+                        extension.volt_delay_delta[n][0][0][ui_pos] =
+                            (delay - delay.floor()) as FDTD_FLOAT;
+                        extension.volt_amp[n][0][0][ui_pos] = (h_amp[n_pp]
+                            * edge_length_value(
+                                &self.base.disc_lines,
+                                self.base.num_lines,
+                                n_pp,
+                                pos,
+                                true,
+                                self.base.grid_delta,
+                            )) as FDTD_FLOAT;
+
+                        pos[n] += 1;
+                        let vi_p = self.vi_at(n_p, pos);
+                        let vi_pp = self.vi_at(n_pp, pos);
+                        extension.volt_amp[n][0][0][ui_pos] *= vi_p;
+                        extension.volt_amp[n][0][1][ui_pos] *= vi_pp;
+                    }
+
+                    if active_dir[n][1] {
+                        pos[n] = stop[n];
+                        let coordinate = yee_coordinates(
+                            &self.base.disc_lines,
+                            self.base.num_lines,
+                            n_p,
+                            pos,
+                            true,
+                        );
+                        let distance = (0..3)
+                            .map(|axis| {
+                                ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs()
+                            })
+                            .sum::<f64>();
+                        let delay = distance * unit / phase_velocity / dt + 1.0;
+                        max_delay = max_delay.max(delay as u32);
+                        extension.volt_delay[n][1][1][ui_pos] = delay.floor() as u32;
+                        extension.volt_delay_delta[n][1][1][ui_pos] =
+                            (delay - delay.floor()) as FDTD_FLOAT;
+                        extension.volt_amp[n][1][1][ui_pos] = (h_amp[n_p]
+                            * edge_length_value(
+                                &self.base.disc_lines,
+                                self.base.num_lines,
+                                n_p,
+                                pos,
+                                true,
+                                self.base.grid_delta,
+                            )) as FDTD_FLOAT;
+
+                        let coordinate = yee_coordinates(
+                            &self.base.disc_lines,
+                            self.base.num_lines,
+                            n_pp,
+                            pos,
+                            true,
+                        );
+                        let distance = (0..3)
+                            .map(|axis| {
+                                ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs()
+                            })
+                            .sum::<f64>();
+                        let delay = distance * unit / phase_velocity / dt + 1.0;
+                        max_delay = max_delay.max(delay as u32);
+                        extension.volt_delay[n][1][0][ui_pos] = delay.floor() as u32;
+                        extension.volt_delay_delta[n][1][0][ui_pos] =
+                            (delay - delay.floor()) as FDTD_FLOAT;
+                        extension.volt_amp[n][1][0][ui_pos] = (h_amp[n_pp]
+                            * edge_length_value(
+                                &self.base.disc_lines,
+                                self.base.num_lines,
+                                n_pp,
+                                pos,
+                                true,
+                                self.base.grid_delta,
+                            )) as FDTD_FLOAT;
+
+                        let vi_p = self.vi_at(n_p, pos);
+                        let vi_pp = self.vi_at(n_pp, pos);
+                        extension.volt_amp[n][1][0][ui_pos] *= vi_p;
+                        extension.volt_amp[n][1][1][ui_pos] *= vi_pp;
+                    }
+
+                    if active_dir[n][1] {
+                        extension.volt_amp[n][1][0][ui_pos] *= -1.0;
+                    }
+                    if active_dir[n][0] {
+                        extension.volt_amp[n][0][1][ui_pos] *= -1.0;
+                    }
+                    if pos[n_p] == stop[n_p] {
+                        if active_dir[n][0] {
+                            extension.volt_amp[n][0][0][ui_pos] = 0.0;
+                        }
+                        if active_dir[n][1] {
+                            extension.volt_amp[n][1][0][ui_pos] = 0.0;
+                        }
+                    }
+                    if pos[n_pp] == stop[n_pp] {
+                        if active_dir[n][0] {
+                            extension.volt_amp[n][0][1][ui_pos] = 0.0;
+                        }
+                        if active_dir[n][1] {
+                            extension.volt_amp[n][1][1][ui_pos] = 0.0;
+                        }
+                    }
+
+                    ui_pos += 1;
+                }
+            }
+        }
+
+        extension.set_max_delay(max_delay + 1);
+        Ok(Some(extension))
+    }
+
+    fn iv_at(&self, component: usize, pos: [usize; 3]) -> FDTD_FLOAT {
+        self.iv_ptr
+            .as_ref()
+            .map(|array| *array.get(component, pos[0], pos[1], pos[2]))
+            .unwrap_or(1.0)
+    }
+
+    fn vi_at(&self, component: usize, pos: [usize; 3]) -> FDTD_FLOAT {
+        self.vi_ptr
+            .as_ref()
+            .map(|array| *array.get(component, pos[0], pos[1], pos[2]))
+            .unwrap_or(1.0)
+    }
+
+    /// Build the lumped `RLC` extension from the CSX `LumpedElement`
+    /// properties.
+    ///
+    /// Mirrors `Operator_Ext_LumpedRLC::BuildExtension`: only series elements
+    /// and parallel elements with an inductance are handled here (a parallel
+    /// `RC` is a plain lossy edge and needs no ADE); the box is snapped to the
+    /// mesh, the element is scaled to one cell, the EC capacitance/conductance
+    /// are rewritten and the single-edge update coefficients are recomputed.
+    pub fn build_lumped_rlc_extension(
+        &mut self,
+        f_max: f64,
+    ) -> Result<Option<EngineExtLumpedRLC>, String> {
+        let Some(structure) = self.structure.as_ref() else {
+            return Ok(None);
+        };
+        let params = structure.parameters().clone();
+        let dt = self.base.d_t;
+        if dt <= 0.0 {
+            return Err("lumped RLC needs a positive timestep".to_string());
+        }
+
+        struct ElementSpec {
+            priority: i32,
+            topology: crate::lumped_rlc::LumpedTopology,
+            direction: usize,
+            resistance: f64,
+            inductance: f64,
+            capacitance: f64,
+            caps: bool,
+            boxes: Vec<(i32, Primitive)>,
+        }
+
+        let mut specs: Vec<ElementSpec> = Vec::new();
+        for index in 0..structure.property_count() {
+            let Some(property) = structure.property_by_index(index) else {
+                continue;
+            };
+            let Some(lumped) = property.lumped_element() else {
+                continue;
+            };
+            let topology = crate::lumped_rlc::LumpedTopology::from(lumped.element_type());
+            let direction = lumped.direction();
+            let mut resistance = lumped.resistance(Some(&params)).unwrap_or(f64::NAN);
+            let mut inductance = lumped.inductance(Some(&params)).unwrap_or(f64::NAN);
+            let mut capacitance = lumped.capacitance(Some(&params)).unwrap_or(f64::NAN);
+
+            // Native warnings: NaN means "absent"; negative values are clamped
+            // to zero because they are not physical.
+            if capacitance < 0.0 {
+                eprintln!(
+                    "[openEMS] Warning: lumped element '{}' has C < 0; clamped to 0",
+                    property.name()
+                );
+                capacitance = 0.0;
+            }
+            if resistance < 0.0 {
+                eprintln!(
+                    "[openEMS] Warning: lumped element '{}' has R < 0; clamped to 0",
+                    property.name()
+                );
+                resistance = 0.0;
+            }
+            if inductance < 0.0 {
+                eprintln!(
+                    "[openEMS] Warning: lumped element '{}' has L < 0; clamped to 0",
+                    property.name()
+                );
+                inductance = 0.0;
+            }
+
+            // Same gate as native `IsLElumpedRLC`.
+            let is_lumped_rlc = match topology {
+                crate::lumped_rlc::LumpedTopology::Parallel => inductance > 0.0,
+                crate::lumped_rlc::LumpedTopology::Series => true,
+            };
+            if !is_lumped_rlc {
+                continue;
+            }
+            if direction > 2 {
+                eprintln!(
+                    "[openEMS] Warning: lumped element '{}' has an invalid direction; skipped",
+                    property.name()
+                );
+                continue;
+            }
+
+            let mut boxes = Vec::new();
+            for primitive in property.primitives() {
+                if matches!(primitive.shape(), csxcad_core::model::PrimitiveShape::Box(_)) {
+                    boxes.push((primitive.priority(), primitive.clone()));
+                } else {
+                    eprintln!(
+                        "[openEMS] Warning: lumped element '{}' contains a non-box primitive; skipped",
+                        property.name()
+                    );
+                }
+            }
+            if boxes.is_empty() {
+                continue;
+            }
+            let priority = property
+                .primitives()
+                .iter()
+                .map(|primitive| primitive.priority())
+                .max()
+                .unwrap_or(0);
+            specs.push(ElementSpec {
+                priority,
+                topology,
+                direction: direction as usize,
+                resistance,
+                inductance,
+                capacitance,
+                caps: lumped.caps(),
+                boxes,
+            });
+        }
+
+        if specs.is_empty() {
+            return Ok(None);
+        }
+
+        let mut positions: Vec<[usize; 3]> = Vec::new();
+        let mut coefficients: Vec<LumpedRLCCoeffs> = Vec::new();
+
+        for spec in specs {
+            let dir = spec.direction;
+            let dir_p1 = (dir + 1) % 3;
+            let dir_p2 = (dir + 2) % 3;
+
+            for (_priority, primitive) in &spec.boxes {
+                let bounds = match primitive.bounding_box(Some(&params), false) {
+                    Ok(bounds) => bounds,
+                    Err(_) => continue,
+                };
+                // CSX bounding boxes are interleaved: [min_x, max_x, min_y, max_y, min_z, max_z].
+                let start = [bounds[0], bounds[2], bounds[4]];
+                let stop = [bounds[1], bounds[3], bounds[5]];
+                let (dimension, ui_start, ui_stop, _start_in, _stop_in) =
+                    self.snap_box_to_mesh_native(start, stop, false, true, 0);
+                if dimension <= 0 {
+                    if dimension >= -1 {
+                        eprintln!(
+                            "[openEMS] Warning: lumped RLC box snapping failed (dimension {dimension}); skipped"
+                        );
+                    }
+                    continue;
+                }
+                if ui_start[dir] == ui_stop[dir] {
+                    eprintln!(
+                        "[openEMS] Warning: lumped RLC has zero snapped length; skipped"
+                    );
+                    continue;
+                }
+
+                let cells_0 = ui_stop[dir] - ui_start[dir];
+                let cells_1 = ui_stop[dir_p1] - ui_start[dir_p1] + 1;
+                let cells_2 = ui_stop[dir_p2] - ui_start[dir_p2] + 1;
+                let parallel_cells = cells_1 * cells_2;
+                let element = crate::lumped_rlc::CellElement::from_element(
+                    spec.resistance,
+                    spec.inductance,
+                    spec.capacitance,
+                    parallel_cells,
+                    cells_0,
+                );
+
+                let series = if spec.topology == crate::lumped_rlc::LumpedTopology::Series {
+                    Some(crate::lumped_rlc::series_coefficients(dt, &element))
+                } else {
+                    None
+                };
+
+                let mut pos = [0usize; 3];
+                for along in ui_start[dir]..ui_stop[dir] {
+                    pos[dir] = along as usize;
+                    for first in ui_start[dir_p1]..=ui_stop[dir_p1] {
+                        pos[dir_p1] = first as usize;
+                        for second in ui_start[dir_p2]..=ui_stop[dir_p2] {
+                            pos[dir_p2] = second as usize;
+                            let index = Self::ec_index(dir, pos[0], pos[1], pos[2], self.base.num_lines);
+                            if index >= self.ec_c.len() {
+                                continue;
+                            }
+
+                            let mut coeffs = LumpedRLCCoeffs {
+                                direction: dir,
+                                ..Default::default()
+                            };
+                            match spec.topology {
+                                crate::lumped_rlc::LumpedTopology::Parallel => {
+                                    let grid_capacitance = self.ec_c[index] as f64;
+                                    let capacitance = crate::lumped_rlc::parallel_capacitance(
+                                        element.capacitance,
+                                        grid_capacitance,
+                                        element.resistance,
+                                        element.inductance,
+                                        f_max,
+                                    );
+                                    self.ec_c[index] = capacitance as FDTD_FLOAT;
+                                    if element.resistance >= 0.0 {
+                                        self.ec_g[index] = element.conductance as FDTD_FLOAT;
+                                    }
+                                    let (i2v, ilv) =
+                                        crate::lumped_rlc::parallel_update_coefficients(
+                                            dt,
+                                            capacitance,
+                                            &element,
+                                        );
+                                    coeffs.i2v = i2v as FDTD_FLOAT;
+                                    coeffs.ilv = ilv as FDTD_FLOAT;
+                                    coeffs.vvd = 1.0;
+                                }
+                                crate::lumped_rlc::LumpedTopology::Series => {
+                                    self.ec_g[index] = 0.0;
+                                    let grid_capacitance = self.ec_c[index] as f64;
+                                    let capacitance = crate::lumped_rlc::series_capacitance(
+                                        grid_capacitance,
+                                        &element,
+                                        f_max,
+                                    );
+                                    self.ec_c[index] = capacitance as FDTD_FLOAT;
+                                    let series = series.expect("series coefficients built above");
+                                    let update =
+                                        crate::lumped_rlc::series_update_coefficients(
+                                            dt,
+                                            capacitance,
+                                            &series,
+                                        );
+                                    coeffs.vv2 = update.vv2 as FDTD_FLOAT;
+                                    coeffs.vj1 = update.vj1 as FDTD_FLOAT;
+                                    coeffs.vj2 = update.vj2 as FDTD_FLOAT;
+                                    coeffs.vvd = update.vvd as FDTD_FLOAT;
+                                    coeffs.ib0 = update.ib0 as FDTD_FLOAT;
+                                    coeffs.b1 = update.b1 as FDTD_FLOAT;
+                                    coeffs.b2 = update.b2 as FDTD_FLOAT;
+                                }
+                            }
+                            self.calc_ec_operator_pos(dir, pos);
+                            positions.push(pos);
+                            coefficients.push(coeffs);
+                        }
+                    }
+                }
+
+                // Metallic caps at both ends, as in native `GetCaps()`.
+                if spec.caps {
+                    for first in ui_start[dir_p1]..=ui_stop[dir_p1] {
+                        for second in ui_start[dir_p2]..=ui_stop[dir_p2] {
+                            let mut cap_pos = [0usize; 3];
+                            cap_pos[dir_p1] = first as usize;
+                            cap_pos[dir_p2] = second as usize;
+                            for plane in [ui_start[dir], ui_stop[dir]] {
+                                cap_pos[dir] = plane as usize;
+                                for transverse in [dir_p1, dir_p2] {
+                                    if cap_pos[transverse] < ui_stop[transverse] as usize {
+                                        if let Some(vv) = self.vv_ptr.as_mut() {
+                                            *vv.get_mut(
+                                                transverse,
+                                                cap_pos[0],
+                                                cap_pos[1],
+                                                cap_pos[2],
+                                            ) = 0.0;
+                                        }
+                                        if let Some(vi) = self.vi_ptr.as_mut() {
+                                            *vi.get_mut(
+                                                transverse,
+                                                cap_pos[0],
+                                                cap_pos[1],
+                                                cap_pos[2],
+                                            ) = 0.0;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if positions.is_empty() {
+            return Ok(None);
+        }
+        let mut extension = EngineExtLumpedRLC::new(positions.len());
+        for index in 0..positions.len() {
+            extension.set_position(index, positions[index], &coefficients[index]);
         }
         Ok(Some(extension))
     }
@@ -2193,24 +3861,9 @@ impl OperatorBase for Operator {
         full_mesh: bool,
         inside: Option<&mut bool>,
     ) -> bool {
-        let grid_delta = self.base.grid_delta;
-        if grid_delta <= 0.0 {
-            if let Some(inside) = inside {
-                *inside = false;
-            }
-            return false;
-        }
-        let num_lines = self.base.num_lines;
-        let mut all_inside = true;
-        for n in 0..3 {
-            let idx = (coord[n] / grid_delta).round() as i32;
-            let max_idx = (num_lines[n] as i32).saturating_sub(1);
-            let clamped = idx.clamp(0, max_idx);
-            uicoord[n] = clamped as u32;
-            if idx < 0 || idx > max_idx {
-                all_inside = false;
-            }
-        }
+        let (index, axis_inside) = self.snap_to_mesh_native(coord, dual_mesh, full_mesh);
+        *uicoord = index;
+        let all_inside = axis_inside.iter().all(|&value| value);
         if let Some(inside) = inside {
             *inside = all_inside;
         }
@@ -2229,45 +3882,17 @@ impl OperatorBase for Operator {
         b_start_in: Option<&mut bool>,
         b_stop_in: Option<&mut bool>,
     ) -> i32 {
-        let grid_delta = self.base.grid_delta;
-        if grid_delta <= 0.0 {
-            if let Some(b_start_in) = b_start_in {
-                *b_start_in = false;
-            }
-            if let Some(b_stop_in) = b_stop_in {
-                *b_stop_in = false;
-            }
-            return -1;
-        }
-        let num_lines = self.base.num_lines;
-        let mut start_inside = true;
-        let mut stop_inside = true;
-        for n in 0..3 {
-            let s_idx = (start[n] / grid_delta).round() as i32;
-            let t_idx = (stop[n] / grid_delta).round() as i32;
-            let max_idx = (num_lines[n] as i32).saturating_sub(1);
-            let s_clamped = s_idx.clamp(0, max_idx);
-            let t_clamped = t_idx.clamp(0, max_idx);
-            ui_start[n] = s_clamped as u32;
-            ui_stop[n] = t_clamped as u32;
-            if s_idx < 0 || s_idx > max_idx {
-                start_inside = false;
-            }
-            if t_idx < 0 || t_idx > max_idx {
-                stop_inside = false;
-            }
-        }
+        let (dimension, snapped_start, snapped_stop, start_in, stop_in) =
+            self.snap_box_to_mesh_native(start, stop, dual_mesh, full_mesh, snap_method);
+        *ui_start = snapped_start;
+        *ui_stop = snapped_stop;
         if let Some(b_start_in) = b_start_in {
-            *b_start_in = start_inside;
+            *b_start_in = start_in.iter().all(|&value| value);
         }
         if let Some(b_stop_in) = b_stop_in {
-            *b_stop_in = stop_inside;
+            *b_stop_in = stop_in.iter().all(|&value| value);
         }
-        if start_inside && stop_inside {
-            0
-        } else {
-            -1
-        }
+        dimension
     }
 
     fn get_primitives_bbox(
@@ -3124,6 +4749,525 @@ mod yee_convention_tests {
         assert!(
             (measured_l - expected_l).abs() / expected_l < 1e-12,
             "L {measured_l:e} vs {expected_l:e}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lumped_rlc_tests {
+    use super::*;
+
+    fn mesh(with_element: &str) -> String {
+        let lines: Vec<String> = (0..21).map(|index| index.to_string()).collect();
+        let joined = lines.join(",");
+        format!(
+            r#"<ContinuousStructure CoordSystem="0">
+                <RectilinearGrid DeltaUnit="0.001">
+                    <XLines>{joined}</XLines>
+                    <YLines>{joined}</YLines>
+                    <ZLines>{joined}</ZLines>
+                </RectilinearGrid>
+                <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                <Properties>{with_element}</Properties>
+            </ContinuousStructure>"#
+        )
+    }
+
+    fn operator(xml: &str) -> Operator {
+        let mut op = Operator::new();
+        op.load_csx(xml).expect("CSX should load");
+        op.base.d_t = 1.0e-12;
+        op.calc_ec_operator();
+        op
+    }
+
+    #[test]
+    fn series_element_rewrites_the_ec_capacitance_on_every_cell() {
+        let xml = mesh(
+            r#"<LumpedElement Name="series" Direction="0" LEtype="1" R="50" L="1e-9" C="1e-12" Caps="0">
+                   <Primitives><Box Priority="1"><P1 X="2" Y="5" Z="5"/><P2 X="12" Y="6" Z="6"/></Box></Primitives>
+               </LumpedElement>"#,
+        );
+        let mut op = operator(&xml);
+        let extension = op
+            .build_lumped_rlc_extension(10.0e9)
+            .expect("the model must build")
+            .expect("the series element must be active");
+        // 10 cells along x, 2 transverse nodes in y and z: 40 edges.\n        assert_eq!(extension.num_positions, 40);
+        for index in 0..extension.num_positions {
+            assert_eq!(extension.coeffs[index].direction, 0);
+            // The series ADE must have a finite update multiplier.
+            let vvd = extension.coeffs[index].vvd;
+            assert!(vvd.is_finite() && vvd > 0.0 && vvd <= 1.0, "vvd={vvd}");
+            // Conductance is zeroed for a series element.
+            let pos = extension.positions[index];
+            let ec_index = Operator::ec_index(0, pos[0], pos[1], pos[2], op.base.num_lines);
+            assert_eq!(op.ec_g[ec_index], 0.0);
+            assert!(op.ec_c[ec_index] > 0.0);
+            // vv/vi were recomputed for the rewritten capacitance.
+            let vv = *op.vv_ptr.as_ref().unwrap().get(0, pos[0], pos[1], pos[2]);
+            assert!(vv.is_finite() && vv.abs() <= 1.0);
+        }
+    }
+
+    #[test]
+    fn parallel_element_with_inductance_gets_the_parallel_branch() {
+        let xml = mesh(
+            r#"<LumpedElement Name="parallel" Direction="1" LEtype="0" R="1e6" L="2e-9" C="1e-12" Caps="0">
+                   <Primitives><Box Priority="1"><P1 X="5" Y="2" Z="5"/><P2 X="6" Y="12" Z="6"/></Box></Primitives>
+               </LumpedElement>"#,
+        );
+        let mut op = operator(&xml);
+        let extension = op
+            .build_lumped_rlc_extension(10.0e9)
+            .expect("the model must build")
+            .expect("the parallel element must be active");
+        // 10 cells along x, 2 transverse nodes in y and z: 40 edges.\n        assert_eq!(extension.num_positions, 40);
+        for index in 0..extension.num_positions {
+            let coeffs = &extension.coeffs[index];
+            assert_eq!(coeffs.direction, 1);
+            assert!(coeffs.ilv > 0.0, "parallel inductance coefficient is zero");
+            assert!(coeffs.i2v > 0.0);
+            assert_eq!(coeffs.vvd, 1.0);
+        }
+    }
+
+    #[test]
+    fn a_parallel_rc_without_inductance_is_left_to_the_plain_engine() {
+        let xml = mesh(
+            r#"<LumpedElement Name="rc" Direction="2" LEtype="0" R="1e3" C="1e-12">
+                   <Primitives><Box Priority="1"><P1 X="5" Y="5" Z="2"/><P2 X="6" Y="6" Z="12"/></Box></Primitives>
+               </LumpedElement>"#,
+        );
+        let mut op = operator(&xml);
+        assert!(op
+            .build_lumped_rlc_extension(10.0e9)
+            .expect("the model must not error")
+            .is_none());
+    }
+
+    #[test]
+    fn invalid_direction_and_zero_length_are_skipped() {
+        let invalid_direction = mesh(
+            r#"<LumpedElement Name="bad" Direction="5" LEtype="1" R="50" L="1e-9" C="1e-12">
+                   <Primitives><Box Priority="1"><P1 X="2" Y="5" Z="5"/><P2 X="12" Y="6" Z="6"/></Box></Primitives>
+               </LumpedElement>"#,
+        );
+        let mut op = operator(&invalid_direction);
+        assert!(op.build_lumped_rlc_extension(10.0e9).unwrap().is_none());
+
+        let zero_length = mesh(
+            r#"<LumpedElement Name="flat" Direction="0" LEtype="1" R="50" L="1e-9">
+                   <Primitives><Box Priority="1"><P1 X="5" Y="5" Z="5"/><P2 X="5" Y="6" Z="6"/></Box></Primitives>
+               </LumpedElement>"#,
+        );
+        let mut op = operator(&zero_length);
+        assert!(op.build_lumped_rlc_extension(10.0e9).unwrap().is_none());
+    }
+
+    #[test]
+    fn metallic_caps_short_both_element_ends() {
+        let xml = mesh(
+            r#"<LumpedElement Name="caps" Direction="0" LEtype="1" R="50" L="1e-9" Caps="1">
+                   <Primitives><Box Priority="1"><P1 X="5" Y="5" Z="5"/><P2 X="10" Y="6" Z="6"/></Box></Primitives>
+               </LumpedElement>"#,
+        );
+        let mut op = operator(&xml);
+        op.build_lumped_rlc_extension(10.0e9).unwrap().expect("active");
+        let vv = op.vv_ptr.as_ref().unwrap();
+        // Transverse edges on both end planes are shorted.
+        for plane in [5usize, 10] {
+            assert_eq!(*vv.get(1, plane, 5, 5), 0.0, "y edge at x={plane}");
+            assert_eq!(*vv.get(2, plane, 5, 5), 0.0, "z edge at x={plane}");
+        }
+        // An edge just inside the element is untouched.
+        assert!(*vv.get(1, 7, 5, 5) > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod tfsf_tests {
+    use super::*;
+
+    fn plane_wave_mesh() -> String {
+        let lines: Vec<String> = (0..21).map(|index| index.to_string()).collect();
+        let joined = lines.join(",");
+        format!(
+            r#"<ContinuousStructure CoordSystem="0">
+                <RectilinearGrid DeltaUnit="0.001">
+                    <XLines>{joined}</XLines>
+                    <YLines>{joined}</YLines>
+                    <ZLines>{joined}</ZLines>
+                </RectilinearGrid>
+                <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                <Properties>
+                    <Excitation Name="plane" Number="0" Enabled="1" Type="10" Frequency="1e10" Excite="0,1,0" PropDir="1,0,0">
+                        <Primitives><Box Priority="0"><P1 X="5" Y="0" Z="0"/><P2 X="15" Y="20" Z="20"/></Box></Primitives>
+                    </Excitation>
+                </Properties>
+            </ContinuousStructure>"#
+        )
+    }
+
+    #[test]
+    fn plane_wave_builds_delays_and_amplitudes_on_the_open_faces() {
+        let mut op = Operator::new();
+        op.load_csx(&plane_wave_mesh()).expect("CSX should load");
+        op.calc_timestep();
+        op.calc_ec_operator();
+        let signal = crate::excitation::Excitation::gauss(1.0e10, 1.0e10);
+        let extension = op
+            .build_tfsf_extension(&signal)
+            .expect("TFSF must build")
+            .expect("a plane wave must be active");
+
+        assert_eq!(extension.start, [5, 0, 0]);
+        assert_eq!(extension.stop, [15, 20, 20]);
+        assert_eq!(extension.num_lines, [11, 21, 21]);
+        // Only the two x faces are open; the box touches the y/z boundaries.
+        assert!(extension.active_dir[0][0] && extension.active_dir[0][1]);
+        assert!(!extension.active_dir[1][0] && !extension.active_dir[1][1]);
+        assert!(!extension.active_dir[2][0] && !extension.active_dir[2][1]);
+
+        // First current sample on the lower x face: origin is one line before
+        // the box, the Yee coordinate adds half a cell in the edge direction.
+        let velocity = op.calc_numeric_phase_velocity(
+            [5, 0, 0],
+            [15, 20, 20],
+            [1.0, 0.0, 0.0],
+            1.0e10,
+        );
+        let distance = 1.0e-3;
+        let expected_delay = distance / velocity / op.base.d_t;
+        let delay = extension.curr_delay[0][0][1][0];
+        assert_eq!(delay, expected_delay.floor() as u32);
+        assert!(
+            (extension.curr_delay_delta[0][0][1][0]
+                - (expected_delay - expected_delay.floor()) as FDTD_FLOAT)
+                .abs()
+                < 1.0e-5
+        );
+        assert!(extension.volt_amp[0][0][0][0].abs() > 0.0);
+        assert!(extension.max_delay >= expected_delay as u32);
+        assert!(velocity > 0.0 && velocity <= C0);
+    }
+
+    #[test]
+    fn a_parallel_polarization_is_disabled() {
+        let xml = plane_wave_mesh().replace("Excite=\"0,1,0\"", "Excite=\"1,0,0\"");
+        let mut op = Operator::new();
+        op.load_csx(&xml).expect("CSX should load");
+        op.calc_timestep();
+        let signal = crate::excitation::Excitation::gauss(1.0e10, 1.0e10);
+        assert!(op.build_tfsf_extension(&signal).unwrap().is_none());
+    }
+
+    #[test]
+    fn numeric_phase_velocity_is_below_c_for_a_cartesian_axis() {
+        let mut op = Operator::new();
+        op.load_csx(&plane_wave_mesh()).expect("CSX should load");
+        op.calc_timestep();
+        let velocity = op.calc_numeric_phase_velocity(
+            [5, 5, 5],
+            [15, 15, 15],
+            [1.0, 0.0, 0.0],
+            1.0e10,
+        );
+        // Numerical dispersion slows the wave down, but only slightly at 15
+        // cells per wavelength.
+        assert!(velocity > 0.9 * C0 && velocity <= C0, "v={velocity:e}");
+    }
+}
+
+#[cfg(test)]
+mod debye_tests {
+    use super::*;
+    use crate::extensions::EngineExtension;
+
+    fn debye_mesh(epsilon_delta: f64, relax_time: f64) -> String {
+        let lines: Vec<String> = (0..5).map(|index| index.to_string()).collect();
+        let joined = lines.join(",");
+        format!(
+            r#"<ContinuousStructure CoordSystem="0">
+                <RectilinearGrid DeltaUnit="0.001">
+                    <XLines>{joined}</XLines>
+                    <YLines>{joined}</YLines>
+                    <ZLines>{joined}</ZLines>
+                </RectilinearGrid>
+                <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                <Properties>
+                    <DebyeMaterial Name="debye" Isotropy="1">
+                        <Property Epsilon="1" Mue="1" Sigma="0" Kappa="0" EpsilonDelta="{epsilon_delta}" EpsilonRelaxTime="{relax_time}"/>
+                        <Primitives><Box Priority="1"><P1 X="-1" Y="-1" Z="-1"/><P2 X="5" Y="5" Z="5"/></Box></Primitives>
+                    </DebyeMaterial>
+                </Properties>
+            </ContinuousStructure>"#
+        )
+    }
+
+    #[test]
+    fn debye_pole_relaxes_to_the_static_permittivity() {
+        let relax_time = 1.0e-10f64;
+        let epsilon_delta = 2.0f64;
+        let mut op = Operator::new();
+        op.load_csx(&debye_mesh(epsilon_delta, relax_time))
+            .expect("CSX should load");
+        op.calc_timestep();
+        op.calc_ec_operator();
+        // The base permittivity of the Debye property must reach the operator.
+        assert!((op.material_grid.as_ref().unwrap()[0].eps_r - 1.0).abs() < 1e-12);
+        let mut extension = op
+            .build_debye_extension()
+            .expect("Debye must build")
+            .expect("the pole is active");
+        assert!(!extension.positions.is_empty());
+        assert_eq!(extension.num_poles, 1);
+        assert_eq!(extension.num_positions, 125);
+
+        let index = extension
+            .positions
+            .iter()
+            .position(|&pos| pos == [2, 2, 2])
+            .expect("centre cell present");
+        let dt = op.base.d_t;
+        assert!(relax_time > 3.0 * dt);
+            let mut volt = FieldArray::new("volt", [5, 5, 5]);
+            let curr = FieldArray::new("curr", [5, 5, 5]);
+            let steps = (30.0 * relax_time / dt) as usize;
+            let mut history = Vec::with_capacity(steps);
+            for _ in 0..steps {
+                // Pre reads the field left by the previous Apply2, exactly as
+                // the engine does.
+                extension.do_pre_voltage_updates(&mut volt, &curr);
+                // Fixed raw voltage: the main update would write this value.
+                *volt.get_mut(0, 2, 2, 2) = 1.0;
+                extension.do_post_voltage_updates(&mut volt, &curr);
+                extension.apply2_voltages(&mut volt, &curr);
+                history.push(extension.volt_pole_ade[0][0][index] as f64);
+            }
+
+            // The pole state obeys W[n+1] = a W[n] + d V[n] with
+            // a = (2 tau - dt)/(2 tau + dt) and d = C_L vi/(2 tau + dt).
+            let relax = extension.v_relax_ade[0][0][index] as f64;
+            let drive = extension.v_drive_ade[0][0][index] as f64;
+            let expected_relax = (2.0 * relax_time - dt) / (2.0 * relax_time + dt);
+            assert!(
+                (relax - expected_relax).abs() < 1.0e-6,
+                "relax coefficient {relax:e} vs analytic {expected_relax:e}"
+            );
+
+            // Steady pole state for a constant drive. The pole is advanced
+            // twice per step (pre with V^n, post with V^(n+1)), so the
+            // trapezoidal recurrence is W[n+1] = a W[n] + d (V^n + V^(n+1))
+            // and the steady state is 2 d / (1 - a) = delta_eps / eps_inf.
+            let steady = history[steps - 1];
+            let expected_steady = 2.0 * drive / (1.0 - relax);
+            assert!(
+                (steady - expected_steady).abs() / expected_steady < 1.0e-6,
+                "steady pole state {steady:e} vs analytic {expected_steady:e}"
+            );
+            assert!(
+                (expected_steady / epsilon_delta - 1.0).abs() < 1.0e-6,
+                "static polarization ratio {expected_steady:e} vs delta_eps {epsilon_delta:e}"
+            );
+
+            // Exponential approach with the pole time constant.
+            // Keep the fit away from the f32 noise floor of the pole state.
+            let first = steps / 10;
+            let last = steps / 3;
+            let mut sum_t = 0.0;
+            let mut sum_y = 0.0;
+            let mut sum_tt = 0.0;
+            let mut sum_ty = 0.0;
+            let mut count = 0.0;
+            for step in first..last {
+                let value = (history[step] - steady).abs();
+                if value <= 1.0e-30 {
+                    continue;
+                }
+                let t = step as f64 * dt;
+                let y = value.ln();
+                sum_t += t;
+                sum_y += y;
+                sum_tt += t * t;
+                sum_ty += t * y;
+                count += 1.0;
+            }
+            let denominator = count * sum_tt - sum_t * sum_t;
+            let slope = (count * sum_ty - sum_t * sum_y) / denominator;
+            let measured_tau = -1.0 / slope;
+            // The exact discrete time constant follows from the coupled
+            // field/pole system
+            //   W[n+1] = a W[n] + d (V[n] + V[n+1]),
+            //   V[n+1] = (V_raw - (W[n+1] - W[n])) / (1 + d),
+            // whose slow eigenvalue is only ~3 % away from the continuum tau.
+            let solve_coefficient = 1.0 / (1.0 + drive);
+            let matrix = [
+                [
+                    relax + drive * (1.0 - relax) * solve_coefficient,
+                    drive * solve_coefficient,
+                ],
+                [(1.0 - relax) * solve_coefficient, -drive * solve_coefficient],
+            ];
+            let trace = matrix[0][0] + matrix[1][1];
+            let determinant = matrix[0][0] * matrix[1][1] - matrix[0][1] * matrix[1][0];
+            let discriminant = trace * trace - 4.0 * determinant;
+            let eigenvalue = (trace + discriminant.sqrt()) / 2.0;
+            let discrete_tau = -dt / eigenvalue.ln();
+            assert!(
+                (measured_tau - discrete_tau).abs() / discrete_tau < 0.01,
+                "relaxation time {measured_tau:e} vs discrete {discrete_tau:e}"
+            );
+            assert!(
+                (discrete_tau - relax_time).abs() / relax_time < 0.05,
+                "discrete time constant {discrete_tau:e} vs continuum {relax_time:e}"
+            );
+            assert_eq!(extension.positions[index], [2, 2, 2]);
+            // The implicit solve must be the inverse of one plus the summed
+            // drive, and the operator must have stored the Debye base material.
+            assert!(
+                (extension.v_solve_ade[0][index] as f64 - 1.0 / (1.0 + drive)).abs() < 1.0e-6
+            );
+            assert!((op.material_grid.as_ref().unwrap()[0].eps_r - 1.0).abs() < 1e-12);
+
+    }
+
+    #[test]
+    fn a_short_relaxation_time_is_rejected() {
+        // tau < 3 dt makes the trapezoidal pole update unstable.
+        let mut op = Operator::new();
+        op.load_csx(&debye_mesh(2.0, 1.0e-15))
+            .expect("CSX should load");
+        op.calc_timestep();
+        op.calc_ec_operator();
+        assert!(op.build_debye_extension().unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod lorentz_tests {
+    use super::*;
+    use crate::extensions::EngineExtension;
+
+    fn lorentz_mesh(plasma: f64, pole: f64, relax: f64) -> String {
+        let lines: Vec<String> = (0..5).map(|index| index.to_string()).collect();
+        let joined = lines.join(",");
+        format!(
+            r#"<ContinuousStructure CoordSystem="0">
+                <RectilinearGrid DeltaUnit="0.001">
+                    <XLines>{joined}</XLines>
+                    <YLines>{joined}</YLines>
+                    <ZLines>{joined}</ZLines>
+                </RectilinearGrid>
+                <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                <Properties>
+                    <LorentzMaterial Name="lor" Isotropy="1">
+                        <Property Epsilon="1" Mue="1" Sigma="0" Kappa="0"
+                                  EpsilonPlasmaFrequency="{plasma}"
+                                  EpsilonLorPoleFrequency="{pole}"
+                                  EpsilonRelaxTime="{relax}"/>
+                        <Primitives><Box Priority="1"><P1 X="-1" Y="-1" Z="-1"/><P2 X="5" Y="5" Z="5"/></Box></Primitives>
+                    </LorentzMaterial>
+                </Properties>
+            </ContinuousStructure>"#
+        )
+    }
+
+    #[test]
+    fn lorentz_pole_rings_at_the_pole_frequency() {
+        let plasma = 5.0e9f64;
+        let pole = 10.0e9f64;
+        let relax = 1.0e-9f64;
+        let mut op = Operator::new();
+        op.load_csx(&lorentz_mesh(plasma, pole, relax))
+            .expect("CSX should load");
+        op.calc_timestep();
+        op.calc_ec_operator();
+        let mut extension = op
+            .build_lorentz_extension()
+            .expect("Lorentz must build")
+            .expect("the pole is active");
+        assert_eq!(extension.num_orders, 1);
+        assert!(extension.volt_ade_on[0]);
+        let index = extension
+            .positions
+            .iter()
+            .position(|&pos| pos == [2, 2, 2])
+            .expect("centre cell present");
+        assert!(extension.v_ext_ade[0][0][index] != 0.0);
+        assert!(extension.v_lor_ade[0][0][index] != 0.0);
+
+        let dt = op.base.d_t;
+        let mut volt = FieldArray::new("volt", [5, 5, 5]);
+        let curr = FieldArray::new("curr", [5, 5, 5]);
+        let steps = (60.0 / (pole * dt)) as usize;
+        let mut history = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            extension.do_pre_voltage_updates(&mut volt, &curr);
+            *volt.get_mut(0, 2, 2, 2) = 1.0;
+            extension.apply2_voltages(&mut volt, &curr);
+            history.push(extension.volt_ade[0][0][index] as f64);
+        }
+
+        // Count upward zero crossings of the polarization ring.
+        let start = steps / 5;
+        let mut crossings = Vec::new();
+        for step in start + 1..steps {
+            if history[step - 1] <= 0.0 && history[step] > 0.0 {
+                crossings.push(step);
+            }
+        }
+        assert!(crossings.len() >= 5, "not enough oscillations: {crossings:?}");
+        let period = (crossings.last().unwrap() - crossings[0]) as f64
+            / (crossings.len() - 1) as f64;
+        let measured = 1.0 / (period * dt);
+        let relative = (measured - pole).abs() / pole;
+        assert!(
+            relative < 0.05,
+            "Lorentz ring {measured:e} Hz vs pole {pole:e} Hz (relative {relative:e})"
+        );
+    }
+
+    #[test]
+    fn lorentz_coefficients_follow_the_native_drude_lorentz_model() {
+        let plasma = 5.0e9f64;
+        let pole = 10.0e9f64;
+        let relax = 1.0e-9f64;
+        let mut op = Operator::new();
+        op.load_csx(&lorentz_mesh(plasma, pole, relax))
+            .expect("CSX should load");
+        op.calc_timestep();
+        op.calc_ec_operator();
+        let extension = op
+            .build_lorentz_extension()
+            .expect("Lorentz must build")
+            .expect("the pole is active");
+        let index = extension
+            .positions
+            .iter()
+            .position(|&pos| pos == [2, 2, 2])
+            .expect("centre cell present");
+
+        // Re-derive one component from the native formulas.
+        let dt = op.base.d_t;
+        let component = 0;
+        let ec_index = Operator::ec_index(component, 2, 2, 2, op.base.num_lines);
+        let ec_c = op.ec_c[ec_index] as f64;
+        let vi = *op.vi_ptr.as_ref().unwrap().get(component, 2, 2, 2) as f64;
+        let w_plasma = std::f64::consts::TAU * plasma;
+        let w_lor = std::f64::consts::TAU * pole;
+        let l_d = 1.0 / (w_plasma * w_plasma * ec_c);
+        let r_d = l_d / relax;
+        let c_l = 1.0 / (w_lor * w_lor * l_d);
+        let v_int = (2.0 * l_d - dt * r_d) / (2.0 * l_d + dt * r_d);
+        let v_ext = dt / (l_d + dt * r_d / 2.0) * vi;
+        let v_lor = dt / c_l / vi;
+        assert!((extension.v_int_ade[0][component][index] as f64 - v_int).abs() < 1e-6);
+        assert!(
+            (extension.v_ext_ade[0][component][index] as f64 - v_ext).abs() / v_ext.abs() < 1e-5
+        );
+        assert!(
+            (extension.v_lor_ade[0][component][index] as f64 - v_lor).abs() / v_lor.abs() < 1e-5
         );
     }
 }

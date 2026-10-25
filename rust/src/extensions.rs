@@ -28,6 +28,10 @@ pub trait EngineExtension {
     fn do_post_current_updates(&mut self, _volt: &FieldArray, _curr: &mut FieldArray) {}
     fn apply2_current(&mut self, _volt: &FieldArray, _curr: &mut FieldArray) {}
 
+    /// Timestep number, refreshed by the engine before every step. Extensions
+    /// that need absolute time (TFSF delays) override this.
+    fn set_timestep(&mut self, _number: u32) {}
+
     /// Query extension-specific convergence metric (e.g. steady-state diff).
     /// Returns `None` by default; override in extensions that support it.
     fn get_last_diff(&self) -> Option<FDTD_FLOAT> {
@@ -668,36 +672,44 @@ mod upml_tests {
 // ============================================================================
 
 /// TFSF engine extension implementing a Total-Field / Scattered-Field boundary.
-/// Adds a correction term to fields on the boundary of the total-field region
-/// based on an excitation signal with delays and amplitudes.
-/// Mirrors C++ `Engine_Ext_TFSF`.
+///
+/// Ported from `FDTD/extensions/engine_ext_tfsf.cpp`. The operator side
+/// pre-computes, for every boundary edge, the propagation delay and the field
+/// amplitude; this side adds the incident field on the six box faces after the
+/// main update.
+///
+/// The per-face arrays are indexed `[n][face][c][ui_pos]` where `c = 0` is the
+/// `nP = (n+1) % 3` component and `c = 1` is `nPP = (n+2) % 3`, matching the
+/// native layout.
 pub struct EngineExtTFSF {
     /// TFSF region start position (inclusive) in each direction.
     pub start: [usize; 3],
     /// TFSF region stop position (inclusive) in each direction.
     pub stop: [usize; 3],
-    /// Number of mesh lines in each direction within the TFSF region.
+    /// Number of mesh lines inside the region (`stop - start + 1`).
     pub num_lines: [usize; 3],
-    /// Active faces: m_ActiveDir[direction][0=low, 1=high].
+    /// Active faces: `active_dir[direction][0=low, 1=high]`.
     pub active_dir: [[bool; 2]; 3],
     /// Excitation signal.
     pub signal: Excitation,
-    /// Current timestep.
+    /// Current timestep, refreshed by the engine before every step.
     pub current_ts: u32,
-    /// Maximum delay value.
+    /// Maximum delay value in timesteps.
     pub max_delay: u32,
-    /// Voltage delay lookup: [direction][face][component][position_index].
+    /// Voltage delay lookup: `[direction][face][component][position_index]`.
     pub volt_delay: Vec<Vec<Vec<Vec<u32>>>>,
-    /// Voltage delay delta (interpolation factor): [direction][face][component][position_index].
+    /// Voltage delay interpolation factor.
     pub volt_delay_delta: Vec<Vec<Vec<Vec<FDTD_FLOAT>>>>,
-    /// Voltage amplitude: [direction][face][component][position_index].
+    /// Voltage amplitude.
     pub volt_amp: Vec<Vec<Vec<Vec<FDTD_FLOAT>>>>,
-    /// Current delay lookup: [direction][face][component][position_index].
+    /// Current delay lookup.
     pub curr_delay: Vec<Vec<Vec<Vec<u32>>>>,
-    /// Current delay delta (interpolation factor): [direction][face][component][position_index].
+    /// Current delay interpolation factor.
     pub curr_delay_delta: Vec<Vec<Vec<Vec<FDTD_FLOAT>>>>,
-    /// Current amplitude: [direction][face][component][position_index].
+    /// Current amplitude.
     pub curr_amp: Vec<Vec<Vec<Vec<FDTD_FLOAT>>>>,
+    /// `current_ts - delay` lookup table, computed once per step.
+    delay_lookup: Vec<usize>,
 }
 
 impl EngineExtTFSF {
@@ -716,6 +728,7 @@ impl EngineExtTFSF {
             curr_delay: vec![vec![vec![vec![]; 2]; 2]; 3],
             curr_delay_delta: vec![vec![vec![vec![]; 2]; 2]; 3],
             curr_amp: vec![vec![vec![vec![]; 2]; 2]; 3],
+            delay_lookup: Vec::new(),
         }
     }
 
@@ -724,9 +737,9 @@ impl EngineExtTFSF {
         self.start = start;
         self.stop = stop;
         self.num_lines = [
-            stop[0].saturating_sub(start[0]),
-            stop[1].saturating_sub(start[1]),
-            stop[2].saturating_sub(start[2]),
+            stop[0] - start[0] + 1,
+            stop[1] - start[1] + 1,
+            stop[2] - start[2] + 1,
         ];
     }
 
@@ -747,19 +760,66 @@ impl EngineExtTFSF {
         self.max_delay = max_delay;
     }
 
-    /// Compute the delay lookup index for the current timestep.
-    fn delay_lookup(&self, delay: u32, signal_length: u32, signal_period: u32) -> usize {
-        let num_ts = self.current_ts;
-        let idx = if num_ts < delay || ((num_ts - delay >= signal_length) && signal_period == 0) {
-            0
-        } else {
-            num_ts - delay
-        };
-        if signal_period > 0 {
-            (idx % signal_period) as usize
-        } else {
-            idx as usize
+    /// Allocate the per-face arrays for every active face.
+    pub fn allocate(&mut self) {
+        for n in 0..3 {
+            let n_p = (n + 1) % 3;
+            let n_pp = (n + 2) % 3;
+            let count = self.num_lines[n_p] * self.num_lines[n_pp];
+            for face in 0..2 {
+                for component in 0..2 {
+                    if !self.active_dir[n][face] {
+                        continue;
+                    }
+                    self.volt_delay[n][face][component] = vec![0; count];
+                    self.volt_delay_delta[n][face][component] = vec![0.0; count];
+                    self.volt_amp[n][face][component] = vec![0.0; count];
+                    self.curr_delay[n][face][component] = vec![0; count];
+                    self.curr_delay_delta[n][face][component] = vec![0.0; count];
+                    self.curr_amp[n][face][component] = vec![0.0; count];
+                }
+            }
         }
+    }
+
+    /// Recompute `current_ts - delay`, mirroring the native delay table.
+    fn update_delay_lookup(&mut self, length: u32, period: u32) {
+        self.delay_lookup = vec![0; self.max_delay as usize + 1];
+        for delay in 0..=self.max_delay as usize {
+            let value = if (self.current_ts as usize) < delay {
+                0
+            } else if (self.current_ts as usize) - delay >= length as usize && period == 0 {
+                0
+            } else {
+                self.current_ts as usize - delay
+            };
+            self.delay_lookup[delay] = if period > 0 {
+                value % period as usize
+            } else {
+                value
+            };
+        }
+    }
+
+    /// Add the incident field to one edge with the native linear interpolation.
+    fn add_sample(
+        &self,
+        amplitude: FDTD_FLOAT,
+        delay: u32,
+        delta: FDTD_FLOAT,
+        sample: impl Fn(usize) -> FDTD_FLOAT,
+    ) -> FDTD_FLOAT {
+        let first = self
+            .delay_lookup
+            .get(delay as usize)
+            .copied()
+            .unwrap_or(0);
+        let second = self
+            .delay_lookup
+            .get(delay as usize + 1)
+            .copied()
+            .unwrap_or(0);
+        (1.0 - delta) * amplitude * sample(first) + delta * amplitude * sample(second)
     }
 }
 
@@ -778,62 +838,44 @@ impl EngineExtension for EngineExtTFSF {
         "TFSF"
     }
 
+    fn set_timestep(&mut self, number: u32) {
+        self.current_ts = number;
+    }
+
     fn do_post_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
-        let signal_length = self.signal.signal_length();
-        let signal_period = self.signal.signal_period();
+        let length = self.signal.signal_length();
+        let period = self.signal.signal_period();
+        self.update_delay_lookup(length, period);
 
         for n in 0..3 {
             let n_p = (n + 1) % 3;
             let n_pp = (n + 2) % 3;
-
-            // lower plane
-            if self.active_dir[n][0] {
-                let mut pos = [0usize; 3];
-                pos[n_p] = self.start[n_p];
-                let mut ui_pos = 0usize;
-                for _i in 0..self.num_lines[n_p] {
-                    pos[n_pp] = self.start[n_pp];
-                    for _j in 0..self.num_lines[n_pp] {
-                        pos[n] = self.start[n];
-                        // Add TFSF correction to the two perpendicular field components
-                        for comp in [n_p, n_pp] {
-                            let delay = self.volt_delay[n][0][comp][ui_pos];
-                            let delta = self.volt_delay_delta[n][0][comp][ui_pos];
-                            let amp = self.volt_amp[n][0][comp][ui_pos];
-                            let signal_idx = self.delay_lookup(delay, signal_length, signal_period);
-                            let signal_val = self.signal_value_at(signal_idx);
-                            let correction =
-                                (1.0_f32 - delta) * amp * signal_val + delta * amp * signal_val;
-                            let current = *volt.get(comp, pos[0], pos[1], pos[2]);
-                            *volt.get_mut(comp, pos[0], pos[1], pos[2]) = current + correction;
-                        }
-                        pos[n_pp] += 1;
-                        ui_pos += 1;
-                    }
-                    pos[n_p] += 1;
+            for face in 0..2 {
+                if !self.active_dir[n][face] {
+                    continue;
                 }
-            }
-
-            // upper plane
-            if self.active_dir[n][1] {
                 let mut pos = [0usize; 3];
                 pos[n_p] = self.start[n_p];
                 let mut ui_pos = 0usize;
                 for _i in 0..self.num_lines[n_p] {
                     pos[n_pp] = self.start[n_pp];
                     for _j in 0..self.num_lines[n_pp] {
-                        pos[n] = self.stop[n];
-                        for comp in [n_p, n_pp] {
-                            let delay = self.volt_delay[n][1][comp][ui_pos];
-                            let delta = self.volt_delay_delta[n][1][comp][ui_pos];
-                            let amp = self.volt_amp[n][1][comp][ui_pos];
-                            let signal_idx = self.delay_lookup(delay, signal_length, signal_period);
-                            let signal_val = self.signal_value_at(signal_idx);
+                        pos[n] = if face == 0 {
+                            self.start[n]
+                        } else {
+                            self.stop[n]
+                        };
+                        for component in 0..2 {
+                            let edge = if component == 0 { n_p } else { n_pp };
+                            let amplitude = self.volt_amp[n][face][component][ui_pos];
+                            let delay = self.volt_delay[n][face][component][ui_pos];
+                            let delta = self.volt_delay_delta[n][face][component][ui_pos];
                             let correction =
-                                (1.0_f32 - delta) * amp * signal_val + delta * amp * signal_val;
-                            let current = *volt.get(comp, pos[0], pos[1], pos[2]);
-                            *volt.get_mut(comp, pos[0], pos[1], pos[2]) =
-                                current + correction as FDTD_FLOAT;
+                                self.add_sample(amplitude, delay, delta, |index| {
+                                    self.signal.current(index)
+                                });
+                            let current = *volt.get(edge, pos[0], pos[1], pos[2]);
+                            *volt.get_mut(edge, pos[0], pos[1], pos[2]) = current + correction;
                         }
                         pos[n_pp] += 1;
                         ui_pos += 1;
@@ -845,64 +887,42 @@ impl EngineExtension for EngineExtTFSF {
     }
 
     fn do_post_current_updates(&mut self, _volt: &FieldArray, curr: &mut FieldArray) {
-        let signal_length = self.signal.signal_length();
-        let signal_period = self.signal.signal_period();
+        let length = self.signal.signal_length();
+        let period = self.signal.signal_period();
+        self.update_delay_lookup(length, period);
 
         for n in 0..3 {
             if !self.active_dir[n][0] && !self.active_dir[n][1] {
                 continue;
             }
-
             let n_p = (n + 1) % 3;
             let n_pp = (n + 2) % 3;
-
-            // lower plane
-            if self.active_dir[n][0] {
-                let mut pos = [0usize; 3];
-                pos[n_p] = self.start[n_p];
-                let mut ui_pos = 0usize;
-                for _i in 0..self.num_lines[n_p] {
-                    pos[n_pp] = self.start[n_pp];
-                    for _j in 0..self.num_lines[n_pp] {
-                        pos[n] = self.start[n].saturating_sub(1);
-                        for comp in [n_p, n_pp] {
-                            let delay = self.curr_delay[n][0][comp][ui_pos];
-                            let delta = self.curr_delay_delta[n][0][comp][ui_pos];
-                            let amp = self.curr_amp[n][0][comp][ui_pos];
-                            let signal_idx = self.delay_lookup(delay, signal_length, signal_period);
-                            let signal_val = self.signal_value_at(signal_idx);
-                            let correction =
-                                (1.0_f32 - delta) * amp * signal_val + delta * amp * signal_val;
-                            let current = *curr.get(comp, pos[0], pos[1], pos[2]);
-                            *curr.get_mut(comp, pos[0], pos[1], pos[2]) = current + correction;
-                        }
-                        pos[n_pp] += 1;
-                        ui_pos += 1;
-                    }
-                    pos[n_p] += 1;
+            for face in 0..2 {
+                if !self.active_dir[n][face] {
+                    continue;
                 }
-            }
-
-            // upper plane
-            if self.active_dir[n][1] {
                 let mut pos = [0usize; 3];
                 pos[n_p] = self.start[n_p];
                 let mut ui_pos = 0usize;
                 for _i in 0..self.num_lines[n_p] {
                     pos[n_pp] = self.start[n_pp];
                     for _j in 0..self.num_lines[n_pp] {
-                        pos[n] = self.stop[n];
-                        for comp in [n_p, n_pp] {
-                            let delay = self.curr_delay[n][1][comp][ui_pos];
-                            let delta = self.curr_delay_delta[n][1][comp][ui_pos];
-                            let amp = self.curr_amp[n][1][comp][ui_pos];
-                            let signal_idx = self.delay_lookup(delay, signal_length, signal_period);
-                            let signal_val = self.signal_value_at(signal_idx);
+                        pos[n] = if face == 0 {
+                            self.start[n].saturating_sub(1)
+                        } else {
+                            self.stop[n]
+                        };
+                        for component in 0..2 {
+                            let edge = if component == 0 { n_p } else { n_pp };
+                            let amplitude = self.curr_amp[n][face][component][ui_pos];
+                            let delay = self.curr_delay[n][face][component][ui_pos];
+                            let delta = self.curr_delay_delta[n][face][component][ui_pos];
                             let correction =
-                                (1.0_f32 - delta) * amp * signal_val + delta * amp * signal_val;
-                            let current = *curr.get(comp, pos[0], pos[1], pos[2]);
-                            *curr.get_mut(comp, pos[0], pos[1], pos[2]) =
-                                current + correction as FDTD_FLOAT;
+                                self.add_sample(amplitude, delay, delta, |index| {
+                                    self.signal.voltage(index)
+                                });
+                            let current = *curr.get(edge, pos[0], pos[1], pos[2]);
+                            *curr.get_mut(edge, pos[0], pos[1], pos[2]) = current + correction;
                         }
                         pos[n_pp] += 1;
                         ui_pos += 1;
@@ -911,13 +931,6 @@ impl EngineExtension for EngineExtTFSF {
                 }
             }
         }
-    }
-}
-
-impl EngineExtTFSF {
-    /// Get the signal value at the given index into the signal waveform.
-    fn signal_value_at(&self, idx: usize) -> FDTD_FLOAT {
-        self.signal.voltage(idx)
     }
 }
 
@@ -938,7 +951,8 @@ mod tfsf_tests {
         ext.set_region([5, 5, 5], [15, 15, 15]);
         assert_eq!(ext.start, [5, 5, 5]);
         assert_eq!(ext.stop, [15, 15, 15]);
-        assert_eq!(ext.num_lines, [10, 10, 10]);
+        // Native keeps the inclusive line count.
+        assert_eq!(ext.num_lines, [11, 11, 11]);
     }
 
     #[test]
@@ -952,14 +966,38 @@ mod tfsf_tests {
     }
 
     #[test]
-    fn test_tfsf_delay_lookup() {
+    fn delay_lookup_matches_native_semantics() {
         let mut ext = EngineExtTFSF::new();
+        ext.set_max_delay(5);
         ext.current_ts = 100;
-        ext.max_delay = 50;
-        // delay=0, signal_length=200 (signal still active), signal_period=0 => idx = 100
-        assert_eq!(ext.delay_lookup(0, 200, 0), 100);
-        // delay=150 > current_ts => idx = 0
-        assert_eq!(ext.delay_lookup(150, 1, 0), 0);
+        ext.update_delay_lookup(200, 0);
+        assert_eq!(ext.delay_lookup[0], 100);
+        assert_eq!(ext.delay_lookup[5], 95);
+        // A delay beyond the current step maps to sample zero.
+        ext.current_ts = 2;
+        ext.update_delay_lookup(200, 0);
+        assert_eq!(ext.delay_lookup[0], 2);
+        assert_eq!(ext.delay_lookup[5], 0);
+        // A periodic signal wraps the index into one period.
+        ext.current_ts = 100;
+        ext.update_delay_lookup(200, 30);
+        assert_eq!(ext.delay_lookup[0], 10);
+        assert_eq!(ext.delay_lookup[5], 5);
+    }
+
+    #[test]
+    fn a_zero_amplitude_leaves_the_field_untouched() {
+        let mut ext = EngineExtTFSF::new();
+        ext.set_region([1, 1, 1], [2, 2, 2]);
+        ext.activate_face(0, 0);
+        ext.allocate();
+        ext.set_max_delay(1);
+        ext.signal = Excitation::gauss(1.0e9, 5.0e8);
+        ext.current_ts = 0;
+        let mut volt = FieldArray::new("volt", [4, 4, 4]);
+        *volt.get_mut(1, 1, 1, 1) = 2.0;
+        ext.do_post_voltage_updates(&mut volt, &FieldArray::new("curr", [4, 4, 4]));
+        assert_eq!(*volt.get(1, 1, 1, 1), 2.0);
     }
 }
 
@@ -1031,8 +1069,35 @@ impl EngineExtDebyeMaterial {
         }
     }
 
-    /// Set a position with its Debye coefficients.
-    pub fn set_position(
+    /// Set the mesh position of one Debye cell.
+    pub fn set_position(&mut self, pos_idx: usize, pos: [usize; 3]) {
+        self.positions[pos_idx] = pos;
+    }
+
+    /// Set the per-pole coefficients of one cell for a single field component.
+    ///
+    /// `v_relax` and `v_drive` are indexed by pole; the native operator stores
+    /// one set per direction because the weights may be anisotropic.
+    pub fn set_position_component(
+        &mut self,
+        pos_idx: usize,
+        component: usize,
+        v_relax: &[FDTD_FLOAT],
+        v_drive: &[FDTD_FLOAT],
+        v_solve: FDTD_FLOAT,
+    ) {
+        if component >= 3 {
+            return;
+        }
+        self.v_solve_ade[component][pos_idx] = v_solve;
+        for pole in 0..self.num_poles.min(v_relax.len()).min(v_drive.len()) {
+            self.v_relax_ade[pole][component][pos_idx] = v_relax[pole];
+            self.v_drive_ade[pole][component][pos_idx] = v_drive[pole];
+        }
+    }
+
+    /// Set every component to the same coefficients (isotropic shortcut).
+    pub fn set_position_uniform(
         &mut self,
         pos_idx: usize,
         pos: [usize; 3],
@@ -1040,15 +1105,9 @@ impl EngineExtDebyeMaterial {
         v_drive: &[FDTD_FLOAT],
         v_solve: FDTD_FLOAT,
     ) {
-        self.positions[pos_idx] = pos;
-        for comp in 0..3 {
-            self.v_solve_ade[comp][pos_idx] = v_solve;
-        }
-        for o in 0..self.num_poles {
-            for comp in 0..3 {
-                self.v_relax_ade[o][comp][pos_idx] = v_relax[o];
-                self.v_drive_ade[o][comp][pos_idx] = v_drive[o];
-            }
+        self.set_position(pos_idx, pos);
+        for component in 0..3 {
+            self.set_position_component(pos_idx, component, v_relax, v_drive, v_solve);
         }
     }
 }
@@ -1132,7 +1191,7 @@ mod debye_tests {
     #[test]
     fn test_debye_set_position() {
         let mut ext = EngineExtDebyeMaterial::new(1, 1);
-        ext.set_position(0, [5, 5, 5], &[0.5_f32], &[0.3_f32], 0.8_f32);
+        ext.set_position_uniform(0, [5, 5, 5], &[0.5_f32], &[0.3_f32], 0.8_f32);
         assert_eq!(ext.positions[0], [5, 5, 5]);
         assert_eq!(ext.v_relax_ade[0][0][0], 0.5_f32);
         assert_eq!(ext.v_drive_ade[0][0][0], 0.3_f32);
@@ -1142,7 +1201,7 @@ mod debye_tests {
     #[test]
     fn test_debye_pre_post_voltage() {
         let mut ext = EngineExtDebyeMaterial::new(1, 1);
-        ext.set_position(0, [1, 1, 1], &[0.5_f32], &[0.3_f32], 0.8_f32);
+        ext.set_position_uniform(0, [1, 1, 1], &[0.5_f32], &[0.3_f32], 0.8_f32);
 
         // Set up a voltage field
         let mut volt = FieldArray::new("volt", [3, 3, 3]);
@@ -1175,7 +1234,7 @@ mod debye_tests {
     #[test]
     fn test_debye_apply2_voltages() {
         let mut ext = EngineExtDebyeMaterial::new(1, 1);
-        ext.set_position(0, [1, 1, 1], &[0.5_f32], &[0.3_f32], 0.8_f32);
+        ext.set_position_uniform(0, [1, 1, 1], &[0.5_f32], &[0.3_f32], 0.8_f32);
         ext.volt_ade[0][0] = 5.4_f32;
 
         let mut volt = FieldArray::new("volt", [3, 3, 3]);
@@ -1218,17 +1277,12 @@ pub struct EngineExtLorentzMaterial {
     pub i_ext_ade: Vec<Vec<Vec<FDTD_FLOAT>>>,
     /// Current Lorentz coefficient: [order][component][pos_idx].
     pub i_lor_ade: Vec<Vec<Vec<FDTD_FLOAT>>>,
+    /// Voltage ADE active per order (native `m_volt_ADE_On`).
+    pub volt_ade_on: Vec<bool>,
+    /// Current ADE active per order (native `m_curr_ADE_On`).
+    pub curr_ade_on: Vec<bool>,
 }
 
-/// Coefficient set for a single Lorentz order at a position.
-pub struct LorentzCoeffs {
-    v_int: FDTD_FLOAT,
-    v_ext: FDTD_FLOAT,
-    v_lor: FDTD_FLOAT,
-    i_int: FDTD_FLOAT,
-    i_ext: FDTD_FLOAT,
-    i_lor: FDTD_FLOAT,
-}
 
 impl EngineExtLorentzMaterial {
     /// Create a new Lorentz extension with the given number of orders and positions.
@@ -1251,21 +1305,49 @@ impl EngineExtLorentzMaterial {
             i_int_ade: zero_cube.clone(),
             i_ext_ade: zero_cube.clone(),
             i_lor_ade: zero_cube,
+            volt_ade_on: vec![false; num_orders],
+            curr_ade_on: vec![false; num_orders],
         }
     }
 
-    /// Set a position with its Lorentz coefficients.
-    pub fn set_position(&mut self, pos_idx: usize, pos: [usize; 3], coeffs: &[LorentzCoeffs]) {
+    /// Set the mesh position of one dispersive cell.
+    pub fn set_position(&mut self, pos_idx: usize, pos: [usize; 3]) {
         self.positions[pos_idx] = pos;
-        for (o, c) in coeffs.iter().enumerate().take(self.num_orders) {
-            for comp in 0..3 {
-                self.v_int_ade[o][comp][pos_idx] = c.v_int;
-                self.v_ext_ade[o][comp][pos_idx] = c.v_ext;
-                self.v_lor_ade[o][comp][pos_idx] = c.v_lor;
-                self.i_int_ade[o][comp][pos_idx] = c.i_int;
-                self.i_ext_ade[o][comp][pos_idx] = c.i_ext;
-                self.i_lor_ade[o][comp][pos_idx] = c.i_lor;
-            }
+    }
+
+    /// Set the Lorentz coefficients of one order for one cell.
+    ///
+    /// Each slice holds one value per field component.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_order_coefficients(
+        &mut self,
+        pos_idx: usize,
+        order: usize,
+        v_int: &[FDTD_FLOAT; 3],
+        v_ext: &[FDTD_FLOAT; 3],
+        v_lor: &[FDTD_FLOAT; 3],
+        i_int: &[FDTD_FLOAT; 3],
+        i_ext: &[FDTD_FLOAT; 3],
+        i_lor: &[FDTD_FLOAT; 3],
+    ) {
+        if order >= self.num_orders {
+            return;
+        }
+        for component in 0..3 {
+            self.v_int_ade[order][component][pos_idx] = v_int[component];
+            self.v_ext_ade[order][component][pos_idx] = v_ext[component];
+            self.v_lor_ade[order][component][pos_idx] = v_lor[component];
+            self.i_int_ade[order][component][pos_idx] = i_int[component];
+            self.i_ext_ade[order][component][pos_idx] = i_ext[component];
+            self.i_lor_ade[order][component][pos_idx] = i_lor[component];
+        }
+    }
+
+    /// Mark one order as carrying voltage and/or current ADE terms.
+    pub fn set_order_active(&mut self, order: usize, voltage: bool, current: bool) {
+        if order < self.num_orders {
+            self.volt_ade_on[order] = voltage;
+            self.curr_ade_on[order] = current;
         }
     }
 }
@@ -1291,6 +1373,9 @@ impl EngineExtension for EngineExtLorentzMaterial {
         for pos_idx in 0..self.num_positions {
             let [i, j, k] = self.positions[pos_idx];
             for o in 0..self.num_orders {
+                if !self.volt_ade_on[o] {
+                    continue;
+                }
                 for comp in 0..3 {
                     let volt_val = *volt.get(comp, i, j, k);
                     if self.v_lor_ade[o][comp][pos_idx] != FDTD_FLOAT::default() {
@@ -1315,6 +1400,9 @@ impl EngineExtension for EngineExtLorentzMaterial {
         for pos_idx in 0..self.num_positions {
             let [i, j, k] = self.positions[pos_idx];
             for o in 0..self.num_orders {
+                if !self.curr_ade_on[o] {
+                    continue;
+                }
                 for comp in 0..3 {
                     let curr_val = *curr.get(comp, i, j, k);
                     if self.i_lor_ade[o][comp][pos_idx] != FDTD_FLOAT::default() {
@@ -1376,15 +1464,18 @@ mod lorentz_tests {
     #[test]
     fn test_lorentz_set_position() {
         let mut ext = EngineExtLorentzMaterial::new(1, 1);
-        let coeffs = [LorentzCoeffs {
-            v_int: 0.5_f32,
-            v_ext: 0.3_f32,
-            v_lor: 0.1_f32,
-            i_int: 0.6_f32,
-            i_ext: 0.4_f32,
-            i_lor: 0.2_f32,
-        }];
-        ext.set_position(0, [5, 5, 5], &coeffs);
+        ext.set_position(0, [5, 5, 5]);
+        ext.set_order_coefficients(
+            0,
+            0,
+            &[0.5; 3],
+            &[0.3; 3],
+            &[0.1; 3],
+            &[0.6; 3],
+            &[0.4; 3],
+            &[0.2; 3],
+        );
+        ext.set_order_active(0, true, true);
         assert_eq!(ext.positions[0], [5, 5, 5]);
         assert_eq!(ext.v_int_ade[0][0][0], 0.5_f32);
         assert_eq!(ext.v_ext_ade[0][0][0], 0.3_f32);
@@ -1397,15 +1488,18 @@ mod lorentz_tests {
     #[test]
     fn test_lorentz_pre_voltage() {
         let mut ext = EngineExtLorentzMaterial::new(1, 1);
-        let coeffs = [LorentzCoeffs {
-            v_int: 0.5_f32,
-            v_ext: 0.3_f32,
-            v_lor: 0.1_f32,
-            i_int: 0.6_f32,
-            i_ext: 0.4_f32,
-            i_lor: 0.2_f32,
-        }];
-        ext.set_position(0, [1, 1, 1], &coeffs);
+        ext.set_position(0, [1, 1, 1]);
+        ext.set_order_coefficients(
+            0,
+            0,
+            &[0.5; 3],
+            &[0.3; 3],
+            &[0.1; 3],
+            &[0.6; 3],
+            &[0.4; 3],
+            &[0.2; 3],
+        );
+        ext.set_order_active(0, true, true);
 
         let mut volt = FieldArray::new("volt", [3, 3, 3]);
         *volt.get_mut(0, 1, 1, 1) = 10.0_f32;
@@ -1421,15 +1515,18 @@ mod lorentz_tests {
     #[test]
     fn test_lorentz_pre_current() {
         let mut ext = EngineExtLorentzMaterial::new(1, 1);
-        let coeffs = [LorentzCoeffs {
-            v_int: 0.5_f32,
-            v_ext: 0.3_f32,
-            v_lor: 0.1_f32,
-            i_int: 0.6_f32,
-            i_ext: 0.4_f32,
-            i_lor: 0.2_f32,
-        }];
-        ext.set_position(0, [1, 1, 1], &coeffs);
+        ext.set_position(0, [1, 1, 1]);
+        ext.set_order_coefficients(
+            0,
+            0,
+            &[0.5; 3],
+            &[0.3; 3],
+            &[0.1; 3],
+            &[0.6; 3],
+            &[0.4; 3],
+            &[0.2; 3],
+        );
+        ext.set_order_active(0, true, true);
 
         let mut curr = FieldArray::new("curr", [3, 3, 3]);
         *curr.get_mut(0, 1, 1, 1) = 10.0_f32;
@@ -1445,15 +1542,18 @@ mod lorentz_tests {
     #[test]
     fn test_lorentz_apply2_voltages() {
         let mut ext = EngineExtLorentzMaterial::new(1, 1);
-        let coeffs = [LorentzCoeffs {
-            v_int: 0.5_f32,
-            v_ext: 0.3_f32,
-            v_lor: 0.1_f32,
-            i_int: 0.6_f32,
-            i_ext: 0.4_f32,
-            i_lor: 0.2_f32,
-        }];
-        ext.set_position(0, [1, 1, 1], &coeffs);
+        ext.set_position(0, [1, 1, 1]);
+        ext.set_order_coefficients(
+            0,
+            0,
+            &[0.5; 3],
+            &[0.3; 3],
+            &[0.1; 3],
+            &[0.6; 3],
+            &[0.4; 3],
+            &[0.2; 3],
+        );
+        ext.set_order_active(0, true, true);
         ext.volt_ade[0][0][0] = 5.4_f32;
 
         let mut volt = FieldArray::new("volt", [3, 3, 3]);
@@ -1468,15 +1568,18 @@ mod lorentz_tests {
     #[test]
     fn test_lorentz_apply2_current() {
         let mut ext = EngineExtLorentzMaterial::new(1, 1);
-        let coeffs = [LorentzCoeffs {
-            v_int: 0.5_f32,
-            v_ext: 0.3_f32,
-            v_lor: 0.1_f32,
-            i_int: 0.6_f32,
-            i_ext: 0.4_f32,
-            i_lor: 0.2_f32,
-        }];
-        ext.set_position(0, [1, 1, 1], &coeffs);
+        ext.set_position(0, [1, 1, 1]);
+        ext.set_order_coefficients(
+            0,
+            0,
+            &[0.5; 3],
+            &[0.3; 3],
+            &[0.1; 3],
+            &[0.6; 3],
+            &[0.4; 3],
+            &[0.2; 3],
+        );
+        ext.set_order_active(0, true, true);
         ext.curr_ade[0][0][0] = 5.4_f32;
 
         let mut curr = FieldArray::new("curr", [3, 3, 3]);
@@ -1754,40 +1857,51 @@ mod conducting_sheet_tests {
 // Lumped RLC extension
 // ============================================================================
 
-/// Coefficients for the lumped RLC extension (series RLC + parallel inductor).
-#[derive(Clone, Debug)]
+/// Coefficients for one lumped `RLC` edge.
+///
+/// Matches the native `Operator_Ext_LumpedRLC` arrays: parallel `ilv`/`i2v`
+/// and the series `vv2`/`vj1`/`vj2`/`vvd`/`ib0`/`b1`/`b2`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LumpedRLCCoeffs {
-    /// Series resistance R (ohm)
-    pub r: FDTD_FLOAT,
-    /// Series inductance L (henry)
-    pub l: FDTD_FLOAT,
-    /// Series capacitance C (farad)
-    pub c: FDTD_FLOAT,
-    /// Parallel inductance Lp (henry)
-    pub lp: FDTD_FLOAT,
-    /// EC coefficient vv (voltage update)
-    pub vv: FDTD_FLOAT,
-    /// EC coefficient vi (voltage update)
-    pub vi: FDTD_FLOAT,
-    /// EC coefficient ii (current update)
-    pub ii: FDTD_FLOAT,
-    /// EC coefficient iv (current update)
-    pub iv: FDTD_FLOAT,
+    /// Edge direction (0/1/2).
+    pub direction: usize,
+    /// Parallel: `dt / L`.
+    pub ilv: FDTD_FLOAT,
+    /// Parallel: `(dt / C) / (1 + dt G / (2 C))`.
+    pub i2v: FDTD_FLOAT,
+    /// Series: coefficient of `V[n-2]` in the voltage update.
+    pub vv2: FDTD_FLOAT,
+    /// Series: coefficient of `J[n-1]` in the voltage update.
+    pub vj1: FDTD_FLOAT,
+    /// Series: coefficient of `J[n-2]` in the voltage update.
+    pub vj2: FDTD_FLOAT,
+    /// Series: multiplier of the whole voltage update.
+    pub vvd: FDTD_FLOAT,
+    /// Series: inverse of `beta_0`.
+    pub ib0: FDTD_FLOAT,
+    /// Series: `beta_1`.
+    pub b1: FDTD_FLOAT,
+    /// Series: `beta_2`.
+    pub b2: FDTD_FLOAT,
 }
 
-/// Lumped RLC extension using ADE time-stepping.
+/// Lumped `RLC` ADE time stepping.
 ///
-/// Ported from C++ `engine_ext_lumpedRLC`. Maintains voltage history
-/// `v_Vdn[3]`, current history `v_Jn[3]`, and parallel inductor current `v_Il`.
+/// Ported from `FDTD/extensions/engine_ext_lumpedRLC.cpp`. The state is the
+/// three-deep voltage history `V[n]`, `V[n-1]`, `V[n-2]`, the current history
+/// `J[n-1]`, `J[n-2]`, and the parallel inductor current `I_L`.
 pub struct EngineExtLumpedRLC {
-    num_positions: usize,
-    positions: Vec<[usize; 3]>,
-    coeffs: Vec<LumpedRLCCoeffs>,
-    /// Voltage history: v_Vdn[3][pos_idx]
+    /// Number of lumped edges.
+    pub num_positions: usize,
+    /// Mesh position of every lumped edge.
+    pub positions: Vec<[usize; 3]>,
+    /// Coefficients of every lumped edge.
+    pub coeffs: Vec<LumpedRLCCoeffs>,
+    /// Voltage history per edge: `[V[n], V[n-1], V[n-2]]`.
     v_vdn: Vec<[FDTD_FLOAT; 3]>,
-    /// Current history: v_Jn[3][pos_idx]
+    /// Current history per edge: `[J[n], J[n-1], J[n-2]]`.
     v_jn: Vec<[FDTD_FLOAT; 3]>,
-    /// Parallel inductor current: v_Il[pos_idx]
+    /// Parallel inductor current per edge.
     v_il: Vec<FDTD_FLOAT>,
 }
 
@@ -1796,32 +1910,34 @@ impl EngineExtLumpedRLC {
         Self {
             num_positions,
             positions: vec![[0; 3]; num_positions],
-            coeffs: vec![
-                LumpedRLCCoeffs {
-                    r: FDTD_FLOAT::default(),
-                    l: FDTD_FLOAT::default(),
-                    c: FDTD_FLOAT::default(),
-                    lp: FDTD_FLOAT::default(),
-                    vv: FDTD_FLOAT::default(),
-                    vi: FDTD_FLOAT::default(),
-                    ii: FDTD_FLOAT::default(),
-                    iv: FDTD_FLOAT::default(),
-                };
-                num_positions
-            ],
-            v_vdn: vec![[FDTD_FLOAT::default(); 3]; num_positions],
-            v_jn: vec![[FDTD_FLOAT::default(); 3]; num_positions],
-            v_il: vec![FDTD_FLOAT::default(); num_positions],
+            coeffs: vec![LumpedRLCCoeffs::default(); num_positions],
+            v_vdn: vec![[0.0; 3]; num_positions],
+            v_jn: vec![[0.0; 3]; num_positions],
+            v_il: vec![0.0; num_positions],
         }
     }
 
     pub fn set_position(&mut self, pos_idx: usize, pos: [usize; 3], coeffs: &LumpedRLCCoeffs) {
         self.positions[pos_idx] = pos;
-        self.coeffs[pos_idx] = coeffs.clone();
-        // Initialize history arrays to zero
-        self.v_vdn[pos_idx] = [FDTD_FLOAT::default(); 3];
-        self.v_jn[pos_idx] = [FDTD_FLOAT::default(); 3];
-        self.v_il[pos_idx] = FDTD_FLOAT::default();
+        self.coeffs[pos_idx] = *coeffs;
+        self.v_vdn[pos_idx] = [0.0; 3];
+        self.v_jn[pos_idx] = [0.0; 3];
+        self.v_il[pos_idx] = 0.0;
+    }
+
+    /// Voltage history of one edge (test/diagnostic access).
+    pub fn voltage_history(&self, pos_idx: usize) -> [FDTD_FLOAT; 3] {
+        self.v_vdn[pos_idx]
+    }
+
+    /// Current history of one edge (test/diagnostic access).
+    pub fn current_history(&self, pos_idx: usize) -> [FDTD_FLOAT; 3] {
+        self.v_jn[pos_idx]
+    }
+
+    /// Parallel inductor current of one edge (test/diagnostic access).
+    pub fn inductor_current(&self, pos_idx: usize) -> FDTD_FLOAT {
+        self.v_il[pos_idx]
     }
 }
 
@@ -1834,48 +1950,56 @@ impl EngineExtension for EngineExtLumpedRLC {
         "lumped_rlc"
     }
 
-    fn do_pre_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+    fn do_pre_voltage_updates(&mut self, _volt: &mut FieldArray, _curr: &FieldArray) {
+        if self.num_positions == 0 {
+            return;
+        }
+        // Native rotates the three voltage slots once, then advances the
+        // parallel inductor current from the (already shifted) V[n-1].
+        for history in self.v_vdn.iter_mut() {
+            let oldest = history[2];
+            history[2] = history[1];
+            history[1] = history[0];
+            history[0] = oldest;
+        }
         for pos_idx in 0..self.num_positions {
-            let [i, j, k] = self.positions[pos_idx];
-            let c = &self.coeffs[pos_idx];
-
-            // Read current node voltage
-            let v = *volt.get(0, i, j, k);
-
-            // Shift voltage history: Vdn[2] = Vdn[1], Vdn[1] = Vdn[0], Vdn[0] = v
-            self.v_vdn[pos_idx][2] = self.v_vdn[pos_idx][1];
-            self.v_vdn[pos_idx][1] = self.v_vdn[pos_idx][0];
-            self.v_vdn[pos_idx][0] = v;
-
-            // Update parallel inductor current: Il += (dt / Lp) * Vdn[0]
-            // (using unit dt = 1 for simplicity; dt absorbed into coefficients)
-            self.v_il[pos_idx] += v / c.lp;
+            let coefficient = &self.coeffs[pos_idx];
+            self.v_il[pos_idx] +=
+                coefficient.i2v * coefficient.ilv * self.v_vdn[pos_idx][1];
         }
     }
 
     fn apply2_voltages(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        if self.num_positions == 0 {
+            return;
+        }
+        for history in self.v_jn.iter_mut() {
+            let oldest = history[2];
+            history[2] = history[1];
+            history[1] = history[0];
+            history[0] = oldest;
+        }
         for pos_idx in 0..self.num_positions {
             let [i, j, k] = self.positions[pos_idx];
-            let c = &self.coeffs[pos_idx];
+            let coefficient = self.coeffs[pos_idx];
+            let direction = coefficient.direction.min(2);
 
-            // Read current node voltage
-            let v = *volt.get(0, i, j, k);
+            let raw = *volt.get(direction, i, j, k);
+            self.v_vdn[pos_idx][0] = raw;
 
-            // Compute updated voltage using series/parallel additions
-            // V_new = vv * v + vi * (Vdn[0] - Vdn[1]) + ... (series RLC contribution)
-            // plus parallel inductor contribution
-            let v_new = c.vv * v
-                + c.vi * (self.v_vdn[pos_idx][0] - self.v_vdn[pos_idx][1])
-                + c.ii * self.v_il[pos_idx]
-                + c.iv * v;
+            let updated = coefficient.vvd
+                * (raw - self.v_il[pos_idx]
+                    + coefficient.vv2 * self.v_vdn[pos_idx][2]
+                    + coefficient.vj1 * self.v_jn[pos_idx][1]
+                    + coefficient.vj2 * self.v_jn[pos_idx][2]);
+            self.v_vdn[pos_idx][0] = updated;
 
-            // Update current history: Jn[2] = Jn[1], Jn[1] = Jn[0], Jn[0] = v_new
-            self.v_jn[pos_idx][2] = self.v_jn[pos_idx][1];
-            self.v_jn[pos_idx][1] = self.v_jn[pos_idx][0];
-            self.v_jn[pos_idx][0] = v_new;
+            self.v_jn[pos_idx][0] = coefficient.ib0
+                * (self.v_vdn[pos_idx][0] - self.v_vdn[pos_idx][2])
+                - (coefficient.b1 * coefficient.ib0) * self.v_jn[pos_idx][1]
+                - (coefficient.b2 * coefficient.ib0) * self.v_jn[pos_idx][2];
 
-            // Set node voltage
-            *volt.get_mut(0, i, j, k) = v_new;
+            *volt.get_mut(direction, i, j, k) = self.v_vdn[pos_idx][0];
         }
     }
 }
@@ -1884,125 +2008,156 @@ impl EngineExtension for EngineExtLumpedRLC {
 mod tests_lumped_rlc {
     use super::*;
 
-    #[test]
-    fn test_lumped_rlc_new() {
-        let ext = EngineExtLumpedRLC::new(2);
-        assert_eq!(ext.num_positions, 2);
-        assert_eq!(ext.positions.len(), 2);
-        assert_eq!(ext.coeffs.len(), 2);
-        assert_eq!(ext.v_vdn.len(), 2);
-        assert_eq!(ext.v_jn.len(), 2);
-        assert_eq!(ext.v_il.len(), 2);
+    fn coefficients(direction: usize) -> LumpedRLCCoeffs {
+        LumpedRLCCoeffs {
+            direction,
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn test_lumped_rlc_set_position() {
+    fn parallel_inductor_current_advances_from_the_previous_voltage() {
         let mut ext = EngineExtLumpedRLC::new(1);
-        let coeffs = LumpedRLCCoeffs {
-            r: 50.0_f32,
-            l: 1e-9_f32,
-            c: 1e-12_f32,
-            lp: 1e-6_f32,
-            vv: 0.8_f32,
-            vi: 0.1_f32,
-            ii: 0.05_f32,
-            iv: 0.02_f32,
-        };
-        ext.set_position(0, [2, 3, 4], &coeffs);
-        assert_eq!(ext.positions[0], [2, 3, 4]);
-        assert_eq!(ext.coeffs[0].r, 50.0);
-        assert_eq!(ext.coeffs[0].lp, 1e-6);
-        // History arrays initialized to zero
-        assert_eq!(ext.v_vdn[0], [0.0_f32; 3]);
-        assert_eq!(ext.v_jn[0], [0.0_f32; 3]);
-        assert_eq!(ext.v_il[0], 0.0);
-    }
-
-    #[test]
-    fn test_lumped_rlc_pre_voltage_updates() {
-        let mut ext = EngineExtLumpedRLC::new(1);
-        let coeffs = LumpedRLCCoeffs {
-            r: 0.0,
-            l: 0.0,
-            c: 0.0,
-            lp: 2.0,
-            vv: 0.0,
-            vi: 0.0,
-            ii: 0.0,
-            iv: 0.0,
-        };
+        let mut coeffs = coefficients(1);
+        coeffs.i2v = 2.0;
+        coeffs.ilv = 3.0;
         ext.set_position(0, [1, 1, 1], &coeffs);
 
         let mut volt = FieldArray::new("volt", [3, 3, 3]);
-        *volt.get_mut(0, 1, 1, 1) = 10.0_f32;
+        *volt.get_mut(1, 1, 1, 1) = 10.0;
 
+        // First step: V[n-1] is still zero, so I_L does not move.
         ext.do_pre_voltage_updates(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
+        assert_eq!(ext.inductor_current(0), 0.0);
 
-        // Voltage history shifted: Vdn[0] = 10.0, Vdn[1] = 0, Vdn[2] = 0
-        assert!((ext.v_vdn[0][0] - 10.0_f32).abs() < 1e-6);
-        assert!((ext.v_vdn[0][1] - 0.0_f32).abs() < 1e-6);
-        assert!((ext.v_vdn[0][2] - 0.0_f32).abs() < 1e-6);
-        // Parallel inductor current: Il += V / Lp = 10.0 / 2.0 = 5.0
-        assert!((ext.v_il[0] - 5.0_f32).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_lumped_rlc_apply2_voltages() {
-        let mut ext = EngineExtLumpedRLC::new(1);
-        let coeffs = LumpedRLCCoeffs {
-            r: 0.0,
-            l: 0.0,
-            c: 0.0,
-            lp: 0.0,
-            vv: 0.5_f32,
-            vi: 0.25_f32,
-            ii: 0.1_f32,
-            iv: 0.05_f32,
-        };
-        ext.set_position(0, [1, 1, 1], &coeffs);
-        // Set history state directly
-        ext.v_vdn[0] = [10.0_f32, 4.0_f32, 0.0_f32];
-        ext.v_il[0] = 20.0_f32;
-
-        let mut volt = FieldArray::new("volt", [3, 3, 3]);
-        *volt.get_mut(0, 1, 1, 1) = 8.0_f32;
-
+        // The voltage update stores V[0]; the next pre-update sees it as V[n-1].
         ext.apply2_voltages(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
-
-        // V_new = 0.5*8.0 + 0.25*(10.0-4.0) + 0.1*20.0 + 0.05*8.0
-        //      = 4.0 + 1.5 + 2.0 + 0.4 = 7.9
-        assert!((*volt.get(0, 1, 1, 1) - 7.9_f32).abs() < 1e-6);
-        // Current history shifted: Jn[0] = 7.9
-        assert!((ext.v_jn[0][0] - 7.9_f32).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_lumped_rlc_full_ade_cycle() {
-        let mut ext = EngineExtLumpedRLC::new(1);
-        let coeffs = LumpedRLCCoeffs {
-            r: 0.0,
-            l: 0.0,
-            c: 0.0,
-            lp: 2.0,
-            vv: 0.5_f32,
-            vi: 0.25_f32,
-            ii: 0.1_f32,
-            iv: 0.05_f32,
-        };
-        ext.set_position(0, [1, 1, 1], &coeffs);
-
-        let mut volt = FieldArray::new("volt", [3, 3, 3]);
-        *volt.get_mut(0, 1, 1, 1) = 10.0_f32;
-
-        // Pre-voltage update: shift history, update Il
+        let stored = ext.voltage_history(0)[0];
         ext.do_pre_voltage_updates(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
-        assert!((ext.v_vdn[0][0] - 10.0_f32).abs() < 1e-6);
-        assert!((ext.v_il[0] - 5.0_f32).abs() < 1e-6);
+        assert!((ext.inductor_current(0) - 2.0 * 3.0 * stored).abs() < 1e-6);
+    }
 
-        // Apply2Voltages: V_new = 0.5*10.0 + 0.25*(10.0-0.0) + 0.1*5.0 + 0.05*10.0
-        //                = 5.0 + 2.5 + 0.5 + 0.5 = 8.5
-        ext.apply2_voltages(&mut volt, &FieldArray::new("curr", [3, 3, 3]));
-        assert!((*volt.get(0, 1, 1, 1) - 8.5_f32).abs() < 1e-6);
+    #[test]
+    fn series_rlc_impedance_matches_the_analytic_admittance() {
+        // Drive the raw edge voltage with a sinusoid and compare the complex
+        // ratio J / V to the analytic series impedance. This validates the
+        // whole ADE, not only its ringing frequency.
+        let dt = 2.0e-12_f64;
+        let inductance = 4.0e-9_f64;
+        let resistance = 1.0_f64;
+        let capacitance = 1.0e-12_f64;
+        let grid_capacitance = 1.0e-12_f64;
+
+        let element = crate::lumped_rlc::CellElement {
+            inductance,
+            resistance,
+            conductance: 0.0,
+            capacitance,
+        };
+        let series = crate::lumped_rlc::series_coefficients(dt, &element);
+        let update =
+            crate::lumped_rlc::series_update_coefficients(dt, grid_capacitance, &series);
+
+        let mut ext = EngineExtLumpedRLC::new(1);
+        ext.set_position(
+            0,
+            [1, 1, 1],
+            &LumpedRLCCoeffs {
+                direction: 0,
+                vv2: update.vv2 as FDTD_FLOAT,
+                vj1: update.vj1 as FDTD_FLOAT,
+                vj2: update.vj2 as FDTD_FLOAT,
+                vvd: update.vvd as FDTD_FLOAT,
+                ib0: update.ib0 as FDTD_FLOAT,
+                b1: update.b1 as FDTD_FLOAT,
+                b2: update.b2 as FDTD_FLOAT,
+                ..Default::default()
+            },
+        );
+
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        let empty = FieldArray::new("curr", [3, 3, 3]);
+
+        for frequency in [1.0e9, 2.0e9, 3.0e9, 4.0e9] {
+            let omega = std::f64::consts::TAU * frequency;
+            let steps = 20_000usize;
+            let window = 4_000usize;
+            let mut volt_samples = Vec::with_capacity(window);
+            let mut curr_samples = Vec::with_capacity(window);
+            for step in 0..steps {
+                *volt.get_mut(0, 1, 1, 1) = (omega * step as f64 * dt).sin() as FDTD_FLOAT;
+                ext.do_pre_voltage_updates(&mut volt, &empty);
+                ext.apply2_voltages(&mut volt, &empty);
+                if step >= steps - window {
+                    volt_samples.push(*volt.get(0, 1, 1, 1) as f64);
+                    curr_samples.push(ext.current_history(0)[0] as f64);
+                }
+            }
+            let fit = |samples: &[f64]| {
+                let mut sine = 0.0;
+                let mut cosine = 0.0;
+                for (offset, value) in samples.iter().enumerate() {
+                    let step = (steps - window + offset) as f64;
+                    let phase = omega * step * dt;
+                    sine += value * phase.sin();
+                    cosine += value * phase.cos();
+                }
+                let scale = 2.0 / samples.len() as f64;
+                (scale * sine, scale * cosine)
+            };
+            let (voltage_sine, voltage_cosine) = fit(&volt_samples);
+            let (current_sine, current_cosine) = fit(&curr_samples);
+            // Phasor convention: value = Im[(a + i b) e^{i omega t}].
+            let voltage = (voltage_sine, voltage_cosine);
+            let current = (current_sine, current_cosine);
+            let denominator = voltage.0 * voltage.0 + voltage.1 * voltage.1;
+            let admittance = (
+                (current.0 * voltage.0 + current.1 * voltage.1) / denominator,
+                (current.1 * voltage.0 - current.0 * voltage.1) / denominator,
+            );
+            let impedance = (
+                resistance,
+                omega * inductance - 1.0 / (omega * capacitance),
+            );
+            let norm = impedance.0 * impedance.0 + impedance.1 * impedance.1;
+            let analytic = (impedance.0 / norm, -impedance.1 / norm);
+            let error = ((admittance.0 - analytic.0).powi(2)
+                + (admittance.1 - analytic.1).powi(2))
+            .sqrt()
+                / (analytic.0 * analytic.0 + analytic.1 * analytic.1).sqrt();
+            assert!(
+                error < 2.0e-3,
+                "admittance at {frequency:e} Hz: model {admittance:?} vs analytic {analytic:?} (rel {error:e})"
+            );
+        }
+    }
+
+    #[test]
+    fn native_recurrence_matches_a_hand_computed_step() {
+        // Deterministic single step with hand-checked arithmetic.
+        let mut ext = EngineExtLumpedRLC::new(1);
+        let coeffs = LumpedRLCCoeffs {
+            direction: 2,
+            vv2: 0.5,
+            vj1: 0.25,
+            vj2: 0.125,
+            vvd: 0.8,
+            ib0: 0.1,
+            b1: 2.0,
+            b2: 3.0,
+            ..Default::default()
+        };
+        ext.set_position(0, [0, 0, 1], &coeffs);
+        let mut volt = FieldArray::new("volt", [3, 1, 2]);
+        *volt.get_mut(2, 0, 0, 1) = 4.0;
+        ext.do_pre_voltage_updates(&mut volt, &FieldArray::new("curr", [3, 1, 2]));
+        ext.apply2_voltages(&mut volt, &FieldArray::new("curr", [3, 1, 2]));
+
+        // V = 0.8 * (4 - 0 + 0 + 0 + 0) = 3.2
+        assert!((*volt.get(2, 0, 0, 1) - 3.2).abs() < 1e-6);
+        // J = 0.1 * (3.2 - 0) = 0.32
+        assert!((ext.current_history(0)[0] - 0.32).abs() < 1e-6);
+        assert!((ext.voltage_history(0)[0] - 3.2).abs() < 1e-6);
     }
 }
 

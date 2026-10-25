@@ -40,6 +40,14 @@ impl Engine {
         self.extensions.push(ext);
     }
 
+    /// Names of the registered extensions, in update order.
+    pub fn extension_names(&self) -> Vec<&'static str> {
+        self.extensions
+            .iter()
+            .map(|extension| extension.get_extension_name())
+            .collect()
+    }
+
     /// Get the number of timesteps executed.
     pub fn get_number_of_timesteps(&self) -> u32 {
         self.num_ts
@@ -231,6 +239,13 @@ impl Engine {
     /// Iterate a number of timesteps.
     pub fn iterate_ts(&mut self, iter_ts: u32) -> bool {
         for _ in 0..iter_ts {
+            // Native `GetNumberOfTimesteps()` is the step index during the
+            // update phases; the counter is incremented only at the end.
+            let number = self.num_ts;
+            for extension in self.extensions.iter_mut() {
+                extension.set_timestep(number);
+            }
+
             // Voltage updates with extensions
             self.do_pre_voltage_updates();
             self.update_voltages();
