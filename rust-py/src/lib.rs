@@ -446,10 +446,73 @@ impl PyOpenEMS {
 
 }
 
+/// Python wrapper around the native `SAR_Calculation`.
+#[pyclass(unsendable, subclass, name = "PySarCalculation")]
+pub struct PySarCalculation {
+    inner: openems_core::sar_hdf5::SarRunner,
+}
+
+#[pymethods]
+impl PySarCalculation {
+    #[new]
+    #[pyo3(signature = (**kwargs))]
+    fn py_new(kwargs: Option<&Bound<'_, PyDict>>) -> Self {
+        // the Python subclass applies the native keyword arguments in __init__
+        let _ = kwargs;
+        Self {
+            inner: openems_core::sar_hdf5::SarRunner::new(),
+        }
+    }
+
+    fn set_debug_level(&mut self, level: i32) {
+        self.inner.debug_level = level;
+    }
+
+    fn enable_progress(&mut self, enable: bool) {
+        self.inner.progress = enable;
+    }
+
+    /// Averaging mass in kg (the Python layer converts from grams).
+    fn set_averaging_mass(&mut self, mass: f64) {
+        self.inner.averaging_mass = mass;
+    }
+
+    #[pyo3(signature = (method, silent = true))]
+    fn set_averaging_method(&mut self, method: &str, silent: bool) -> bool {
+        let _ = silent;
+        self.inner.set_averaging_method(method)
+    }
+
+    fn enable_cube_stats(&mut self) {
+        self.inner.record_cube_stats = true;
+    }
+
+    fn enable_auto_range(&mut self, db: f64) {
+        self.inner.auto_range = db;
+    }
+
+    /// Read the raw SAR data, calculate and write the result.
+    ///
+    /// `num_threads` is accepted for API compatibility; the calculation is
+    /// deterministic and produces the same result for every worker count.
+    fn calc_from_hdf5(
+        &mut self,
+        input: &str,
+        output: &str,
+        num_threads: u32,
+    ) -> PyResult<bool> {
+        let _ = num_threads;
+        self.inner
+            .calc_from_hdf5(input, output)
+            .map_err(|error| PyValueError::new_err(format!("CalcFromHDF5: {error}")))
+    }
+}
+
 /// Python module definition.
 #[pymodule]
 fn _openems(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyOpenEMS>()?;
+    m.add_class::<PySarCalculation>()?;
     m.add("BC_PEC", BC_PEC)?;
     m.add("BC_PMC", BC_PMC)?;
     m.add("BC_MUR", BC_MUR)?;

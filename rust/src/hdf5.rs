@@ -153,6 +153,8 @@ mod backend {
         static mut H5T_STD_I32LE_g: Hid;
         static mut H5T_IEEE_F32LE_g: Hid;
         static mut H5T_IEEE_F64LE_g: Hid;
+    static mut H5T_STD_U8LE_g: Hid;
+    static mut H5T_NATIVE_UINT8_g: Hid;
 
         fn H5open() -> Herr;
         fn H5Eset_auto2(
@@ -1104,7 +1106,209 @@ mod backend {
             result
         }
 
-        /// Read a one-dimensional `f32` attribute into a `Vec<f32>`.
+        /// Write a one-dimensional `i32` attribute (native index vectors).
+        pub fn write_i32_attribute_vector(
+            &self,
+            path: &str,
+            name: &str,
+            values: &[i32],
+        ) -> Result<(), Hdf5Error> {
+            let _guard = lock();
+            let object_name = c_name(path)?;
+            let attribute_name = c_name(name)?;
+            let object = unsafe {
+                check_id(
+                    "H5Oopen",
+                    H5Oopen(self.handle.id, object_name.as_ptr(), H5P_DEFAULT),
+                )?
+            };
+            let result = unsafe {
+                let dims = [values.len() as HSize];
+                let space = H5Screate_simple(1, dims.as_ptr(), ptr::null());
+                if space < 0 {
+                    let _ = H5Oclose(object);
+                    return Err(Hdf5Error::Hdf5 {
+                        operation: "H5Screate_simple",
+                        code: space as i32,
+                    });
+                }
+                let attribute = H5Acreate2(
+                    object,
+                    attribute_name.as_ptr(),
+                    H5T_STD_I32LE_g,
+                    space,
+                    H5P_DEFAULT,
+                    H5P_DEFAULT,
+                );
+                let mut result = Ok(());
+                if attribute < 0 {
+                    result = Err(Hdf5Error::Hdf5 {
+                        operation: "H5Acreate2",
+                        code: attribute as i32,
+                    });
+                } else {
+                    let write = H5Awrite(
+                        attribute,
+                        H5T_NATIVE_INT_g,
+                        values.as_ptr() as *const c_void,
+                    );
+                    if write < 0 {
+                        result = Err(Hdf5Error::Hdf5 {
+                            operation: "H5Awrite",
+                            code: write,
+                        });
+                    }
+                    let _ = H5Aclose(attribute);
+                }
+                let _ = H5Sclose(space);
+                result
+            };
+            unsafe {
+                let _ = H5Oclose(object);
+            }
+            result
+        }
+
+        /// Write a one-dimensional `f64` attribute (native frequency vectors).
+        pub fn write_f64_attribute_vector(
+            &self,
+            path: &str,
+            name: &str,
+            values: &[f64],
+        ) -> Result<(), Hdf5Error> {
+            let _guard = lock();
+            let object_name = c_name(path)?;
+            let attribute_name = c_name(name)?;
+            let object = unsafe {
+                check_id(
+                    "H5Oopen",
+                    H5Oopen(self.handle.id, object_name.as_ptr(), H5P_DEFAULT),
+                )?
+            };
+            let result = unsafe {
+                let dims = [values.len() as HSize];
+                let space = H5Screate_simple(1, dims.as_ptr(), ptr::null());
+                if space < 0 {
+                    let _ = H5Oclose(object);
+                    return Err(Hdf5Error::Hdf5 {
+                        operation: "H5Screate_simple",
+                        code: space as i32,
+                    });
+                }
+                let attribute = H5Acreate2(
+                    object,
+                    attribute_name.as_ptr(),
+                    H5T_IEEE_F64LE_g,
+                    space,
+                    H5P_DEFAULT,
+                    H5P_DEFAULT,
+                );
+                let mut result = Ok(());
+                if attribute < 0 {
+                    result = Err(Hdf5Error::Hdf5 {
+                        operation: "H5Acreate2",
+                        code: attribute as i32,
+                    });
+                } else {
+                    let write = H5Awrite(
+                        attribute,
+                        H5T_NATIVE_DOUBLE_g,
+                        values.as_ptr() as *const c_void,
+                    );
+                    if write < 0 {
+                        result = Err(Hdf5Error::Hdf5 {
+                            operation: "H5Awrite",
+                            code: write,
+                        });
+                    }
+                    let _ = H5Aclose(attribute);
+                }
+                let _ = H5Sclose(space);
+                result
+            };
+            unsafe {
+                let _ = H5Oclose(object);
+            }
+            result
+        }
+
+        /// Write a three-dimensional `u8` dataset (native cube statistics).
+        pub fn write_u8_dataset_nd(
+            &self,
+            group: &str,
+            name: &str,
+            dims: &[usize],
+            data: &[u8],
+            order: Option<&str>,
+        ) -> Result<(), Hdf5Error> {
+            let expected: usize = dims.iter().product();
+            if expected != data.len() {
+                return Err(Hdf5Error::InvalidShape {
+                    path: format!("{group}/{name}"),
+                    detail: format!("{expected} values expected, {} given", data.len()),
+                });
+            }
+            let file_type = unsafe { H5T_STD_U8LE_g };
+            let mem_type = unsafe { H5T_NATIVE_UINT8_g };
+            self.write_dataset(
+                group,
+                name,
+                file_type,
+                mem_type,
+                dims,
+                data.as_ptr() as *const c_void,
+                order,
+            )
+        }
+
+        /// Read a one-dimensional `f64` attribute (native frequency vectors).
+        pub fn read_f64_attribute_vector(
+            &self,
+            path: &str,
+            name: &str,
+        ) -> Result<Vec<f64>, Hdf5Error> {
+            let _guard = lock();
+            let (object, attribute) = self.open_attribute(path, name)?;
+            let result = unsafe {
+                let space = H5Aget_space(attribute);
+                if space < 0 {
+                    Err(Hdf5Error::Hdf5 {
+                        operation: "H5Aget_space",
+                        code: space as i32,
+                    })
+                } else {
+                    let points = H5Sget_simple_extent_npoints(space);
+                    let _ = H5Sclose(space);
+                    if points < 0 {
+                        Err(Hdf5Error::Hdf5 {
+                            operation: "H5Sget_simple_extent_npoints",
+                            code: points as c_int,
+                        })
+                    } else {
+                        let mut values = vec![0.0f64; points as usize];
+                        let read = H5Aread(
+                            attribute,
+                            H5T_NATIVE_DOUBLE_g,
+                            values.as_mut_ptr() as *mut c_void,
+                        );
+                        if read < 0 {
+                            Err(Hdf5Error::Hdf5 {
+                                operation: "H5Aread",
+                                code: read,
+                            })
+                        } else {
+                            Ok(values)
+                        }
+                    }
+                }
+            };
+            unsafe {
+                let _ = H5Aclose(attribute);
+                let _ = H5Oclose(object);
+            }
+            result
+        }
+
         pub fn read_f32_attribute_vector(
             &self,
             path: &str,
@@ -1378,6 +1582,37 @@ impl Hdf5File {
     }
 
     pub fn read_string_attribute(&self, path: &str, name: &str) -> Result<String, Hdf5Error> {
+        let _ = (path, name);
+        Err(Hdf5Error::Unsupported)
+    }
+
+    pub fn write_f64_attribute_vector(
+        &self,
+        path: &str,
+        name: &str,
+        values: &[f64],
+    ) -> Result<(), Hdf5Error> {
+        let _ = (path, name, values);
+        Err(Hdf5Error::Unsupported)
+    }
+
+    pub fn write_u8_dataset_nd(
+        &self,
+        group: &str,
+        name: &str,
+        dims: &[usize],
+        data: &[u8],
+        order: Option<&str>,
+    ) -> Result<(), Hdf5Error> {
+        let _ = (group, name, dims, data, order);
+        Err(Hdf5Error::Unsupported)
+    }
+
+    pub fn read_f64_attribute_vector(
+        &self,
+        path: &str,
+        name: &str,
+    ) -> Result<Vec<f64>, Hdf5Error> {
         let _ = (path, name);
         Err(Hdf5Error::Unsupported)
     }

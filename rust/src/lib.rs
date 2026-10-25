@@ -30,6 +30,8 @@ pub mod operator_extension;
 pub mod processing;
 pub mod processing_integral;
 pub mod sar;
+#[cfg(feature = "hdf5")]
+pub mod sar_hdf5;
 
 // Re-export the main solver and boundary condition types at the crate root
 // so dependents can use `openems_core::{OpenEMS, BC_PEC, ...}`.

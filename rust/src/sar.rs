@@ -65,6 +65,14 @@ pub struct SarCalculation {
     pub valid_cells: usize,
     /// Number of cells assigned by the step-2 fallback.
     pub unused_cells: usize,
+    /// Background (air) cells with zero density.
+    pub air_cells: usize,
+    /// Per-cell averaging cube kind (native `CubeType` dataset).
+    pub cube_type: Vec<u8>,
+    /// Mass enclosed by the cube assigned to a cell, in kg.
+    pub cube_mass: Vec<f64>,
+    /// Volume of the cube assigned to a cell, in m^3.
+    pub cube_volume: Vec<f64>,
 }
 
 impl SarCalculation {
@@ -95,6 +103,10 @@ impl SarCalculation {
             max_iterations: 100,
             valid_cells: 0,
             unused_cells: 0,
+            air_cells: 0,
+            cube_type: Vec::new(),
+            cube_mass: Vec::new(),
+            cube_volume: Vec::new(),
         }
     }
 
@@ -214,6 +226,11 @@ impl SarCalculation {
     pub fn calc_sar(&mut self) {
         self.valid_cells = 0;
         self.unused_cells = 0;
+        self.air_cells = 0;
+        let cells = self.cell_volume.len();
+        self.cube_type = vec![0; cells];
+        self.cube_mass = vec![0.0; cells];
+        self.cube_volume = vec![0.0; cells];
         self.max_sar = vec![0.0; self.frequencies.len()];
         self.max_index = vec![[0; 3]; self.frequencies.len()];
         if self.averaging_mass <= 0.0 {
@@ -232,6 +249,7 @@ impl SarCalculation {
                     let index = self.index([i, j, k]);
                     let density = self.cell_density[index];
                     if density <= 0.0 {
+                        self.air_cells += 1;
                         continue;
                     }
                     for (frequency, values) in self.power_density.iter().enumerate() {
@@ -273,6 +291,9 @@ impl SarCalculation {
                     valid[index] = true;
                     used[index] = true;
                     self.valid_cells += 1;
+                    self.cube_type[index] = 7;
+                    self.cube_mass[index] = cube.mass;
+                    self.cube_volume[index] = cube.volume;
                     for (frequency, value) in values.iter().enumerate() {
                         if *value > sar[frequency][index] {
                             sar[frequency][index] = *value;
@@ -308,10 +329,11 @@ impl SarCalculation {
                         if status == CubeStatus::Valid {
                             min_volume = min_volume.min(cube.volume);
                             let values = self.calc_cubical_sar(&cube);
-                            candidates.push((cube, values));
+                            candidates.push((face, cube, values));
                         }
                     }
-                    for (cube, values) in candidates {
+                    let mut chosen: Option<(usize, AveragingCube)> = None;
+                    for (face, cube, values) in candidates {
                         if cube.volume > self.unused_relative_volume_limit * min_volume {
                             continue;
                         }
@@ -319,6 +341,20 @@ impl SarCalculation {
                             if *value > best[frequency] {
                                 best[frequency] = *value;
                             }
+                        }
+                        if chosen
+                            .as_ref()
+                            .map(|(_, current)| cube.volume <= current.volume)
+                            .unwrap_or(true)
+                        {
+                            chosen = Some((face, cube));
+                        }
+                    }
+                    if let Some((face, cube)) = &chosen {
+                        if self.cube_type[index] == 0 {
+                            self.cube_type[index] = (*face as u8) + 1;
+                            self.cube_mass[index] = cube.mass;
+                            self.cube_volume[index] = cube.volume;
                         }
                     }
                     for (frequency, value) in best.iter().enumerate() {
@@ -338,7 +374,7 @@ impl SarCalculation {
     }
 
     fn assign_used_sar(
-        &self,
+        &mut self,
         values: &[f64],
         cube: &AveragingCube,
         used: &mut [bool],
@@ -353,6 +389,11 @@ impl SarCalculation {
                         continue;
                     }
                     used[index] = true;
+                    if self.cube_type[index] == 0 {
+                        self.cube_type[index] = 8;
+                        self.cube_mass[index] = cube.mass;
+                        self.cube_volume[index] = cube.volume;
+                    }
                     // Native stores the cube value for cells covered by a cube;
                     // a cell with its own valid cube keeps its own average.
                     for (frequency, value) in values.iter().enumerate() {
@@ -367,6 +408,39 @@ impl SarCalculation {
     /// The cell widths along each axis.
     pub fn cell_width(&self) -> &[Vec<f64>; 3] {
         &self.cell_width
+    }
+
+    /// Per-cell volumes in m^3.
+    pub fn cell_volumes(&self) -> &[f64] {
+        &self.cell_volume
+    }
+
+    /// Per-cell mass density in kg/m^3.
+    pub fn cell_densities(&self) -> &[f64] {
+        &self.cell_density
+    }
+
+    /// Local SAR per cell of one frequency (W/kg).
+    pub fn local_sar(&self, frequency: usize) -> Option<Vec<f64>> {
+        let power_density = self.power_density.get(frequency)?;
+        Some(
+            power_density
+                .iter()
+                .zip(self.cell_density.iter())
+                .map(|(power, density)| {
+                    if *density > 0.0 {
+                        power / density
+                    } else {
+                        0.0
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// Global cell index for a position (native `ArrayIJK` order).
+    pub fn cell_index(&self, position: [usize; 3]) -> usize {
+        self.index(position)
     }
 
     /// SAR map of one frequency (W/kg).

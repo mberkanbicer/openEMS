@@ -18,8 +18,11 @@ import numpy as np
 
 try:
     from openEMS._openems import PyOpenEMS as _RustOpenEMS
-except ImportError:  # extension built as a standalone module
-    from openems_py import PyOpenEMS as _RustOpenEMS
+except ImportError as _import_error:  # extension built as a standalone module
+    try:
+        from openems_py import PyOpenEMS as _RustOpenEMS
+    except ImportError:
+        raise _import_error
 
 from CSXCAD.Utilities import GetMultiDirs
 
