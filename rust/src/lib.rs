@@ -23,6 +23,8 @@ pub mod extensions;
 pub mod hdf5;
 pub mod lumped_rlc;
 pub mod nf2ff;
+#[cfg(feature = "hdf5")]
+pub mod nf2ff_hdf5;
 pub mod openems;
 pub mod operator;
 pub mod operator_base;

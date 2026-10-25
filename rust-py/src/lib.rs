@@ -508,11 +508,103 @@ impl PySarCalculation {
     }
 }
 
+/// Python wrapper around the native `nf2ff` driver.
+#[pyclass(unsendable, subclass, name = "PyNf2ff")]
+pub struct PyNf2ff {
+    inner: openems_core::nf2ff_hdf5::Nf2ffRunner,
+}
+
+#[pymethods]
+impl PyNf2ff {
+    #[new]
+    #[pyo3(signature = (freq, theta, phi, center, num_threads = 0, **kwargs))]
+    fn py_new(
+        freq: Vec<f64>,
+        theta: Vec<f64>,
+        phi: Vec<f64>,
+        center: Vec<f64>,
+        num_threads: u32,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
+        let _ = num_threads;
+        if center.len() != 3 {
+            return Err(PyValueError::new_err(
+                "nf2ff: center must have 3 components",
+            ));
+        }
+        let mut runner = openems_core::nf2ff_hdf5::Nf2ffRunner::new(
+            freq,
+            theta,
+            phi,
+            [center[0], center[1], center[2]],
+        );
+        if let Some(kwargs) = kwargs {
+            for (key, value) in kwargs.iter() {
+                if key.extract::<String>()?.as_str() == "verbose" {
+                    runner.set_verbose_level(value.extract::<i32>()?);
+                } else {
+                    return Err(PyAssertionError::new_err(format!(
+                        "Unknown keyword(s): {{{}: {}}}",
+                        key, value
+                    )));
+                }
+            }
+        }
+        Ok(Self { inner: runner })
+    }
+
+    fn analyse_file(&mut self, e_file: &str, h_file: &str) -> PyResult<bool> {
+        self.inner
+            .analyse_file(e_file, h_file)
+            .map_err(|error| PyValueError::new_err(format!("AnalyseFile: {error}")))
+    }
+
+    fn set_mirror(&mut self, mirror_type: i32, ny: i32, position: f64) -> PyResult<()> {
+        if mirror_type <= 0 {
+            return Ok(());
+        }
+        if mirror_type >= 3 {
+            return Err(PyValueError::new_err(
+                "SetMirror: invalid mirror type!",
+            ));
+        }
+        if !(0..3).contains(&ny) {
+            return Err(PyValueError::new_err(format!(
+                "SetMirror: invalid direction {ny}"
+            )));
+        }
+        if !self.inner.set_mirror(mirror_type, ny as usize, position) {
+            return Err(PyValueError::new_err("SetMirror: invalid mirror setting"));
+        }
+        Ok(())
+    }
+
+    fn set_radius(&mut self, radius: f64) {
+        self.inner.set_radius(radius);
+    }
+
+    fn set_verbose_level(&mut self, level: i32) {
+        self.inner.set_verbose_level(level);
+    }
+
+    /// Request the Octave/MATLAB compatible result layout.
+    fn set_legacy_format(&mut self, legacy: bool) {
+        self.inner.set_legacy_format(legacy);
+    }
+
+    fn write2hdf5(&self, filename: &str) -> PyResult<bool> {
+        self.inner
+            .write_hdf5(filename)
+            .map_err(|error| PyValueError::new_err(format!("Write2HDF5: {error}")))
+    }
+}
+
 /// Python module definition.
 #[pymodule]
 fn _openems(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyOpenEMS>()?;
     m.add_class::<PySarCalculation>()?;
+    m.add_class::<PyNf2ff>()?;
     m.add("BC_PEC", BC_PEC)?;
     m.add("BC_PMC", BC_PMC)?;
     m.add("BC_MUR", BC_MUR)?;
