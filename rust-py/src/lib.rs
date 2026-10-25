@@ -1,7 +1,7 @@
 //! Python bindings for the openEMS FDTD solver.
 //! Mirrors the Cython `openEMS.pyx` interface using PyO3.
 
-use pyo3::exceptions::{PyException, PyValueError};
+use pyo3::exceptions::{PyAssertionError, PyValueError};
 use pyo3::prelude::{PyAny, PyModule, PyResult, Python};
 use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyModuleMethods};
 use pyo3::{pyclass, pymethods, pymodule, Bound, FromPyObject, Py};
@@ -22,15 +22,34 @@ fn extract_f64<'py>(val: &Bound<'py, PyAny>) -> PyResult<f64> {
 }
 
 fn extract_u32<'py>(val: &Bound<'py, PyAny>) -> PyResult<u32> {
-    extract(val)
+    if let Ok(value) = val.extract::<u32>() {
+        return Ok(value);
+    }
+    let value = val.extract::<f64>()?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(PyValueError::new_err(format!(
+            "expected a non-negative integer, got {value}"
+        )));
+    }
+    Ok(value as u32)
 }
 
 fn extract_i32<'py>(val: &Bound<'py, PyAny>) -> PyResult<i32> {
-    extract(val)
+    if let Ok(value) = val.extract::<i32>() {
+        return Ok(value);
+    }
+    let value = val.extract::<f64>()?;
+    if !value.is_finite() {
+        return Err(PyValueError::new_err("expected an integer"));
+    }
+    Ok(value as i32)
 }
 
 fn extract_bool<'py>(val: &Bound<'py, PyAny>) -> PyResult<bool> {
-    extract(val)
+    if let Ok(value) = val.extract::<bool>() {
+        return Ok(value);
+    }
+    Ok(val.extract::<i64>()? != 0)
 }
 
 fn extract_vec_f64<'py>(val: &Bound<'py, PyAny>) -> PyResult<Vec<f64>> {
@@ -103,7 +122,7 @@ impl PyOpenEMS {
                         })?;
                     }
                     _ => {
-                        return Err(PyValueError::new_err(format!(
+                        return Err(PyAssertionError::new_err(format!(
                             "Unknown keyword argument: {}",
                             key_str
                         )));
@@ -310,47 +329,34 @@ impl PyOpenEMS {
         self.inner.set_csx_xml(xml.to_string());
     }
 
-    /// Add edges of primitives to the FDTD grid.
-    #[pyo3(signature = (dirs, primitives=None))]
-    fn add_edges2grid(
-        &mut self,
-        dirs: &str,
-        primitives: Option<Bound<'_, PyList>>,
-    ) -> PyResult<()> {
-        let _csx = self.csx.as_ref().ok_or_else(|| {
-            PyValueError::new_err("AddEdges2Grid: Unable to access CSX!")
-        })?;
-        let _ = (dirs, primitives);
-
-        Ok(())
-    }
-
-    /// Create a near-field to far-field box.
-    #[pyo3(signature = (name=None, start=None, stop=None, _kw=None))]
-    fn create_nf2ff_box(
-        &mut self,
-        name: Option<&str>,
-        start: Option<Vec<f64>>,
-        stop: Option<Vec<f64>>,
-        _kw: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<Py<PyAny>> {
-        let _ = (name, start, stop);
-        Err(PyException::new_err(
-            "CreateNF2FFBox: requires CSXCAD integration (future task)",
-        ))
-    }
-
     /// Run the openEMS FDTD simulation.
-    #[pyo3(signature = (sim_path, _kw=None))]
-    fn run(
-        &mut self,
-        sim_path: &str,
-        _kw: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<i32> {
-        let _ = sim_path;
-        self.inner.setup_fdtd();
-        self.inner.run_fdtd();
+    ///
+    /// Returns the native exit code: 0 on success, 1 when the FDTD setup fails.
+    /// The Python layer owns the simulation path, the cleanup and the option
+    /// mapping, exactly like the native `Run` wrapper.
+    fn run(&mut self) -> PyResult<i32> {
+        if !self.inner.setup_fdtd() {
+            return Ok(1);
+        }
+        if !self.inner.run_fdtd() {
+            return Ok(1);
+        }
         Ok(0)
+    }
+
+    /// Skip the simulation, only run the setup (native `--no-simulation`).
+    fn set_no_simulation(&mut self, val: bool) {
+        self.inner.set_no_simulation(val);
+    }
+
+    /// Write the native statistics files at the end of a run.
+    fn set_dump_statistics(&mut self, val: bool) {
+        self.inner.set_dump_statistics(val);
+    }
+
+    /// Use the exact energy end criterion (native `--exact-endcriteria`).
+    fn set_exact_end_criteria(&mut self, val: bool) {
+        self.inner.set_exact_end_criteria(val);
     }
 
     /// Set the abort flag.
