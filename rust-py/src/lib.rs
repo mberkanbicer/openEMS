@@ -399,6 +399,18 @@ impl PyOpenEMS {
         self.inner.debug_csx();
     }
 
+    /// The native `<FDTD ...>` element for the current solver settings.
+    fn fdtd_xml(&self) -> String {
+        self.inner.write_fdtd_element()
+    }
+
+    /// Apply the options of a native `<FDTD>` element (attributes plus the
+    /// `Excitation` and `BoundaryCond` children).
+    fn apply_fdtd_xml(&mut self, xml: &str) {
+        let options = openems_core::fdtd_options::parse_fdtd_options(xml);
+        self.inner.apply_fdtd_options(&options);
+    }
+
     /// Write the FDTD setup and CSX data to an XML file.
     fn write2xml(&self, file: &str) -> PyResult<bool> {
         let xml = self

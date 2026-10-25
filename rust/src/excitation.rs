@@ -263,6 +263,11 @@ impl Excitation {
         Ok(())
     }
 
+    /// Custom excitation expression, if this is a custom excitation.
+    pub fn custom_function(&self) -> Option<&str> {
+        self.custom_expr.as_deref()
+    }
+
     fn build_custom(&mut self, dt: f64, max_ts: u32) -> Result<(), ExcitationError> {
         let expression = self
             .custom_expr

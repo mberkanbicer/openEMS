@@ -5,6 +5,20 @@
 //! input file. The CSXCAD parser only consumes the geometry, so these options
 //! are read here and applied to the solver.
 
+/// Excitation setup from the `<Excitation>` child of `<FDTD>`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FdtdExcitation {
+    Gauss { f0: f64, fc: f64 },
+    Sinus { f0: f64 },
+    Dirac { f_max: f64 },
+    Step { f_max: f64 },
+    Custom {
+        function: String,
+        f0: f64,
+        f_max: f64,
+    },
+}
+
 /// Solver options gathered from the `<FDTD>` element.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FdtdOptions {
@@ -17,6 +31,15 @@ pub struct FdtdOptions {
     pub time_step_factor: Option<f64>,
     pub time_step_method: Option<i32>,
     pub coord_system: Option<i32>,
+    pub cylinder_coords: Option<bool>,
+    pub multi_grid: Option<Vec<f64>>,
+    /// Boundary conditions by native index (0 PEC, 1 PMC, 2 MUR, 3 PML).
+    pub bc_type: Option<[i32; 6]>,
+    /// PML layer count per boundary index.
+    pub pml_size: Option<[u32; 6]>,
+    /// Per-boundary Mur phase velocity, `None` when not set.
+    pub mur_phase_velocity: [Option<f64>; 6],
+    pub excitation: Option<FdtdExcitation>,
 }
 
 /// Extract the attribute string of the `<FDTD …>` element, if present.
@@ -155,10 +178,230 @@ pub fn parse_fdtd_options(xml: &str) -> FdtdOptions {
                     options.coord_system = Some(parsed);
                 }
             }
+            "cylindercoords" => {
+                options.cylinder_coords = Some(value.trim() == "1");
+            }
+            "multigrid" => {
+                options.multi_grid = Some(
+                    value
+                        .split(',')
+                        .filter_map(|entry| entry.trim().parse::<f64>().ok())
+                        .collect(),
+                );
+            }
             _ => {}
         }
     }
+
+    // `<BoundaryCond ...>` child
+    if let Some(tag) = child_tag(xml, "BoundaryCond") {
+        let mut bc = [0i32; 6];
+        let mut pml = [0u32; 6];
+        let names = ["xmin", "xmax", "ymin", "ymax", "zmin", "zmax"];
+        let attributes = attributes(&tag);
+        for (name, value) in &attributes {
+            if let Some(index) = names.iter().position(|entry| entry == name) {
+                let value = value.trim();
+                match value {
+                    "PEC" => bc[index] = 0,
+                    "PMC" => bc[index] = 1,
+                    "MUR" => bc[index] = 2,
+                    _ => {
+                        if let Some(size) = value.strip_prefix("PML_") {
+                            bc[index] = 3;
+                            pml[index] = size.trim().parse::<u32>().unwrap_or(8);
+                        } else if let Ok(parsed) = value.parse::<i32>() {
+                            bc[index] = parsed;
+                        }
+                    }
+                }
+            }
+            let mur_names = [
+                "MUR_PhaseVelocity_xmin",
+                "MUR_PhaseVelocity_xmax",
+                "MUR_PhaseVelocity_ymin",
+                "MUR_PhaseVelocity_ymax",
+                "MUR_PhaseVelocity_zmin",
+                "MUR_PhaseVelocity_zmax",
+            ];
+            if let Some(index) = mur_names.iter().position(|entry| entry == name) {
+                options.mur_phase_velocity[index] = value.trim().parse::<f64>().ok();
+            }
+        }
+        options.bc_type = Some(bc);
+        options.pml_size = Some(pml);
+    }
+
+    // `<Excitation ...>` child
+    if let Some(tag) = child_tag(xml, "Excitation") {
+        let attributes = attributes(&tag);
+        let get = |name: &str| {
+            attributes
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        let excitation_type = get("Type")
+            .and_then(|value| value.trim().parse::<i32>().ok())
+            .unwrap_or(-1);
+        let f0 = get("f0")
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let fc = get("fc")
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let f_max = get("f_max")
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .unwrap_or(0.0);
+        options.excitation = match excitation_type {
+            0 => Some(FdtdExcitation::Gauss { f0, fc }),
+            1 => Some(FdtdExcitation::Sinus { f0 }),
+            2 => Some(FdtdExcitation::Dirac { f_max }),
+            3 => Some(FdtdExcitation::Step { f_max }),
+            10 => Some(FdtdExcitation::Custom {
+                function: get("Function").unwrap_or_default(),
+                f0,
+                f_max,
+            }),
+            _ => None,
+        };
+    }
+
     options
+}
+
+/// Attribute body of the first `<name ...>` child element.
+fn child_tag(xml: &str, name: &str) -> Option<String> {
+    let start = xml.find(&format!("<{name}"))?;
+    let rest = &xml[start..];
+    let end = rest.find('>')?;
+    Some(rest[..end].to_string())
+}
+
+/// The native `<FDTD ...>` element (attributes plus the `Excitation` and
+/// `BoundaryCond` children) for the given solver settings.
+pub fn write_fdtd_element(settings: &FdtdWriteSettings) -> String {
+    let mut element = String::from("<FDTD");
+    attribute(&mut element, "NumberOfTimesteps", &settings.nr_ts.to_string());
+    if settings.cylinder_coords {
+        attribute(&mut element, "CylinderCoords", "1");
+        if !settings.multi_grid.is_empty() {
+            let radii = settings
+                .multi_grid
+                .iter()
+                .map(|radius| radius.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            attribute(&mut element, "MultiGrid", &radii);
+        }
+    }
+    if settings.max_time > 0.0 {
+        attribute(&mut element, "MaxTime", &settings.max_time.to_string());
+    }
+    attribute(&mut element, "endCriteria", &settings.end_criteria.to_string());
+    attribute(&mut element, "OverSampling", &settings.over_sampling.to_string());
+    if settings.cell_constant_material {
+        attribute(&mut element, "CellConstantMaterial", "1");
+    }
+    if let FdtdExcitation::Dirac { f_max }
+    | FdtdExcitation::Step { f_max }
+    | FdtdExcitation::Custom { f_max, .. } = settings.excitation
+    {
+        attribute(&mut element, "f_max", &f_max.to_string());
+    }
+    attribute(&mut element, "TimeStepMethod", &settings.time_step_method.to_string());
+    if settings.time_step > 0.0 {
+        attribute(&mut element, "TimeStep", &settings.time_step.to_string());
+    }
+    if settings.time_step_factor > 1.0 {
+        attribute(
+            &mut element,
+            "TimeStepFactor",
+            &settings.time_step_factor.to_string(),
+        );
+    }
+    element.push('>');
+
+    let mut excitation = String::from("<Excitation");
+    match &settings.excitation {
+        FdtdExcitation::Gauss { f0, fc } => {
+            attribute(&mut excitation, "Type", "0");
+            attribute(&mut excitation, "f0", &f0.to_string());
+            attribute(&mut excitation, "fc", &fc.to_string());
+        }
+        FdtdExcitation::Sinus { f0 } => {
+            attribute(&mut excitation, "Type", "1");
+            attribute(&mut excitation, "f0", &f0.to_string());
+        }
+        FdtdExcitation::Dirac { .. } => attribute(&mut excitation, "Type", "2"),
+        FdtdExcitation::Step { .. } => attribute(&mut excitation, "Type", "3"),
+        FdtdExcitation::Custom { function, f0, .. } => {
+            attribute(&mut excitation, "Type", "10");
+            attribute(&mut excitation, "f0", &f0.to_string());
+            attribute(&mut excitation, "Function", &escape_attribute(function));
+        }
+    }
+    excitation.push_str("/>");
+    element.push_str(&excitation);
+
+    let mut boundary = String::from("<BoundaryCond");
+    let names = ["xmin", "xmax", "ymin", "ymax", "zmin", "zmax"];
+    for index in 0..6 {
+        let value = match settings.bc_type[index] {
+            0 => "PEC".to_string(),
+            1 => "PMC".to_string(),
+            2 => "MUR".to_string(),
+            3 => format!("PML_{}", settings.pml_size[index]),
+            other => other.to_string(),
+        };
+        attribute(&mut boundary, names[index], &value);
+        if let Some(velocity) = settings.mur_phase_velocity[index] {
+            if velocity > 0.0 {
+                let name = format!("MUR_PhaseVelocity_{}", names[index]);
+                attribute(&mut boundary, &name, &velocity.to_string());
+            }
+        }
+    }
+    boundary.push_str("/>");
+    element.push_str(&boundary);
+    element.push_str("</FDTD>");
+    element
+}
+
+fn attribute(element: &mut String, name: &str, value: &str) {
+    element.push(' ');
+    element.push_str(name);
+    element.push('=');
+    element.push('"');
+    element.push_str(value);
+    element.push('"');
+}
+
+fn escape_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Everything the native `<FDTD>` writer emits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FdtdWriteSettings {
+    pub nr_ts: u32,
+    pub end_criteria: f64,
+    pub max_time: f64,
+    pub over_sampling: u32,
+    pub cell_constant_material: bool,
+    pub cylinder_coords: bool,
+    pub multi_grid: Vec<f64>,
+    pub time_step: f64,
+    pub time_step_factor: f64,
+    pub time_step_method: i32,
+    pub bc_type: [i32; 6],
+    pub pml_size: [u32; 6],
+    pub mur_phase_velocity: [Option<f64>; 6],
+    pub excitation: FdtdExcitation,
 }
 
 #[cfg(test)]

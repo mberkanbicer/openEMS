@@ -50,6 +50,8 @@ pub struct OpenEMS {
     pub bc_type_set: bool,
     pub pml_size: [u32; 6],
     pub mur_v_ph: [f64; 6],
+    /// Cylindrical multi-grid radii (native `m_CC_MultiGrid`).
+    pub multi_grid: Vec<f64>,
     pub max_time: f64,
     pub time_step_method: i32,
     pub time_step: f64,
@@ -102,6 +104,7 @@ impl OpenEMS {
             bc_type_set: false,
             pml_size: [0; 6],
             mur_v_ph: [0.0; 6],
+            multi_grid: Vec::new(),
             max_time: 0.0,
             time_step_method: 0,
             time_step: 0.0,
@@ -228,10 +231,129 @@ impl OpenEMS {
         if radii.is_empty() {
             return Err("Invalid multi grid definition".to_string());
         }
-        // Store radii for later use in cylinder multi-grid setup.
-        // The actual grid setup happens in setup_fdtd().
-        let _ = radii;
+        // the radii are written back to the FDTD setup and used by the
+        // cylindrical multi-grid operator during `setup_fdtd()`
+        self.multi_grid = radii.to_vec();
         Ok(())
+    }
+
+    /// The native `<FDTD ...>` element for the current solver settings.
+    pub fn write_fdtd_element(&self) -> String {
+        use crate::fdtd_options::{FdtdExcitation, FdtdWriteSettings};
+        let excitation = match self.excitation.as_deref() {
+            Some(excitation) => match excitation.exc_type {
+                crate::excitation::ExcitationType::Gauss => FdtdExcitation::Gauss {
+                    f0: excitation.f0,
+                    fc: excitation.fc,
+                },
+                crate::excitation::ExcitationType::Sinus => {
+                    FdtdExcitation::Sinus { f0: excitation.f0 }
+                }
+                crate::excitation::ExcitationType::Dirac => FdtdExcitation::Dirac {
+                    f_max: excitation.f_max,
+                },
+                crate::excitation::ExcitationType::Step => FdtdExcitation::Step {
+                    f_max: excitation.f_max,
+                },
+                crate::excitation::ExcitationType::Custom => FdtdExcitation::Custom {
+                    function: excitation
+                        .custom_function()
+                        .unwrap_or_default()
+                        .to_string(),
+                    f0: excitation.f0,
+                    f_max: excitation.f_max,
+                },
+            },
+            None => FdtdExcitation::Gauss { f0: 0.0, fc: 0.0 },
+        };
+        crate::fdtd_options::write_fdtd_element(&FdtdWriteSettings {
+            nr_ts: self.nr_ts,
+            end_criteria: self.end_crit,
+            max_time: self.max_time,
+            over_sampling: self.over_sampling,
+            cell_constant_material: self.cell_constant_material,
+            cylinder_coords: self.cylinder_coords,
+            multi_grid: self.multi_grid.clone(),
+            time_step: self.time_step,
+            time_step_factor: self.time_step_factor,
+            time_step_method: self.time_step_method,
+            bc_type: self.bc_type,
+            pml_size: self.pml_size,
+            mur_phase_velocity: std::array::from_fn(|index| {
+                (self.mur_v_ph[index] > 0.0).then_some(self.mur_v_ph[index])
+            }),
+            excitation,
+        })
+    }
+
+    /// Apply the options of a native `<FDTD>` element (native
+    /// `Parse_XML_FDTDSetup`).
+    pub fn apply_fdtd_options(&mut self, options: &crate::fdtd_options::FdtdOptions) {
+        if let Some(nr_ts) = options.nr_ts {
+            self.nr_ts = nr_ts;
+        }
+        if let Some(end_criteria) = options.end_criteria {
+            self.end_crit = end_criteria;
+        }
+        if let Some(max_time) = options.max_time {
+            self.max_time = max_time;
+        }
+        if let Some(over_sampling) = options.over_sampling {
+            if over_sampling > 1 {
+                self.over_sampling = over_sampling;
+            }
+        }
+        if let Some(cell_constant_material) = options.cell_constant_material {
+            self.cell_constant_material = cell_constant_material;
+        }
+        if let Some(time_step) = options.time_step {
+            self.time_step = time_step;
+        }
+        if let Some(time_step_factor) = options.time_step_factor {
+            self.time_step_factor = time_step_factor;
+        }
+        if let Some(time_step_method) = options.time_step_method {
+            self.time_step_method = time_step_method;
+        }
+        if let Some(coord_system) = options.coord_system {
+            self.cylinder_coords = coord_system == 1;
+        }
+        if let Some(cylinder_coords) = options.cylinder_coords {
+            self.cylinder_coords = cylinder_coords;
+        }
+        if let Some(multi_grid) = &options.multi_grid {
+            self.multi_grid = multi_grid.clone();
+        }
+        if let Some(bc_type) = options.bc_type {
+            self.bc_type = bc_type;
+            self.bc_type_set = true;
+        }
+        if let Some(pml_size) = options.pml_size {
+            self.pml_size = pml_size;
+        }
+        for (index, velocity) in options.mur_phase_velocity.iter().enumerate() {
+            if let Some(velocity) = velocity {
+                self.mur_v_ph[index] = *velocity;
+            }
+        }
+        match &options.excitation {
+            Some(crate::fdtd_options::FdtdExcitation::Gauss { f0, fc }) => {
+                self.set_gauss_excite(*f0, *fc);
+            }
+            Some(crate::fdtd_options::FdtdExcitation::Sinus { f0 }) => {
+                self.set_sinus_excite(*f0);
+            }
+            Some(crate::fdtd_options::FdtdExcitation::Dirac { f_max }) => {
+                self.set_dirac_excite(*f_max);
+            }
+            Some(crate::fdtd_options::FdtdExcitation::Step { f_max }) => {
+                self.set_step_excite(*f_max);
+            }
+            Some(crate::fdtd_options::FdtdExcitation::Custom { function, f0, f_max }) => {
+                self.set_custom_excite(function, *f0, *f_max);
+            }
+            None => {}
+        }
     }
 
     /// Set a Gaussian pulse excitation.

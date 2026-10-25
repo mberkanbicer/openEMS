@@ -447,20 +447,44 @@ class openEMS(_RustOpenEMS):
         return error_code
 
     # -- XML ---------------------------------------------------------------
+    _XML_HEADER = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+
+    def _document(self):
+        """The native `openEMS` input document: `<FDTD>` plus the CSX."""
+        csx = ""
+        if self.__CSX is not None:
+            csx = self.__CSX._live().to_xml_string()
+            if csx.startswith("<?xml"):
+                csx = csx[csx.index("?>") + 2 :]
+        return (
+            self._XML_HEADER
+            + "<openEMS>"
+            + self.fdtd_xml()
+            + csx
+            + "</openEMS>"
+        )
+
     def Write2XML(self, file):
-        self._push_csx_xml()
-        return self.write2xml(str(file))
+        document = self._document()
+        with open(str(file), "w", encoding="utf-8") as handle:
+            handle.write(document)
+        return True
 
     def ReadFromXML(self, file):
-        result = self.read_from_xml(str(file))
-        if result:
-            from CSXCAD import ContinuousStructure
+        with open(str(file), encoding="utf-8") as handle:
+            document = handle.read()
+        self.apply_fdtd_xml(document)
+        self.set_csx_xml(document)
 
-            csx = ContinuousStructure()
-            message = csx.ReadFromXML(str(file))
-            if message == "":
-                self.__CSX = csx
-        return result
+        from CSXCAD import ContinuousStructure
+
+        csx = ContinuousStructure()
+        message = csx.ReadFromXML(str(file))
+        if message != "":
+            print("ReadFromXML: {}".format(message))
+            return False
+        self.__CSX = csx
+        return True
 
     # -- misc --------------------------------------------------------------
     @staticmethod
