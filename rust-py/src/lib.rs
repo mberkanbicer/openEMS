@@ -40,7 +40,7 @@ fn extract_vec_f64<'py>(val: &Bound<'py, PyAny>) -> PyResult<Vec<f64>> {
 /// Python wrapper around the Rust `OpenEMS` solver.
 ///
 /// Mirrors the Cython `cdef class openEMS` from `openEMS.pyx`.
-#[pyclass(unsendable)]
+#[pyclass(unsendable, subclass)]
 pub struct PyOpenEMS {
     inner: OpenEMS,
     csx: Option<Py<PyAny>>,
@@ -440,7 +440,7 @@ impl PyOpenEMS {
 
 /// Python module definition.
 #[pymodule]
-fn openems_py(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _openems(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyOpenEMS>()?;
     m.add("BC_PEC", BC_PEC)?;
     m.add("BC_PMC", BC_PMC)?;
