@@ -1,106 +1,216 @@
 //! Command-line interface for the openEMS FDTD solver.
-//! Mirrors the C++ `openEMS` application entry point.
+//!
+//! Mirrors the native `openEMS <FDTD_XML_FILE> [<options>...]` contract:
+//! the first positional argument is the FDTD input file, the solver options
+//! live in its `<FDTD>` element, and the command line only overrides the
+//! execution-level settings (engine, threads, dumps, debug output).
+//!
+//! Exit codes follow the native entry point: `0` on success, `1` for a parse
+//! or setup failure, and `255` (the native `-1`) when no input file is given.
 
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use openems_core::openems::OpenEMS;
-use openems_core::processing::FieldProbe;
-use std::fs;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
-/// openEMS FDTD solver — command-line interface.
+const USAGE: &str = " Usage: openEMS <FDTD_XML_FILE> [<options>...]";
+
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    name = "openEMS",
+    disable_help_flag = true,
+    disable_version_flag = true,
+    disable_help_subcommand = true
+)]
 struct Args {
-    /// Path to CSXCAD XML geometry file.
-    #[arg(short = 'c', long = "csx")]
-    csx: Option<PathBuf>,
+    /// FDTD XML input file (native `<FDTD>` + `<ContinuousStructure>`).
+    #[arg(value_name = "FDTD_XML_FILE")]
+    xml: Option<PathBuf>,
 
-    /// Number of time steps to run.
-    #[arg(short = 't', long = "timesteps", default_value = "100")]
-    timesteps: u32,
+    /// Show this help message and exit.
+    #[arg(short = 'h', long = "help", action = ArgAction::SetTrue)]
+    help: bool,
 
-    /// End criteria (dB).
-    #[arg(long = "end-crit", default_value = "1e-6")]
-    end_crit: f64,
+    /// Disable all field dumps for a faster simulation.
+    #[arg(long = "disable-dumps")]
+    disable_dumps: bool,
 
-    /// Gaussian pulse center frequency (Hz).
-    #[arg(long = "f0", default_value = "1e9")]
-    f0: f64,
+    /// Dump the material distribution to `material_dump.vtk`.
+    #[arg(long = "debug-material")]
+    debug_material: bool,
 
-    /// Gaussian pulse cutoff frequency (Hz).
-    #[arg(long = "fc", default_value = "5e8")]
-    fc: f64,
+    /// Dump the metal distribution to `PEC_dump.vtk`.
+    #[arg(long = "debug-PEC")]
+    debug_pec: bool,
 
-    /// Boundary condition type for all sides (0=PEC,1=PMC,2=MUR,3=PML).
-    #[arg(long = "bc", default_value = "0")]
-    bc: i32,
+    /// Dump the operator to `operator_dump.vtk`.
+    #[arg(long = "debug-operator")]
+    debug_operator: bool,
 
-    /// PML size (cells) for all sides.
-    #[arg(long = "pml", default_value = "0")]
-    pml: u32,
+    /// Dump the box list to `box_dump_0.vtk`.
+    #[arg(long = "debug-boxes")]
+    debug_boxes: bool,
 
-    /// Add a field probe at X,Y,Z (meters), repeatable.
-    #[arg(long = "probe", value_delimiter = ',')]
-    probe: Option<Vec<f64>>,
+    /// Write the CSX geometry to `debugCSX.xml`.
+    #[arg(long = "debug-CSX")]
+    debug_csx: bool,
 
-    /// Enable verbose output.
-    #[arg(short = 'v', long = "verbose")]
-    verbose: bool,
+    /// Engine selection (accepted for compatibility; the Rust kernel is used).
+    #[arg(long = "engine", default_value = "fastest", value_name = "TYPE")]
+    engine: String,
+
+    /// Force the number of worker threads (0 = automatic).
+    #[arg(long = "numThreads", alias = "num-threads", default_value_t = 0, value_name = "N")]
+    num_threads: i32,
+
+    /// Only run preprocessing; do not simulate.
+    #[arg(long = "no-simulation")]
+    no_simulation: bool,
+
+    /// Write `openEMS_run_stats.txt` and `openEMS_stats.txt`.
+    #[arg(long = "dump-statistics")]
+    dump_statistics: bool,
+
+    /// Evaluate the end criterion on a fixed Nyquist schedule.
+    #[arg(long = "exact-endcriteria")]
+    exact_end_criteria: bool,
+
+    /// Show probe discretization information.
+    #[arg(long = "showProbeDiscretization")]
+    show_probe_discretization: bool,
+
+    /// Dump all fields using the native field components.
+    #[arg(long = "nativeFieldDumps")]
+    native_field_dumps: bool,
+
+    /// Dump all fields using the legacy HDF5 layout.
+    #[arg(long = "legacyHDF5Dumps")]
+    legacy_hdf5_dumps: bool,
+
+    /// Verbose level (repeatable: -v, -vv, -vvv).
+    #[arg(short = 'v', long = "verbose", action = ArgAction::Count)]
+    verbose: u8,
 }
 
-fn main() {
-    let args = Args::parse();
+fn welcome() {
+    println!("--------------------------------------------------------------------------------");
+    println!(" openEMS - Electromagnetic Field Solver (Rust)");
+    println!(" Version: {} (Rust migration)", env!("CARGO_PKG_VERSION"));
+    println!("--------------------------------------------------------------------------------");
+}
 
-    if args.verbose {
-        println!("[openems-cli] Arguments: {:?}", args);
+fn show_options() {
+    println!("{USAGE}");
+    println!();
+    println!("Options:");
+    println!("  -h [ --help ]                 Show this help message and exit");
+    println!("  --disable-dumps               Disable all field dumps for faster simulation");
+    println!("  --debug-material              Dump material distribution to 'material_dump.vtk'");
+    println!("  --debug-PEC                   Dump metal distribution to 'PEC_dump.vtk'");
+    println!("  --debug-operator              Dump operator to 'operator_dump.vtk'");
+    println!("  --debug-boxes                 Dump boxes to 'box_dump_0.vtk'");
+    println!("  --debug-CSX                   Write CSX geometry to 'debugCSX.xml'");
+    println!("  --engine arg                  Engine type: fastest, basic, sse, sse-compressed,");
+    println!("                                multithreaded (default: fastest)");
+    println!("  --numThreads arg              Force the number of worker threads (0 = automatic)");
+    println!("  --no-simulation               Only run preprocessing; do not simulate");
+    println!("  --dump-statistics             Write 'openEMS_run_stats.txt' and 'openEMS_stats.txt'");
+    println!("  --exact-endcriteria           Evaluate the end criterion on a fixed schedule");
+    println!("  --showProbeDiscretization     Show probe discretization information");
+    println!("  --nativeFieldDumps            Dump all fields using the native components");
+    println!("  --legacyHDF5Dumps             Dump all fields using the legacy HDF5 layout");
+    println!("  -v [ --verbose ] arg          Verbose level (1-3), also -v, -vv, -vvv");
+}
+
+fn main() -> ExitCode {
+    welcome();
+
+    let args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    if args.help {
+        show_options();
+        return ExitCode::SUCCESS;
     }
+    let Some(xml_path) = args.xml.as_ref() else {
+        show_options();
+        return ExitCode::from(255);
+    };
+
+    let xml = match std::fs::read_to_string(xml_path) {
+        Ok(xml) => xml,
+        Err(error) => {
+            eprintln!("openEMS - could not read '{}': {error}", xml_path.display());
+            return ExitCode::from(1);
+        }
+    };
 
     let mut sim = OpenEMS::new();
-    sim.set_number_of_time_steps(args.timesteps);
-    sim.set_end_criteria(args.end_crit);
-    sim.set_gauss_excite(args.f0, args.fc);
+    sim.set_csx_xml(xml);
+    sim.set_verbose_level(args.verbose as i32);
+    sim.set_engine(&args.engine);
+    sim.set_enable_dumps(!args.disable_dumps);
+    sim.set_no_simulation(args.no_simulation);
+    sim.set_dump_statistics(args.dump_statistics);
+    sim.set_exact_end_criteria(args.exact_end_criteria);
+    sim.set_debug_dumps(
+        args.debug_material,
+        args.debug_operator,
+        args.debug_boxes,
+        args.debug_pec,
+        args.debug_csx,
+    );
 
-    // Apply boundary condition to all 6 sides.
-    for side in 0..6 {
-        sim.set_bc_type(side, args.bc);
-    }
-    for side in 0..6 {
-        sim.set_pml_size(side, args.pml);
-    }
+    // The native `fastest`/`multithreaded` engines use all available cores;
+    // `basic` keeps the serial kernel. An explicit --numThreads wins.
+    let available = std::thread::available_parallelism()
+        .map(|value| value.get() as i32)
+        .unwrap_or(1);
+    let threads = match args.engine.to_ascii_lowercase().as_str() {
+        "basic" => 1,
+        "sse" | "sse-compressed" => {
+            eprintln!(
+                "openEMS - the SSE engine is not implemented; using the basic Rust kernel"
+            );
+            1
+        }
+        _ => available,
+    };
+    sim.set_number_of_threads(if args.num_threads > 0 {
+        args.num_threads
+    } else {
+        threads
+    });
 
-    // Load CSXCAD geometry if provided.
-    if let Some(csx_path) = &args.csx {
-        let xml = match fs::read_to_string(csx_path) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[openems-cli] Failed to read CSX file '{}': {}", csx_path.display(), e);
-                std::process::exit(1);
-            }
-        };
-        sim.set_csx_xml(xml);
-    }
-
-    // Add field probes if specified.
-    if let Some(probes) = &args.probe {
-        for p in probes.chunks(3) {
-            if p.len() == 3 {
-                let name = format!("probe_{}_{}_{}", p[0], p[1], p[2]);
-                sim.add_processing(Box::new(FieldProbe::new(&name, [p[0], p[1], p[2]])));
-            }
+    if args.show_probe_discretization {
+        if let Some(array) = sim.processing_array.as_ref() {
+            println!("openEMS - probe process intervals: {:?}", array.process_intervals());
+        } else {
+            println!("openEMS - no probes registered");
         }
     }
+    if args.native_field_dumps || args.legacy_hdf5_dumps {
+        eprintln!(
+            "openEMS - the native/legacy dump-layout switches are not applied yet by the \
+             Rust dump layer"
+        );
+    }
 
-    println!("[openems-cli] Setting up FDTD simulation...");
     if !sim.setup_fdtd() {
-        eprintln!("[openems-cli] Setup failed.");
-        std::process::exit(1);
+        eprintln!("openEMS - ParseFDTDSetup failed.");
+        return ExitCode::from(1);
     }
-
-    println!("[openems-cli] Running FDTD simulation ({} timesteps)...", args.timesteps);
+    if args.no_simulation {
+        return ExitCode::SUCCESS;
+    }
     if !sim.run_fdtd() {
-        eprintln!("[openems-cli] Run failed.");
-        std::process::exit(1);
+        eprintln!("openEMS - RunFDTD failed.");
+        return ExitCode::from(1);
     }
-
-    println!("[openems-cli] Simulation complete.");
+    ExitCode::SUCCESS
 }

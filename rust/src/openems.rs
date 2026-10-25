@@ -22,6 +22,17 @@ pub const BC_PMC: i32 = 1;
 pub const BC_MUR: i32 = 2;
 pub const BC_PML: i32 = 3;
 
+/// Statistics of one solver run, used by `--dump-statistics`.
+#[derive(Clone, Debug, Default)]
+pub struct RunStats {
+    pub cells: u64,
+    pub timesteps: u32,
+    pub dt: f64,
+    pub wall_seconds: f64,
+    pub end_change: f64,
+    pub end_criteria: f64,
+}
+
 /// The main openEMS solver class.
 /// Orchestrates the FDTD simulation: parsing setup, building the operator,
 /// creating the engine, and running the time-stepping loop.
@@ -46,6 +57,25 @@ pub struct OpenEMS {
     pub abort: bool,
     pub num_threads: i32,
     pub verbose_level: i32,
+    /// Engine selection (`fastest`, `basic`, `sse`, `sse-compressed`,
+    /// `multithreaded`). Accepted for CLI compatibility; the basic Rust kernel
+    /// is used in all cases and the choice only affects the worker count.
+    pub engine: String,
+    /// Run setup only (`--no-simulation`).
+    pub no_simulation: bool,
+    /// Write `openEMS_stats.txt` and `openEMS_run_stats.txt`.
+    pub dump_statistics: bool,
+    /// Evaluate the energy end criterion on the Nyquist cadence instead of
+    /// every 100 steps (`--exact-endcriteria`).
+    pub exact_end_criteria: bool,
+    /// Debug dumps requested by the native CLI.
+    pub debug_material_dump: bool,
+    pub debug_operator_dump: bool,
+    pub debug_box_dump: bool,
+    pub debug_pec_dump: bool,
+    pub debug_csx_dump: bool,
+    /// Statistics of the last run.
+    pub last_run_stats: Option<RunStats>,
     /// CSXCAD XML geometry string. When set, `setup_fdtd()` parses it via
     /// `Operator::load_csx()` to populate the grid, materials, boundary
     /// conditions and per-cell materials.
@@ -79,6 +109,16 @@ impl OpenEMS {
             abort: false,
             num_threads: 1,
             verbose_level: 0,
+            engine: "fastest".to_string(),
+            no_simulation: false,
+            dump_statistics: false,
+            exact_end_criteria: false,
+            debug_material_dump: false,
+            debug_operator_dump: false,
+            debug_box_dump: false,
+            debug_pec_dump: false,
+            debug_csx_dump: false,
+            last_run_stats: None,
             csx_xml: None,
             processing_array: None,
         }
@@ -262,6 +302,49 @@ impl OpenEMS {
         }
     }
 
+    /// Select the engine (`fastest`, `basic`, `sse`, `sse-compressed`,
+    /// `multithreaded`). Unknown names keep the previous selection.
+    pub fn set_engine(&mut self, engine: &str) {
+        let normalized = engine.to_ascii_lowercase();
+        if matches!(
+            normalized.as_str(),
+            "fastest" | "basic" | "sse" | "sse-compressed" | "multithreaded"
+        ) {
+            self.engine = normalized;
+        }
+    }
+
+    /// Run preprocessing only (`--no-simulation`).
+    pub fn set_no_simulation(&mut self, val: bool) {
+        self.no_simulation = val;
+    }
+
+    /// Write the statistics files after a run.
+    pub fn set_dump_statistics(&mut self, val: bool) {
+        self.dump_statistics = val;
+    }
+
+    /// Evaluate the energy end criterion on the Nyquist cadence.
+    pub fn set_exact_end_criteria(&mut self, val: bool) {
+        self.exact_end_criteria = val;
+    }
+
+    /// Request the native debug dumps.
+    pub fn set_debug_dumps(
+        &mut self,
+        material: bool,
+        operator: bool,
+        boxes: bool,
+        pec: bool,
+        csx: bool,
+    ) {
+        self.debug_material_dump = material;
+        self.debug_operator_dump = operator;
+        self.debug_box_dump = boxes;
+        self.debug_pec_dump = pec;
+        self.debug_csx_dump = csx;
+    }
+
     /// Enable debug material output.
     pub fn debug_material(&mut self) {
         if let Some(ref eng) = self.fdtd_eng {
@@ -346,17 +429,162 @@ impl OpenEMS {
         self.abort
     }
 
+    /// Write the native debug dumps from the finished operator.
+    fn write_debug_dumps(&self, op: &Operator) {
+        use crate::debug_dump;
+
+        let counts = op.base.num_lines;
+        let dims = [counts[0] as usize, counts[1] as usize, counts[2] as usize];
+        let cells = dims[0] * dims[1] * dims[2];
+        let mut disc: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for axis in 0..3 {
+            for index in 0..dims[axis] {
+                disc[axis].push(
+                    op.get_disc_line(axis as i32, index as u32, false) * op.base.grid_delta,
+                );
+            }
+        }
+        let lines: [&[f64]; 3] = [&disc[0], &disc[1], &disc[2]];
+
+        if self.debug_material_dump {
+            if let Some(grid) = &op.material_grid {
+                let mut values = vec![0.0; cells];
+                for index in 0..cells {
+                    values[index] = grid[index].eps_r;
+                }
+                match debug_dump::write_scalar_vtk(
+                    "material_dump.vtk",
+                    "eps_r",
+                    dims,
+                    lines,
+                    &values,
+                ) {
+                    Ok(()) => println!("[openEMS] material written to 'material_dump.vtk'"),
+                    Err(error) => eprintln!("[openEMS] material_dump.vtk failed: {error}"),
+                }
+            }
+        }
+
+        if self.debug_operator_dump {
+            if let Some(vv) = op.vv_ptr.as_ref() {
+                let mut values = vec![0.0; cells];
+                for i in 0..dims[0] {
+                    for j in 0..dims[1] {
+                        for k in 0..dims[2] {
+                            let index = (i * dims[1] + j) * dims[2] + k;
+                            values[index] = *vv.get(0, i, j, k) as f64;
+                        }
+                    }
+                }
+                match debug_dump::write_scalar_vtk(
+                    "operator_dump.vtk",
+                    "vv",
+                    dims,
+                    lines,
+                    &values,
+                ) {
+                    Ok(()) => println!("[openEMS] operator written to 'operator_dump.vtk'"),
+                    Err(error) => eprintln!("[openEMS] operator_dump.vtk failed: {error}"),
+                }
+            }
+        }
+
+        if self.debug_pec_dump {
+            if let (Some(vv), Some(vi)) = (op.vv_ptr.as_ref(), op.vi_ptr.as_ref()) {
+                let mut values = vec![0.0; cells];
+                for i in 0..dims[0] {
+                    for j in 0..dims[1] {
+                        for k in 0..dims[2] {
+                            let index = (i * dims[1] + j) * dims[2] + k;
+                            if *vv.get(0, i, j, k) == 0.0 && *vi.get(0, i, j, k) == 0.0 {
+                                values[index] = 1.0;
+                            }
+                        }
+                    }
+                }
+                match debug_dump::write_scalar_vtk(
+                    "PEC_dump.vtk",
+                    "PEC",
+                    dims,
+                    lines,
+                    &values,
+                ) {
+                    Ok(()) => println!("[openEMS] PEC written to 'PEC_dump.vtk'"),
+                    Err(error) => eprintln!("[openEMS] PEC_dump.vtk failed: {error}"),
+                }
+            }
+        }
+
+        if self.debug_box_dump {
+            if let Some(structure) = op.structure.as_ref() {
+                let params = structure.parameters();
+                let scale = op.base.grid_delta;
+                let mut boxes = Vec::new();
+                for index in 0..structure.property_count() {
+                    let Some(property) = structure.property_by_index(index) else {
+                        continue;
+                    };
+                    for primitive in property.primitives() {
+                        if let Ok(bounds) = primitive.bounding_box(Some(params), false) {
+                            boxes.push([
+                                bounds[0] * scale,
+                                bounds[2] * scale,
+                                bounds[4] * scale,
+                                bounds[1] * scale,
+                                bounds[3] * scale,
+                                bounds[5] * scale,
+                            ]);
+                        }
+                    }
+                }
+                match debug_dump::write_boxes_vtk("box_dump_0.vtk", "boxes", &boxes) {
+                    Ok(()) => println!("[openEMS] boxes written to 'box_dump_0.vtk'"),
+                    Err(error) => eprintln!("[openEMS] box_dump_0.vtk failed: {error}"),
+                }
+            }
+        }
+    }
+
     /// Initialize the FDTD operator from a CSX geometry.
     /// Mirrors C++ `SetupFDTD` (operator setup portion).
     ///
     /// A CSXCAD geometry is required. There is no fabricated fallback grid.
     pub fn setup_fdtd(&mut self) -> bool {
-        let Some(xml) = self.csx_xml.as_deref() else {
+        let Some(xml) = self.csx_xml.clone() else {
             eprintln!("[openEMS] Setup failed: no CSXCAD geometry was provided");
             return false;
         };
+        // Native `ParseFDTDSetup`: solver settings live in the `<FDTD>` element.
+        let options = crate::fdtd_options::parse_fdtd_options(&xml);
+        if let Some(value) = options.nr_ts {
+            self.nr_ts = value;
+        }
+        if let Some(value) = options.end_criteria {
+            self.end_crit = value;
+        }
+        if let Some(value) = options.max_time {
+            self.max_time = value;
+        }
+        if let Some(value) = options.over_sampling {
+            self.over_sampling = value;
+        }
+        if let Some(value) = options.cell_constant_material {
+            self.cell_constant_material = value;
+        }
+        if let Some(value) = options.time_step {
+            self.time_step = value;
+        }
+        if let Some(value) = options.time_step_factor {
+            self.time_step_factor = value;
+        }
+        if let Some(value) = options.time_step_method {
+            self.time_step_method = value;
+        }
+        if let Some(value) = options.coord_system {
+            self.cylinder_coords = value == 1;
+        }
         let mut op = Operator::new();
-        if let Err(error) = op.load_csx(xml) {
+        if let Err(error) = op.load_csx(&xml) {
             eprintln!("[openEMS] Failed to load CSXCAD geometry: {error}");
             return false;
         }
@@ -435,6 +663,21 @@ impl OpenEMS {
         // Apply boundary conditions.
         op.apply_electric_bc();
         op.apply_magnetic_bc();
+
+        // Native debug dumps (`--debug-*`).
+        if self.debug_csx_dump {
+            match std::fs::write("debugCSX.xml", &xml) {
+                Ok(()) => println!("[openEMS] CSX geometry written to 'debugCSX.xml'"),
+                Err(error) => eprintln!("[openEMS] Could not write 'debugCSX.xml': {error}"),
+            }
+        }
+        if self.debug_material_dump
+            || self.debug_operator_dump
+            || self.debug_box_dump
+            || self.debug_pec_dump
+        {
+            self.write_debug_dumps(&op);
+        }
 
         // Build every operator-side extension through one ordered registry,
         // mirroring `Operator::AddExtension` + `BuildExtension`. Physics that
@@ -555,6 +798,11 @@ impl OpenEMS {
         if self.fdtd_eng.is_none() {
             return false;
         }
+        if self.no_simulation {
+            println!("[openEMS] preprocessing only (--no-simulation)");
+            return true;
+        }
+        let started = std::time::Instant::now();
 
         // Invoke PreProcess on all registered processings. The array is taken
         // out so that the field interface can borrow the engine immutably while
@@ -628,6 +876,16 @@ impl OpenEMS {
         let mut ts = 0u32;
         let mut change: f64 = 1.0;
         let mut max_energy: f64 = 0.0;
+        let f_max = self
+            .excitation
+            .as_ref()
+            .map(|signal| signal.f_max)
+            .unwrap_or(0.0);
+        let end_interval = if self.exact_end_criteria && f_max > 0.0 && dt > 0.0 {
+            ((1.0 / f_max / 2.0 / dt).floor() as u32).max(1)
+        } else {
+            100
+        };
 
         while ts < ts_limit && change > end_crit && !self.check_abort_cond() {
             // Execute one timestep (voltage + current updates with extensions).
@@ -652,7 +910,7 @@ impl OpenEMS {
             match self.fdtd_eng.as_ref().unwrap().get_steady_state_diff() {
                 Some(diff) => change = diff as f64,
                 None => {
-                    if ts.is_multiple_of(100) {
+                    if end_interval > 0 && ts.is_multiple_of(end_interval) {
                         let energy = self.fdtd_eng.as_ref().unwrap().fast_energy();
                         if energy > max_energy {
                             max_energy = energy;
@@ -690,7 +948,71 @@ impl OpenEMS {
         }
 
         println!("[openEMS] FDTD simulation completed: {} timesteps.", ts);
+
+        let cells = self
+            .fdtd_eng
+            .as_ref()
+            .map(|engine| engine.op.get_number_cells() as u64)
+            .unwrap_or(0);
+        let stats = RunStats {
+            cells,
+            timesteps: ts,
+            dt,
+            wall_seconds: started.elapsed().as_secs_f64(),
+            end_change: change,
+            end_criteria: end_crit,
+        };
+        if self.dump_statistics {
+            self.write_statistics(&stats);
+        }
+        self.last_run_stats = Some(stats);
+
         true
+    }
+
+    /// Write `openEMS_stats.txt` and `openEMS_run_stats.txt`.
+    fn write_statistics(&self, stats: &RunStats) {
+        let mut setup = String::new();
+        setup.push_str("# openEMS simulation statistics\n");
+        setup.push_str(&format!("cells = {}\n", stats.cells));
+        setup.push_str(&format!("dt = {:.12e}\n", stats.dt));
+        for face in 0..6 {
+            setup.push_str(&format!(
+                "boundary[{}] = {}\n",
+                face,
+                match self.bc_type[face] {
+                    BC_PEC => "PEC",
+                    BC_PMC => "PMC",
+                    BC_MUR => "MUR",
+                    BC_PML => "PML",
+                    _ => "unknown",
+                }
+            ));
+            setup.push_str(&format!("pml_size[{}] = {}\n", face, self.pml_size[face]));
+        }
+        setup.push_str(&format!("over_sampling = {}\n", self.over_sampling));
+        setup.push_str(&format!("engine = {}\n", self.engine));
+
+        let mut run = String::new();
+        run.push_str("# openEMS run statistics\n");
+        run.push_str(&format!("timesteps = {}\n", stats.timesteps));
+        run.push_str(&format!("wall_seconds = {:.6}\n", stats.wall_seconds));
+        run.push_str(&format!("end_change = {:.12e}\n", stats.end_change));
+        run.push_str(&format!("end_criteria = {:.12e}\n", stats.end_criteria));
+        run.push_str(&format!(
+            "end_criteria_dB = {:.3}\n",
+            -10.0 * stats.end_change.max(f64::MIN_POSITIVE).log10()
+        ));
+
+        for (name, contents) in [
+            ("openEMS_stats.txt", setup),
+            ("openEMS_run_stats.txt", run),
+        ] {
+            match std::fs::write(name, contents) {
+                Ok(()) => println!("[openEMS] statistics written to '{name}'"),
+                Err(error) => eprintln!("[openEMS] could not write '{name}': {error}"),
+            }
+        }
     }
 }
 
