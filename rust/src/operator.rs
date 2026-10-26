@@ -207,6 +207,10 @@ pub struct Operator {
     /// A cylindrical mesh that includes the `rho = 0` axis (native
     /// `CC_R0_included`).
     pub r0_included: bool,
+    /// Per-z metal flag for the `rho = 0` axis (native `GetPropertyByCoordPriority`).
+    pub r0_axis_metal: Vec<bool>,
+    /// Per-z `(vv, vi)` update coefficients of the `rho = 0` Ez edge.
+    pub r0_pairs: Vec<(FDTD_FLOAT, FDTD_FLOAT)>,
 }
 
 impl Operator {
@@ -226,6 +230,8 @@ impl Operator {
             structure: None,
             mesh_type: MeshType::Cartesian,
             r0_included: false,
+            r0_axis_metal: Vec::new(),
+            r0_pairs: Vec::new(),
         }
     }
 
@@ -245,9 +251,9 @@ impl Operator {
     }
 
     /// Build the azimuthal seam extension of a cylindrical mesh.
-    /// Mirrors `Operator_Ext_Cylinder::CreateEngineExtention`; the `rho = 0`
-    /// axis update is not reachable because such meshes are rejected in
-    /// `load_csx` (RM-137).
+    ///
+    /// Mirrors `Operator_Ext_Cylinder::CreateEngineExtention`, including the
+    /// `rho = 0` axis coefficients computed by [`Self::build_r0_coefficients`].
     pub fn build_cylinder_extension(&self) -> Option<crate::extensions::EngineExtCylinder> {
         if !self.is_cylindrical() {
             return None;
@@ -259,7 +265,112 @@ impl Operator {
         ]);
         extension.set_closed_alpha(self.closed_alpha());
         extension.set_r0_included(self.r0_included);
+        if let Some(pairs) = self.r0_coefficients() {
+            for (k, (vv, vi)) in pairs.iter().enumerate() {
+                extension.set_r0_coeffs(k, *vv, *vi);
+            }
+        }
         Some(extension)
+    }
+
+    /// Native `Operator_Ext_Cylinder::BuildExtension` (the `rho = 0` axis).
+    ///
+    /// At the axis every azimuthal sector shares a single `Ez` edge, so their
+    /// capacitances and conductances are summed into one pair of update
+    /// coefficients. `E_alpha` is forced to zero and `Ez` is copied to all
+    /// azimuths by the engine extension. Must run after `apply_electric_bc`,
+    /// exactly like native (`ApplyElectricBC` precedes the extension setup).
+    pub fn build_r0_coefficients(&mut self) {
+        if !self.r0_included || !self.is_cylindrical() {
+            return;
+        }
+        let counts = self.base.num_lines;
+        let nx = counts[0] as usize;
+        let ny = counts[1] as usize;
+        let nz = counts[2] as usize;
+        if nx == 0 || ny == 0 || nz == 0 {
+            return;
+        }
+        let dt = self.base.d_t;
+        let metric = MeshMetric::new(
+            &self.base.disc_lines,
+            counts,
+            self.base.grid_delta,
+            self.mesh_type,
+        );
+        let material_grid = self.material_grid.as_ref();
+        let bg_eps_r = self.base.m_bg_eps_r;
+        let bg_kappa = self.base.m_bg_kappa;
+
+        let mut pairs = Vec::with_capacity(nz);
+        for k in 0..nz {
+            let mut capacity = 0.0f64;
+            let mut conductance = 0.0f64;
+            // Native loops `pos[1] < GetNumberOfLines(1,true) - 2`, one term
+            // per azimuthal sector.
+            for j in 0..ny.saturating_sub(2) {
+                let (eps_r, kappa) = match material_grid {
+                    Some(grid) => {
+                        let index = Self::ec_index(2, 0, j, k, counts);
+                        match grid.get(index) {
+                            Some(material) => (material.eps_r, material.kappa),
+                            None => (bg_eps_r, bg_kappa),
+                        }
+                    }
+                    None => (bg_eps_r, bg_kappa),
+                };
+                let area = metric.edge_area(2, [0, j, k], false);
+                let delta = metric.edge_length(2, [0, j, k], false);
+                if delta > 0.0 {
+                    capacity += eps_r * EPS0 * area / delta;
+                    conductance += kappa * area / delta;
+                }
+            }
+
+            // Native `SetVV(2,0,0,k,1)`: the regular update only carries the
+            // old value, the extension applies the summed coefficients.
+            if let Some(vv) = self.vv_ptr.as_mut() {
+                *vv.get_mut(2, 0, 0, k) = 1.0;
+            }
+
+            // Share the summed C/G over every azimuthal copy of the axis edge.
+            let index = Self::ec_index(2, 0, 0, k, counts);
+            for i in 0..ny {
+                let index = Self::ec_index(2, 0, i, k, counts);
+                if index < self.ec_c.len() {
+                    self.ec_c[index] = capacity as FDTD_FLOAT;
+                    self.ec_g[index] = conductance as FDTD_FLOAT;
+                }
+            }
+
+            let metal = self.r0_axis_metal.get(k).copied().unwrap_or(false);
+            if metal || capacity <= 0.0 {
+                // Native zeroes only the axis entry itself (metal axis = PEC).
+                if let Some(vv) = self.vv_ptr.as_mut() {
+                    *vv.get_mut(2, 0, 0, k) = 0.0;
+                }
+                if index < self.ec_c.len() {
+                    self.ec_c[index] = 0.0;
+                    self.ec_g[index] = 0.0;
+                }
+                pairs.push((0.0, 0.0));
+                continue;
+            }
+            let denom = 1.0 + dt * conductance / (2.0 * capacity);
+            let vv_r0 = ((1.0 - dt * conductance / (2.0 * capacity)) / denom) as FDTD_FLOAT;
+            let vi_r0 = ((dt / capacity) / denom) as FDTD_FLOAT;
+            pairs.push((vv_r0, vi_r0));
+        }
+        self.r0_pairs = pairs;
+    }
+
+    /// Per-z `(vv, vi)` pairs produced by [`Self::build_r0_coefficients`].
+    pub fn r0_coefficients(&self) -> Option<&[(FDTD_FLOAT, FDTD_FLOAT)]> {
+        if self.r0_pairs.is_empty() {
+            None
+        } else {
+            Some(&self.r0_pairs)
+        }
     }
 
     /// True for a full `2*pi` azimuthal mesh with a duplicated seam plane.
@@ -431,14 +542,10 @@ impl Operator {
                 structure.grid_mut().add_line(1, padded + (second - first));
                 num_lines[1] = grid_lines[1].len() as u32;
             }
+            // Native `Operator_Cylinder::SetupCSXGrid`: `rho = 0` on a closed
+            // azimuth is the axis, which needs the dedicated `Ez` update
+            // (`Operator_Ext_Cylinder`, implemented in `build_r0_coefficients`).
             r0_included = grid_lines[0][0] == 0.0 && closed_alpha;
-            if r0_included {
-                return Err(
-                    "cylindrical mesh: a mesh that includes the rho = 0 axis needs the \
-                     dedicated axis update, which is not ported yet (RM-137)"
-                        .to_string(),
-                );
-            }
             mesh_type = MeshType::Cylindrical { closed_alpha };
         }
         self.mesh_type = mesh_type;
@@ -770,6 +877,28 @@ impl Operator {
             }
         }
 
+        // Native `Operator_Ext_Cylinder::BuildExtension`: a metal property
+        // covering the axis turns the `rho = 0` Ez edge into PEC. The lookup
+        // must honour property priorities, so it reuses the same sampler.
+        let r0_axis_metal = if r0_included {
+            let nz = num_lines_usize[2];
+            (0..nz)
+                .map(|k| {
+                    let coordinate = [
+                        0.0,
+                        0.0,
+                        disc_lines[2].as_ref().map(|l| l[k]).unwrap_or(0.0),
+                    ];
+                    sample(coordinate)
+                        .map(|material| material.is_pec)
+                        .unwrap_or(false)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.r0_axis_metal = r0_axis_metal;
+
         self.init_data_storage(num_lines_usize);
         self.material_grid = Some(material_grid);
         self.structure = Some(structure);
@@ -945,7 +1074,17 @@ impl Operator {
     /// Mirrors C++ `CalcTimestep`: method 3 selects `Rennings_2` (Var3, the
     /// largest stable step for rectilinear meshes), everything else Var1.
     pub fn calc_timestep(&mut self) -> f64 {
-        if self.base.m_time_step_var == 3 {
+        // Native `Operator_Cylinder::CalcTimestep`: a mesh that includes the
+        // rho = 0 singularity forces the conservative `Rennings_1` step.
+        let r0_singular = self.is_cylindrical()
+            && self
+                .base
+                .disc_lines[0]
+                .as_ref()
+                .and_then(|lines| lines.first())
+                .copied()
+                == Some(0.0);
+        if self.base.m_time_step_var == 3 && !r0_singular {
             return self.calc_timestep_var3();
         }
         self.calc_timestep_var1()
@@ -5511,7 +5650,7 @@ mod coordinate_system_tests {
     }
 
     #[test]
-    fn cylindrical_negative_rho_and_open_axis_are_rejected() {
+    fn cylindrical_negative_rho_is_rejected() {
         let mut op = Operator::new();
         let error = op
             .load_csx(&cylindrical_mesh(
@@ -5520,14 +5659,58 @@ mod coordinate_system_tests {
             ))
             .expect_err("negative rho must be rejected");
         assert!(error.contains("negative rho"), "{error}");
+    }
+
+    /// Native `Operator_Cylinder::SetupCSXGrid`: `rho = 0` is only the axis on a
+    /// closed azimuth; with an open azimuth it is an ordinary PEC boundary.
+    #[test]
+    fn cylindrical_rho_zero_axis_is_accepted() {
+        let mut op = Operator::new();
+        op.load_csx(&cylindrical_mesh(
+            "0,1,2,3,4",
+            "0,1.5707963267948966,3.141592653589793,4.71238898038469,6.283185307179586",
+        ))
+        .expect("a closed mesh with the rho = 0 axis must load");
+        assert!(op.is_cylindrical());
+        assert!(op.closed_alpha());
+        assert!(op.r0_included);
 
         let mut op = Operator::new();
-        let error = op
+        op.load_csx(&cylindrical_mesh("0,1,2,3,4", "0,0.5,1.0,1.5"))
+            .expect("an open mesh starting at rho = 0 must load");
+        assert!(op.is_cylindrical());
+        assert!(!op.closed_alpha());
+        assert!(!op.r0_included, "an open azimuth has no special axis update");
+    }
+
+    /// Native `Operator_Cylinder::CalcTimestep` forces the conservative
+    /// `Rennings_1` step for a mesh that includes the `rho = 0` singularity.
+    #[test]
+    fn cylindrical_r0_uses_the_conservative_timestep() {
+        let mut op = Operator::new();
+        op.load_csx(&cylindrical_mesh(
+            "0,1,2,3,4",
+            "0,1.5707963267948966,3.141592653589793,4.71238898038469,6.283185307179586",
+        ))
+        .expect("closed r0 mesh");
+        op.base.m_time_step_var = 3;
+        let dt = op.calc_timestep();
+        assert!(dt > 0.0 && dt.is_finite(), "dt {dt}");
+        // The conservative step must not exceed the plain 3-D CFL estimate.
+        let cfl = 1.0 / (C0 * (2.0e6_f64).sqrt());
+        assert!(dt <= cfl, "dt {dt} exceeds the CFL bound {cfl}");
+
+        // The same mesh without the axis keeps the Rennings_2 step, which is
+        // larger than Rennings_1.
+        let mut shifted = Operator::new();
+        shifted
             .load_csx(&cylindrical_mesh(
-                "0,1,2,3,4",
+                "1,2,3,4,5",
                 "0,1.5707963267948966,3.141592653589793,4.71238898038469,6.283185307179586",
             ))
-            .expect_err("a rho = 0 axis must be rejected until RM-137 is ported");
-        assert!(error.contains("rho = 0"), "{error}");
+            .expect("shifted mesh");
+        shifted.base.m_time_step_var = 3;
+        let dt_shifted = shifted.calc_timestep();
+        assert!(dt_shifted > dt, "Rennings_2 {dt_shifted} vs Rennings_1 {dt}");
     }
 }

@@ -143,7 +143,11 @@ impl OpenEMS {
 
     /// Set the end criteria.
     pub fn set_end_criteria(&mut self, val: f64) {
-        self.end_crit = val;
+        // Native keeps the default for a non-positive criteria
+        // (`openems.cpp` maps `endCriteria == 0` to 1e-6).
+        if val > 0.0 {
+            self.end_crit = val;
+        }
     }
 
     /// Enable or disable dumps.
@@ -881,6 +885,11 @@ impl OpenEMS {
         op.apply_electric_bc();
         op.apply_magnetic_bc();
 
+        // Native `Operator_Ext_Cylinder::BuildExtension` runs after the
+        // electric BC (which zeroes the axis edges) and installs the summed
+        // rho = 0 coefficients.
+        op.build_r0_coefficients();
+
         // Native debug dumps (`--debug-*`).
         if self.debug_csx_dump {
             match std::fs::write("debugCSX.xml", &xml) {
@@ -1001,10 +1010,11 @@ impl OpenEMS {
         }
         if op.is_cylindrical() && self.verbose_level > 0 {
             println!(
-                "[openEMS] cylindrical mesh: rho = {:?}..{:?}, alpha closed = {}",
+                "[openEMS] cylindrical mesh: rho = {:?}..{:?}, alpha closed = {}, r0 axis = {}",
                 op.base.disc_lines[0].as_ref().and_then(|l| l.first()),
                 op.base.disc_lines[0].as_ref().and_then(|l| l.last()),
-                op.closed_alpha()
+                op.closed_alpha(),
+                op.r0_included
             );
         }
 
@@ -1017,6 +1027,19 @@ impl OpenEMS {
         }
         self.fdtd_eng = Some(Box::new(engine));
         self.fdtd_op = None; // operator is owned by the engine
+
+        // Native `openems.cpp` writes the sampled excitation waveforms (`et`,
+        // `ht`) before `SetupProcessing`; a probe that reuses those names then
+        // truncates the file when it is initialised.
+        if self.enable_dumps {
+            let dt = self
+                .fdtd_eng
+                .as_ref()
+                .expect("engine checked above")
+                .op
+                .get_timestep();
+            self.dump_excitation_signals(dt);
+        }
 
         // Native `SetupProcessing`: every `ProbeBox` and `DumpBox` property
         // becomes a processing object that streams its data to a file.
@@ -1557,18 +1580,6 @@ fn build_sar_cell_data(
             return true;
         }
         let started = std::time::Instant::now();
-
-        // Native `RunFDTD`: dump the sampled excitation waveforms (`et`,
-        // `ht`) before the time loop.
-        if self.enable_dumps {
-            let dt = self
-                .fdtd_eng
-                .as_ref()
-                .expect("engine checked above")
-                .op
-                .get_timestep();
-            self.dump_excitation_signals(dt);
-        }
 
         // Invoke PreProcess on all registered processings. The array is taken
         // out so that the field interface can borrow the engine immutably while
