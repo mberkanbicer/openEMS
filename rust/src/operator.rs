@@ -886,6 +886,7 @@ impl Operator {
                             *ii.get_mut(n, i, j, k) = 0.0;
                             *iv.get_mut(n, i, j, k) = 0.0;
                         }
+
                     }
                 }
             }
@@ -1192,58 +1193,65 @@ impl Operator {
             .get_mut(n, i, j, k) = vi;
     }
 
-    /// Apply magnetic boundary conditions (PMC): zero the tangential current
-    /// coefficients on PMC faces. The normal component is untouched, matching
-    /// native `ApplyMagneticBC`.
+    /// Apply magnetic boundary conditions (PMC), mirroring native
+    /// `Operator::ApplyMagneticBC` exactly:
+    ///
+    /// * a PMC face on the low side clears all three current components on the
+    ///   face line,
+    /// * a PMC face on the high side clears the two tangential components on
+    ///   the line *inside* the outermost one (`numLines - 2`),
+    /// * the outermost current line of every axis is always cleared because it
+    ///   lies outside the iterated FDTD domain.
+    ///
+    /// The unconditional last-line pass is part of native's loop body, so it
+    /// runs whenever the PMC mask is built (i.e. always).
     pub fn apply_magnetic_bc(&mut self) {
+        let bc = self.base.m_bc;
+        let counts = self.base.num_lines;
+
         let ii = self.ii_ptr.as_mut().expect("ii_ptr not allocated");
         let iv = self.iv_ptr.as_mut().expect("iv_ptr not allocated");
-        let bc = self.base.m_bc;
+        let dims = [ii.ni(), ii.nj(), ii.nk()];
 
-        let nx = ii.ni();
-        let ny = ii.nj();
-        let nz = ii.nk();
+        for n in 0..3 {
+            let np = (n + 1) % 3;
+            let npp = (n + 2) % 3;
+            let lines = counts[n] as usize;
+            if lines == 0 {
+                continue;
+            }
+            let last = lines - 1;
+            for a in 0..dims[np] {
+                for b in 0..dims[npp] {
+                    let mut pos = [0usize; 3];
+                    pos[np] = a;
+                    pos[npp] = b;
 
-        // PMC = 1. Only the two tangential components are forced to zero.
-        for &(face, i) in &[(0usize, 0usize), (1usize, nx.saturating_sub(1))] {
-            if bc[face] != 1 {
-                continue;
-            }
-            for n in [1usize, 2] {
-                for j in 0..ny {
-                    for k in 0..nz {
-                        *ii.get_mut(n, i, j, k) = 0.0;
-                        *iv.get_mut(n, i, j, k) = 0.0;
+                    if bc[2 * n] == 1 {
+                        pos[n] = 0;
+                        for component in [n, np, npp] {
+                            Self::clear_current_line(ii, iv, component, pos);
+                        }
+                    }
+                    if bc[2 * n + 1] == 1 && last >= 1 {
+                        pos[n] = last - 1;
+                        for component in [np, npp] {
+                            Self::clear_current_line(ii, iv, component, pos);
+                        }
+                    }
+                    pos[n] = last;
+                    for component in [n, np, npp] {
+                        Self::clear_current_line(ii, iv, component, pos);
                     }
                 }
             }
         }
-        for &(face, j) in &[(2usize, 0usize), (3usize, ny.saturating_sub(1))] {
-            if bc[face] != 1 {
-                continue;
-            }
-            for n in [0usize, 2] {
-                for i in 0..nx {
-                    for k in 0..nz {
-                        *ii.get_mut(n, i, j, k) = 0.0;
-                        *iv.get_mut(n, i, j, k) = 0.0;
-                    }
-                }
-            }
-        }
-        for &(face, k) in &[(4usize, 0usize), (5usize, nz.saturating_sub(1))] {
-            if bc[face] != 1 {
-                continue;
-            }
-            for n in [0usize, 1] {
-                for i in 0..nx {
-                    for j in 0..ny {
-                        *ii.get_mut(n, i, j, k) = 0.0;
-                        *iv.get_mut(n, i, j, k) = 0.0;
-                    }
-                }
-            }
-        }
+    }
+
+    /// Clear the `ii`/`iv` update coefficients of one current line.
+    fn clear_current_line(ii: &mut FieldArray, iv: &mut FieldArray, n: usize, pos: [usize; 3]) {
+        *ii.get_mut(n, pos[0], pos[1], pos[2]) = 0.0;
+        *iv.get_mut(n, pos[0], pos[1], pos[2]) = 0.0;
     }
 
     // ----- private helpers -----
@@ -4308,7 +4316,7 @@ mod tests {
     }
 
     #[test]
-    fn pmc_boundary_zeroes_only_tangential_components() {
+    fn pmc_boundary_matches_the_native_magnetic_bc() {
         let mut op = Operator::new();
         op.base.grid_delta = 1e-3;
         op.base.d_t = 1.0e-12;
@@ -4318,18 +4326,28 @@ mod tests {
         op.apply_magnetic_bc();
 
         let ii = op.ii_ptr.as_ref().unwrap();
-        // x-min face at (0,2,2): Hy and Hz are tangential, Hx is normal.
-        assert_eq!(*ii.get(1, 0, 2, 2), 0.0);
-        assert_eq!(*ii.get(2, 0, 2, 2), 0.0);
-        assert!(*ii.get(0, 0, 2, 2) > 0.0);
-        // y-min face at (2,0,2): Hx and Hz are tangential, Hy is normal.
-        assert_eq!(*ii.get(0, 2, 0, 2), 0.0);
-        assert_eq!(*ii.get(2, 2, 0, 2), 0.0);
-        assert!(*ii.get(1, 2, 0, 2) > 0.0);
-        // z-min face at (2,2,0): Hx and Hy are tangential, Hz is normal.
-        assert_eq!(*ii.get(0, 2, 2, 0), 0.0);
-        assert_eq!(*ii.get(1, 2, 2, 0), 0.0);
-        assert!(*ii.get(2, 2, 2, 0) > 0.0);
+        // Native `ApplyMagneticBC` clears *all three* current components on a
+        // low PMC face, and the first inner line keeps its coefficients.
+        for n in 0..3 {
+            assert_eq!(*ii.get(n, 0, 2, 2), 0.0);
+            assert!(*ii.get(n, 1, 2, 2) > 0.0);
+        }
+        // On the high face only the tangential components are cleared, and on
+        // the line inside the outermost one (numLines - 2 = 3).
+        assert_eq!(*ii.get(1, 3, 2, 2), 0.0);
+        assert_eq!(*ii.get(2, 3, 2, 2), 0.0);
+        assert!(*ii.get(0, 3, 2, 2) > 0.0);
+        // The outermost line always lies outside the iterated domain.
+        for n in 0..3 {
+            assert_eq!(*ii.get(n, 4, 2, 2), 0.0);
+            assert_eq!(*ii.get(n, 2, 4, 2), 0.0);
+            assert_eq!(*ii.get(n, 2, 2, 4), 0.0);
+        }
+        // Low faces of the other axes follow the same rule.
+        for n in 0..3 {
+            assert_eq!(*ii.get(n, 2, 0, 2), 0.0);
+            assert_eq!(*ii.get(n, 2, 2, 0), 0.0);
+        }
     }
 
     #[test]
