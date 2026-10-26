@@ -1129,6 +1129,7 @@ impl OpenEMS {
                         processing.set_dump_mode_value(dump.dump_mode());
                         processing.set_legacy_format(self.legacy_hdf5_dumps);
                         processing.set_process_interval(interval);
+                        processing.set_fd_nyquist(nyquist);
                         // native: FD dumps default to the plain Nyquist rate
                         let fd_over = if dump.oversampling() >= 0 {
                             dump.oversampling().max(1) as u32
@@ -1180,6 +1181,7 @@ impl OpenEMS {
                         processing.set_sar_method(dump.sar_method());
                         processing.set_legacy_format(self.legacy_hdf5_dumps);
                         processing.set_process_interval(interval);
+                        processing.set_fd_nyquist(nyquist);
                         let fd_over = if dump.oversampling() >= 0 {
                             dump.oversampling().max(1) as u32
                         } else {
@@ -1225,6 +1227,7 @@ impl OpenEMS {
                         processing.set_sar_method(dump.sar_method());
                         processing.set_legacy_format(self.legacy_hdf5_dumps);
                         processing.set_process_interval(interval);
+                        processing.set_fd_nyquist(nyquist);
                         let fd_over = if dump.oversampling() >= 0 {
                             dump.oversampling().max(1) as u32
                         } else {
@@ -1519,6 +1522,7 @@ fn build_sar_cell_data(
                 processing.set_weight(probe.weight());
                 processing.set_normal_dir(probe.normal_direction());
                 processing.set_process_interval(interval);
+                processing.set_fd_nyquist(nyquist);
                 processing.add_frequencies(probe.fd_samples());
                 let oversampling = probe.oversampling();
                 if oversampling > 0 {

@@ -1475,6 +1475,9 @@ pub struct ProcessFieldsFD {
     legacy_fmt: bool,
     /// Cached reduced mesh indices.
     indices: Option<[Vec<usize>; 3]>,
+    /// Nyquist step count of the highest excited frequency (native
+    /// `m_FD_Nyquist`); caps the per-frequency DFT interval.
+    fd_nyquist: u32,
 }
 
 impl ProcessFieldsFD {
@@ -1504,7 +1507,14 @@ impl ProcessFieldsFD {
             dump_mode: 0,
             legacy_fmt: false,
             indices: None,
+            fd_nyquist: 0,
         }
+    }
+
+    /// Cap the DFT interval at the excitation Nyquist, as native
+    /// `Processing::AddFrequency` does (`m_FD_Nyquist = min(global, freq)`).
+    pub fn set_fd_nyquist(&mut self, nyquist: u32) {
+        self.fd_nyquist = nyquist;
     }
 
     /// Restrict the dump to a box (metres), native `DefineStartStopCoord`.
@@ -1626,9 +1636,16 @@ impl ProcessFieldsFD {
             self.fd_interval = 1;
             return;
         }
-        let nyquist_steps = 1.0 / (2.0 * highest * dt);
-        let oversampling = self.fd_oversampling.max(1) as f64;
-        self.fd_interval = ((nyquist_steps / oversampling).round() as u32).max(1);
+        // Native `Processing::AddFrequency`: the DFT interval is capped by the
+        // Nyquist step count of the highest excited frequency.
+        let frequency_nyquist = (1.0 / (2.0 * highest * dt)).floor() as u32;
+        let nyquist = if self.fd_nyquist > 0 {
+            frequency_nyquist.min(self.fd_nyquist)
+        } else {
+            frequency_nyquist
+        };
+        let oversampling = self.fd_oversampling.max(1);
+        self.fd_interval = (nyquist / oversampling).max(1);
     }
 
     fn ensure_accumulators(&mut self, dims: [usize; 3]) {
@@ -1906,12 +1923,17 @@ impl ProcessFieldsFD {
     fn dump_vtk(&mut self, dims: [usize; 3]) {
         let field_name = Self::get_field_name_by_type(self.dump_type);
         let [nx, ny, nz] = dims;
-        let coordinates: [Vec<f64>; 3] = [
-            (0..nx).map(|index| index as f64).collect(),
-            (0..ny).map(|index| index as f64).collect(),
-            (0..nz).map(|index| index as f64).collect(),
-        ];
-        let coordinate_refs: [&[f64]; 3] = [&coordinates[0], &coordinates[1], &coordinates[2]];
+        // Native `VTK_File_Writer` uses the real mesh lines, not the index.
+        let coordinates: [Vec<f64>; 3] = self
+            .disc_lines
+            .clone()
+            .unwrap_or_else(|| {
+                [
+                    (0..nx).map(|index| index as f64).collect(),
+                    (0..ny).map(|index| index as f64).collect(),
+                    (0..nz).map(|index| index as f64).collect(),
+                ]
+            });
         for (index, frequency) in self.frequencies.iter().enumerate() {
             let re = &self.acc_re[index];
             let im = &self.acc_im[index];
@@ -1932,10 +1954,20 @@ impl ProcessFieldsFD {
                     }
                 }
             }
-            let _ = VTKFileWriter::new(&format!("{}_f={label}_abs", self.name))
-                .write_structured_grid(&field_name, dims, coordinate_refs, &magnitude);
-            let _ = VTKFileWriter::new(&format!("{}_f={label}_arg", self.name))
-                .write_structured_grid(&field_name, dims, coordinate_refs, &phase);
+            let _ = write_rectilinear_vtr(
+                &format!("{}_f={label}_abs", self.name),
+                &field_name,
+                dims,
+                &coordinates,
+                &magnitude,
+            );
+            let _ = write_rectilinear_vtr(
+                &format!("{}_f={label}_arg", self.name),
+                &field_name,
+                dims,
+                &coordinates,
+                &phase,
+            );
 
             // 21 phase snapshots, matching the native VTK FD dump.
             for step in 0..21 {
@@ -1957,14 +1989,77 @@ impl ProcessFieldsFD {
                     }
                 }
                 let degrees = (angle * 180.0 / std::f64::consts::PI).round() as i32;
-                let _ = VTKFileWriter::new(&format!(
-                    "{}_f={label}_p={degrees:03}",
-                    self.name
-                ))
-                .write_structured_grid(&field_name, dims, coordinate_refs, &snapshot);
+                let _ = write_rectilinear_vtr(
+                    &format!("{}_f={label}_p={degrees:03}", self.name),
+                    &field_name,
+                    dims,
+                    &coordinates,
+                    &snapshot,
+                );
             }
         }
     }
+}
+
+/// Write a rectilinear grid as a VTK XML `.vtr` file (native
+/// `VTK_File_Writer` with `vtkXMLRectilinearGridWriter`).
+///
+/// `values` holds three components in the `(n, i, j, k)` layout used by the
+/// field arrays; the VTK point order is x-fastest, so the data is transposed on
+/// the way out.
+fn write_rectilinear_vtr(
+    prefix: &str,
+    field_name: &str,
+    dims: [usize; 3],
+    lines: &[Vec<f64>; 3],
+    values: &FieldArray,
+) -> std::io::Result<()> {
+    let [nx, ny, nz] = dims;
+    let mut text = String::new();
+    text.push_str("<?xml version=\"1.0\"?>\n");
+    text.push_str(
+        "<VTKFile type=\"RectilinearGrid\" version=\"0.1\" byte_order=\"LittleEndian\">\n",
+    );
+    text.push_str(&format!(
+        "  <RectilinearGrid WholeExtent=\"0 {} 0 {} 0 {}\">\n",
+        nx.saturating_sub(1),
+        ny.saturating_sub(1),
+        nz.saturating_sub(1)
+    ));
+    text.push_str(&format!(
+        "    <Piece Extent=\"0 {} 0 {} 0 {}\">\n",
+        nx.saturating_sub(1),
+        ny.saturating_sub(1),
+        nz.saturating_sub(1)
+    ));
+    text.push_str("      <PointData>\n");
+    for (n, name) in ["X", "Y", "Z"].iter().enumerate() {
+        text.push_str(&format!(
+            "        <DataArray type=\"Float32\" Name=\"{field_name}_{name}\" NumberOfComponents=\"1\" format=\"ascii\">\n          ",
+        ));
+        for i in 0..nx {
+            for j in 0..ny {
+                for k in 0..nz {
+                    text.push_str(&format!("{:e} ", values.get(n, i, j, k)));
+                }
+            }
+        }
+        text.push_str("\n        </DataArray>\n");
+    }
+    text.push_str("      </PointData>\n");
+    text.push_str("      <Coordinates>\n");
+    for (axis, name) in ["x", "y", "z"].iter().enumerate() {
+        text.push_str(&format!(
+            "        <DataArray type=\"Float64\" Name=\"{name}\" format=\"ascii\">\n          ",
+        ));
+        for value in &lines[axis] {
+            text.push_str(&format!("{value:e} "));
+        }
+        text.push_str("\n        </DataArray>\n");
+    }
+    text.push_str("      </Coordinates>\n");
+    text.push_str("    </Piece>\n  </RectilinearGrid>\n</VTKFile>\n");
+    std::fs::write(format!("{prefix}.vtr"), text)
 }
 
 /// Per-cell material data needed by the SAR dumps
@@ -2011,6 +2106,8 @@ pub struct ProcessFieldsSAR {
     dump_mode: i32,
     /// Native `SAR_Method` averaging method (`Simple` by default).
     sar_method: String,
+    /// Nyquist step count of the highest excited frequency.
+    fd_nyquist: u32,
     sample_count: u32,
     initialized: bool,
 }
@@ -2037,6 +2134,7 @@ impl ProcessFieldsSAR {
             j_acc_im: Vec::new(),
             dump_mode: 2,
             sar_method: "Simple".to_string(),
+            fd_nyquist: 0,
             sample_count: 0,
             initialized: false,
         }
@@ -2066,6 +2164,11 @@ impl ProcessFieldsSAR {
 
     pub fn set_legacy_format(&mut self, legacy: bool) {
         self.legacy_fmt = legacy;
+    }
+
+    /// Cap the DFT interval at the excitation Nyquist.
+    pub fn set_fd_nyquist(&mut self, nyquist: u32) {
+        self.fd_nyquist = nyquist;
     }
 
     /// Select the native averaging method used by the result dumps.
@@ -2160,9 +2263,14 @@ impl ProcessFieldsSAR {
             self.fd_interval = 1;
             return;
         }
-        let nyquist_steps = 1.0 / (2.0 * highest * dt);
-        let oversampling = self.fd_oversampling.max(1) as f64;
-        self.fd_interval = ((nyquist_steps / oversampling).round() as u32).max(1);
+        let frequency_nyquist = (1.0 / (2.0 * highest * dt)).floor() as u32;
+        let nyquist = if self.fd_nyquist > 0 {
+            frequency_nyquist.min(self.fd_nyquist)
+        } else {
+            frequency_nyquist
+        };
+        let oversampling = self.fd_oversampling.max(1);
+        self.fd_interval = (nyquist / oversampling).max(1);
     }
 
     fn ensure_accumulators(&mut self, dims: [usize; 3]) {
@@ -2902,7 +3010,7 @@ fn compute_dump_indices(
             meta.disc_lines[axis][index]
         }
     };
-    let (first, last) = match bounds {
+    let (mut first, mut last) = match bounds {
         Some((start, stop)) => {
             let low = meta.snap_to_mesh_line(axis, start[axis], dual_mesh, true);
             let high = meta.snap_to_mesh_line(axis, stop[axis], dual_mesh, true);
@@ -2910,6 +3018,27 @@ fn compute_dump_indices(
         }
         None => (0, count - 1),
     };
+    // Native `SnapBox2Mesh` with `SnapMethod = 1`: a partially covered cell at
+    // the box edge is included, which adds one line on the dual (H/B) mesh.
+    if let Some((start, stop)) = bounds {
+        if last > first {
+            let line = |index: usize| {
+                if dual_mesh {
+                    meta.dual_line(axis, index)
+                } else {
+                    meta.disc_lines[axis][index]
+                }
+            };
+            let low = start[axis].min(stop[axis]);
+            let high = start[axis].max(stop[axis]);
+            if line(first) > low && first > 0 {
+                first -= 1;
+            }
+            if line(last) < high && last + 1 < count {
+                last += 1;
+            }
+        }
+    }
     if opt_resolution[axis] > 0.0 && last > first {
         let resolution = opt_resolution[axis];
         let mut indices = vec![first];
@@ -3938,7 +4067,13 @@ mod fd_dump_tests {
         let samples = dump.sample_count();
         assert!(samples > 100, "too few samples: {samples}");
         let interval = dump.fd_interval() as f64;
-        let expected = (samples as f64) * meta.dt * interval;
+        let (sum_re, sum_im) = (0..samples).fold((0.0f64, 0.0f64), |(re, im), k| {
+            let time = k as f64 * interval * meta.dt;
+            let angle = 2.0 * std::f64::consts::PI * signal * time;
+            let value = angle.sin();
+            (re + value * angle.cos(), im + value * angle.sin())
+        });
+        let expected = sum_re.hypot(sum_im) * 2.0 * meta.dt * interval;
         let re = dump.real_part(0).expect("real");
         let im = dump.imag_part(0).expect("imag");
         let position = 1 * 3 * 3 + 1 * 3 + 1;
@@ -3947,7 +4082,7 @@ mod fd_dump_tests {
         let magnitude = (re[position] as f64).hypot(im[position] as f64);
         assert!(
             (magnitude - expected).abs() / expected < 1.0e-3,
-            "magnitude {magnitude:e} vs expected {expected:e}"
+            "magnitude {magnitude:e} vs expected {expected:e} (samples {samples}, interval {interval})"
         );
         // The off-frequency bin is far smaller.
         let off_re = dump.real_part(1).unwrap();
@@ -3970,8 +4105,8 @@ mod fd_dump_tests {
             curr: &curr,
         };
         dump.process_fields(0, &interface);
-        // nyquist = 1/(2*10e9*1e-12) = 50 steps; /4 = 12.5 -> 13
-        assert_eq!(dump.fd_interval(), 13);
+        // Native `m_FD_Interval = max(1, m_FD_Nyquist / over)`: 50 / 4 = 12
+        assert_eq!(dump.fd_interval(), 12);
         dump.reset();
         assert_eq!(dump.sample_count(), 0);
         assert_eq!(dump.fd_interval(), 0);
@@ -4004,14 +4139,15 @@ mod fd_dump_tests {
             dump.process_fields(step, &interface);
         }
         dump.post_process();
-        let abs = format!("{prefix}_f=1000000000_abs.vtk");
-        let arg = format!("{prefix}_f=1000000000_arg.vtk");
-        let phase = format!("{prefix}_f=1000000000_p=000.vtk");
+        let abs = format!("{prefix}_f=1000000000_abs.vtr");
+        let arg = format!("{prefix}_f=1000000000_arg.vtr");
+        let phase = format!("{prefix}_f=1000000000_p=000.vtr");
         for path in [&abs, &arg, &phase] {
             assert!(std::path::Path::new(path).exists(), "missing {path}");
             let text = std::fs::read_to_string(path).unwrap();
-            assert!(text.contains("DATASET STRUCTURED_GRID"));
-            assert!(text.contains("VECTORS E-Field double"));
+            assert!(text.contains("<VTKFile type=\"RectilinearGrid\""));
+            assert!(text.contains("<PointData>"));
+            assert!(text.contains("<Coordinates>"));
             let _ = std::fs::remove_file(path);
         }
         let _ = std::fs::remove_dir_all(&directory);

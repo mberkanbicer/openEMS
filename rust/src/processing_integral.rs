@@ -57,6 +57,9 @@ pub struct ProcessIntegral {
     header_written: bool,
     /// Sample the current at the half timestep (native `SetDualTime`).
     dual_time: bool,
+    /// Nyquist step count of the highest excited frequency (native
+    /// `m_FD_Nyquist`); caps the per-frequency DFT interval.
+    fd_nyquist: u32,
     calculator: Box<dyn IntegralCalculator>,
 }
 
@@ -79,7 +82,9 @@ impl ProcessIntegral {
             precision: 12,
             process_interval: 1,
             fd_interval: 0,
-            fd_oversampling: 4,
+            // Native probeFDOverSampling defaults to 1 (plain Nyquist rate),
+            // independent of the time-domain OverSampling.
+            fd_oversampling: 1,
             fd_samples: Vec::new(),
             fd_results: Vec::new(),
             results: vec![0.0; rows],
@@ -88,8 +93,15 @@ impl ProcessIntegral {
             enabled: true,
             header_written: false,
             dual_time: false,
+            fd_nyquist: 0,
             calculator,
         }
+    }
+
+    /// Cap the DFT interval at the excitation Nyquist (native
+    /// `Processing::AddFrequency`).
+    pub fn set_fd_nyquist(&mut self, nyquist: u32) {
+        self.fd_nyquist = nyquist;
     }
 
     pub fn get_filename(&self) -> &str {
@@ -155,9 +167,14 @@ impl ProcessIntegral {
             self.fd_interval = 1;
             return;
         }
-        let nyquist_steps = 1.0 / (2.0 * highest * dt);
-        let oversampling = self.fd_oversampling.max(1) as f64;
-        self.fd_interval = ((nyquist_steps / oversampling).round() as u32).max(1);
+        let frequency_nyquist = (1.0 / (2.0 * highest * dt)).floor() as u32;
+        let nyquist = if self.fd_nyquist > 0 {
+            frequency_nyquist.min(self.fd_nyquist)
+        } else {
+            frequency_nyquist
+        };
+        let oversampling = self.fd_oversampling.max(1);
+        self.fd_interval = (nyquist / oversampling).max(1);
     }
 
     fn write_header(&mut self) {
