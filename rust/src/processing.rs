@@ -1979,12 +1979,16 @@ pub struct SarCellData {
     pub conductivity: Vec<f64>,
 }
 
-/// SAR (Specific Absorption Rate) raw dump (`SAR_RAW_DATA`, dump type 29).
+/// SAR (Specific Absorption Rate) processing.
 ///
-/// Mirrors the C++ `ProcessFieldsSAR` raw-data path: the running DFT of the
-/// electric field at the cell centres is written together with the cell
-/// volumes, mass densities and conductivities, which `sar_calc` /
-/// `SAR_Calculation::CalcFromHDF5` then post-processes.
+/// Mirrors the C++ `ProcessFieldsSAR`:
+///
+/// * `DumpType` 29 (`SAR_RAW_DATA`) accumulates the electric-field DFT and
+///   writes the raw dump (`/Mesh`, `/CellWidth`, `/CellData/*`,
+///   `/FieldData/FD`) that `sar_calc` post-processes;
+/// * `DumpType` 20/21/22 (`SAR_LOCAL`/`SAR_1G`/`SAR_10G`) additionally
+///   accumulate the current-density DFT and run the same `SAR_Calculation` in
+///   the solver, writing the result file directly.
 pub struct ProcessFieldsSAR {
     name: String,
     processing_name: String,
@@ -2000,12 +2004,19 @@ pub struct ProcessFieldsSAR {
     disc_lines: Option<[Vec<f64>; 3]>,
     acc_re: Vec<Vec<f32>>,
     acc_im: Vec<Vec<f32>>,
+    /// Current-density DFT of the direct result dumps (`DumpType` 20..22).
+    j_acc_re: Vec<Vec<f32>>,
+    j_acc_im: Vec<Vec<f32>>,
+    /// Native `DumpMode` of the dump box (0 none, 1 node, 2 cell).
+    dump_mode: i32,
+    /// Native `SAR_Method` averaging method (`Simple` by default).
+    sar_method: String,
     sample_count: u32,
     initialized: bool,
 }
 
 impl ProcessFieldsSAR {
-    /// `dump_type` is the native `DumpType` (`29` for the raw SAR data).
+    /// `dump_type` is the native `DumpType` (`29` raw data, `20..22` results).
     pub fn new(name: &str, dump_type: i32) -> Self {
         Self {
             name: name.to_string(),
@@ -2022,6 +2033,10 @@ impl ProcessFieldsSAR {
             disc_lines: None,
             acc_re: Vec::new(),
             acc_im: Vec::new(),
+            j_acc_re: Vec::new(),
+            j_acc_im: Vec::new(),
+            dump_mode: 2,
+            sar_method: "Simple".to_string(),
             sample_count: 0,
             initialized: false,
         }
@@ -2051,6 +2066,37 @@ impl ProcessFieldsSAR {
 
     pub fn set_legacy_format(&mut self, legacy: bool) {
         self.legacy_fmt = legacy;
+    }
+
+    /// Select the native averaging method used by the result dumps.
+    pub fn set_sar_method(&mut self, method: impl Into<String>) {
+        let method = method.into();
+        if !method.trim().is_empty() {
+            self.sar_method = method;
+        }
+    }
+
+    pub fn sar_method(&self) -> &str {
+        &self.sar_method
+    }
+
+    /// Set the native `DumpMode` interpolation of the sampled field.
+    pub fn set_dump_mode_value(&mut self, mode: i32) {
+        self.dump_mode = mode;
+    }
+
+    /// True for the direct result dumps (`SAR_LOCAL`, `SAR_1G`, `SAR_10G`).
+    fn is_result_dump(&self) -> bool {
+        matches!(self.dump_type, 20 | 21 | 22)
+    }
+
+    /// Averaging mass in kg of this dump type (native `DumpFDData`).
+    fn averaging_mass(&self) -> f64 {
+        match self.dump_type {
+            21 => 1.0e-3,
+            22 => 10.0e-3,
+            _ => 0.0,
+        }
     }
 
     pub fn get_processing_name(&self) -> String {
@@ -2089,16 +2135,23 @@ impl ProcessFieldsSAR {
         0.0
     }
 
-    /// Cell-centred electric field of the current step (native `CalcField`
-    /// with `CELL_INTERPOLATE`).
-    fn cell_field(&self, interface: &EngineInterface<'_>) -> FieldArray {
+    /// Interpolated electric field of the current step (native `CalcField`).
+    /// `dump_type` selects E (0) or J = kappa * E (2).
+    fn sampled_field(&self, interface: &EngineInterface<'_>, dump_type: i32) -> FieldArray {
         let dims = interface.meta.num_lines;
         let indices = [
             (0..dims[0]).collect::<Vec<_>>(),
             (0..dims[1]).collect::<Vec<_>>(),
             (0..dims[2]).collect::<Vec<_>>(),
         ];
-        extract_physical_field(interface.volt, &indices, interface.meta, false, 2, 0)
+        extract_physical_field(
+            interface.volt,
+            &indices,
+            interface.meta,
+            false,
+            self.dump_mode,
+            dump_type,
+        )
     }
 
     fn update_interval(&mut self, dt: f64) {
@@ -2118,8 +2171,66 @@ impl ProcessFieldsSAR {
             self.dims = Some(dims);
             self.acc_re = vec![vec![0.0f32; cells]; self.frequencies.len()];
             self.acc_im = vec![vec![0.0f32; cells]; self.frequencies.len()];
+            if self.is_result_dump() {
+                self.j_acc_re = vec![vec![0.0f32; cells]; self.frequencies.len()];
+                self.j_acc_im = vec![vec![0.0f32; cells]; self.frequencies.len()];
+            }
             self.sample_count = 0;
         }
+    }
+
+    /// Accumulate one field sample into a running DFT.
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate(
+        frequencies: &[f64],
+        field: &FieldArray,
+        dims: [usize; 3],
+        time: f64,
+        scale: f64,
+        acc_re: &mut [Vec<f32>],
+        acc_im: &mut [Vec<f32>],
+    ) {
+        let [nx, ny, nz] = dims;
+        for (frequency, (re, im)) in frequencies
+            .iter()
+            .zip(acc_re.iter_mut().zip(acc_im.iter_mut()))
+        {
+            let argument = -2.0 * std::f64::consts::PI * frequency * time;
+            let cosine = argument.cos() * scale;
+            let sine = argument.sin() * scale;
+            let mut index = 0usize;
+            for n in 0..3 {
+                for i in 0..nx {
+                    for j in 0..ny {
+                        for k in 0..nz {
+                            let value = *field.get(n, i, j, k) as f64;
+                            re[index] += (value * cosine) as f32;
+                            im[index] += (value * sine) as f32;
+                            index += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cell widths of the cropped dump mesh (native `GetDiscDelta`).
+    fn cell_widths(&self, dims: [usize; 3]) -> [Vec<f64>; 3] {
+        let lines = self.disc_lines.clone().unwrap_or_default();
+        let mut widths: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for axis in 0..3 {
+            for index in 0..dims[axis] {
+                let width = if index + 1 < lines[axis].len() {
+                    lines[axis][index + 1] - lines[axis][index]
+                } else if index > 0 {
+                    lines[axis][index] - lines[axis][index - 1]
+                } else {
+                    0.0
+                };
+                widths[axis].push(width);
+            }
+        }
+        widths
     }
 
     /// Write the raw SAR dump (`/Mesh`, `/CellWidth`, `/CellData`,
@@ -2141,19 +2252,8 @@ impl ProcessFieldsSAR {
         file.write_i32_attribute("/Mesh", "mesh_type", 0)?;
         // native `WriteRectMesh(numLines, cellWidth, ..., "/CellWidth")` writes
         // one width per mesh line
-        let mut widths: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let widths = self.cell_widths(dims);
         for axis in 0..3 {
-            let count = dims[axis];
-            for index in 0..count {
-                let width = if index + 1 < lines[axis].len() {
-                    lines[axis][index + 1] - lines[axis][index]
-                } else if index > 0 {
-                    lines[axis][index] - lines[axis][index - 1]
-                } else {
-                    0.0
-                };
-                widths[axis].push(width);
-            }
             file.write_f64_dataset("/CellWidth", ["x", "y", "z"][axis], &widths[axis])?;
         }
         let cells = dims[0] * dims[1] * dims[2];
@@ -2187,6 +2287,84 @@ impl ProcessFieldsSAR {
             file.write_f64_attribute(&path, "frequency", *frequency)?;
         }
         Ok(())
+    }
+
+    /// Write a direct SAR result dump (`DumpType` 20..22) from the in-solver
+    /// DFT accumulators. Mirrors the native `ProcessFieldsSAR::DumpFDData`
+    /// result branch, which feeds the same `SAR_Calculation` used by
+    /// `sar_calc`.
+    #[cfg(feature = "hdf5")]
+    fn dump_result(&self) -> Result<(), String> {
+        let Some(dims) = self.dims else {
+            return Ok(());
+        };
+        if self.j_acc_re.len() != self.frequencies.len() {
+            return Err("the J-field DFT was not accumulated".to_string());
+        }
+        let lines = self.disc_lines.clone().unwrap_or_default();
+        let widths = self.cell_widths(dims);
+        let mut e_fields = Vec::with_capacity(self.frequencies.len());
+        let mut j_fields = Vec::with_capacity(self.frequencies.len());
+        for index in 0..self.frequencies.len() {
+            let mut e_field = crate::nf2ff::ComplexField::new(dims);
+            let mut j_field = crate::nf2ff::ComplexField::new(dims);
+            for component in 0..3 {
+                for i in 0..dims[0] {
+                    for j in 0..dims[1] {
+                        for k in 0..dims[2] {
+                            let offset =
+                                ((component * dims[0] + i) * dims[1] + j) * dims[2] + k;
+                            e_field.set(
+                                component,
+                                i,
+                                j,
+                                k,
+                                ComplexPoint {
+                                    re: f64::from(self.acc_re[index][offset]),
+                                    im: f64::from(self.acc_im[index][offset]),
+                                },
+                            );
+                            j_field.set(
+                                component,
+                                i,
+                                j,
+                                k,
+                                ComplexPoint {
+                                    re: f64::from(self.j_acc_re[index][offset]),
+                                    im: f64::from(self.j_acc_im[index][offset]),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            e_fields.push(e_field);
+            j_fields.push(j_field);
+        }
+        let mut runner = crate::sar_hdf5::SarRunner::new();
+        if !runner.set_averaging_method(&self.sar_method) {
+            return Err(format!("unknown SAR averaging method '{}'", self.sar_method));
+        }
+        runner.averaging_mass = self.averaging_mass();
+        runner
+            .calc_from_fields(
+                &lines,
+                widths,
+                self.cell_data.volume.clone(),
+                self.cell_data.density.clone(),
+                None,
+                &self.frequencies,
+                &e_fields,
+                Some(&j_fields),
+                &format!("{}.h5", self.name),
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(not(feature = "hdf5"))]
+    fn dump_result(&self) -> Result<(), String> {
+        Err("HDF5 support is not compiled in; rebuild with --features hdf5".to_string())
     }
 }
 
@@ -2241,31 +2419,31 @@ impl Processing for ProcessFieldsSAR {
         if self.disc_lines.is_none() {
             self.disc_lines = Some(interface.meta.disc_lines.clone());
         }
-        let reduced = self.cell_field(interface);
-        let [nx, ny, nz] = dims;
         let time = num_ts as f64 * interface.meta.dt;
         let scale = 2.0 * interface.meta.dt * interval as f64;
-        for (frequency, (re, im)) in self
-            .frequencies
-            .iter()
-            .zip(self.acc_re.iter_mut().zip(self.acc_im.iter_mut()))
-        {
-            let argument = -2.0 * std::f64::consts::PI * frequency * time;
-            let cosine = argument.cos() * scale;
-            let sine = argument.sin() * scale;
-            let mut index = 0usize;
-            for n in 0..3 {
-                for i in 0..nx {
-                    for j in 0..ny {
-                        for k in 0..nz {
-                            let value = *reduced.get(n, i, j, k) as f64;
-                            re[index] += (value * cosine) as f32;
-                            im[index] += (value * sine) as f32;
-                            index += 1;
-                        }
-                    }
-                }
-            }
+        let reduced = self.sampled_field(interface, 0);
+        Self::accumulate(
+            &self.frequencies,
+            &reduced,
+            dims,
+            time,
+            scale,
+            &mut self.acc_re,
+            &mut self.acc_im,
+        );
+        // The result dumps need the current density at the same positions
+        // (native `CalcField` with `J_FIELD_DUMP` + `AddEFieldAndJField`).
+        if self.is_result_dump() {
+            let current = self.sampled_field(interface, 2);
+            Self::accumulate(
+                &self.frequencies,
+                &current,
+                dims,
+                time,
+                scale,
+                &mut self.j_acc_re,
+                &mut self.j_acc_im,
+            );
         }
         self.sample_count += 1;
         self.get_next_interval(num_ts)
@@ -2285,7 +2463,14 @@ impl Processing for ProcessFieldsSAR {
         if self.dims.is_none() || self.acc_re.is_empty() {
             return;
         }
-        if let Err(error) = self.dump_raw() {
+        if self.is_result_dump() {
+            if let Err(error) = self.dump_result() {
+                eprintln!(
+                    "[openEMS] Failed to write the SAR result dump '{}': {error}",
+                    self.name
+                );
+            }
+        } else if let Err(error) = self.dump_raw() {
             eprintln!(
                 "[openEMS] Failed to write the raw SAR dump '{}': {error}",
                 self.name
@@ -2298,6 +2483,12 @@ impl Processing for ProcessFieldsSAR {
             values.fill(0.0);
         }
         for values in &mut self.acc_im {
+            values.fill(0.0);
+        }
+        for values in &mut self.j_acc_re {
+            values.fill(0.0);
+        }
+        for values in &mut self.j_acc_im {
             values.fill(0.0);
         }
         self.sample_count = 0;

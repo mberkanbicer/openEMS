@@ -3809,25 +3809,6 @@ fn edge_length_value(
     disc_delta_value(&lines[n], counts[n] as usize, pos[n], dual) * grid_delta
 }
 
-/// Edge area in square metres. Matches native `GetEdgeArea`.
-fn edge_area_value(
-    lines: &[Option<Vec<f64>>; 3],
-    counts: [u32; 3],
-    n: usize,
-    pos: [usize; 3],
-    dual: bool,
-    grid_delta: f64,
-) -> f64 {
-    if n >= 3 {
-        return 0.0;
-    }
-    let n_p = (n + 1) % 3;
-    let n_pp = (n + 2) % 3;
-    // Native `GetNodeArea` uses `GetNodeWidth(axis, pos, dual)` which is
-    // `GetEdgeLength(axis, pos, !dual)`.
-    edge_length_value(lines, counts, n_p, pos, !dual, grid_delta)
-        * edge_length_value(lines, counts, n_pp, pos, !dual, grid_delta)
-}
 
 
 impl Default for Operator {

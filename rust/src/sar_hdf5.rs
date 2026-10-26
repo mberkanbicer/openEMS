@@ -140,18 +140,11 @@ impl SarRunner {
         ];
         let num_lines = [mesh[0].len(), mesh[1].len(), mesh[2].len()];
         let cells = num_lines[0] * num_lines[1] * num_lines[2];
-
-        let mut calculation = SarCalculation::new(num_lines);
-        self.apply_method(&mut calculation);
-        calculation.averaging_mass = self.averaging_mass;
-
         let widths = [
             read_axis(&file, "/CellWidth", "x")?,
             read_axis(&file, "/CellWidth", "y")?,
             read_axis(&file, "/CellWidth", "z")?,
         ];
-        calculation.set_cell_width(widths);
-
         let volume = read_scalar_field(&file, "/CellData/Volume")?;
         let density = read_scalar_field(&file, "/CellData/Density")?;
         let conductivity = read_scalar_field(&file, "/CellData/Conductivity")?;
@@ -167,10 +160,9 @@ impl SarRunner {
                 });
             }
         }
-        calculation.set_cell_volume(volume);
-        calculation.set_cell_density(density);
 
-        for (index, frequency) in frequencies.iter().enumerate() {
+        let mut fields = Vec::with_capacity(frequencies.len());
+        for index in 0..frequencies.len() {
             let path = format!("/FieldData/FD/f{index}");
             let (dims, re, im) = file.read_complex_f32_dataset(&path)?;
             if dims.len() != 4 || dims[0] < 3 {
@@ -206,11 +198,115 @@ impl SarRunner {
                     }
                 }
             }
-            calculation.add_e_field_and_conductivity(*frequency, &field, &conductivity);
+            fields.push(field);
+        }
+
+        self.calc_from_fields(
+            &mesh,
+            widths,
+            volume,
+            density,
+            Some(conductivity),
+            &frequencies,
+            &fields,
+            None,
+            output,
+        )
+    }
+
+    /// Calculate the SAR from in-memory fields and write the native result.
+    ///
+    /// This is the shared path of the `sar_calc` tool (which reads a raw dump
+    /// first) and the direct `DumpType` 20..22 result dumps, which call it
+    /// while the solver still owns the DFT accumulators.
+    ///
+    /// `j_fields` selects the native `AddEFieldAndJField` path; `None` uses
+    /// `AddEFieldAndConductivity` with the cell conductivity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn calc_from_fields(
+        &mut self,
+        mesh: &[Vec<f64>; 3],
+        widths: [Vec<f64>; 3],
+        volume: Vec<f64>,
+        density: Vec<f64>,
+        conductivity: Option<Vec<f64>>,
+        frequencies: &[f64],
+        e_fields: &[ComplexField],
+        j_fields: Option<&[ComplexField]>,
+        output: &str,
+    ) -> Result<bool, SarError> {
+        if frequencies.is_empty() {
+            return Err(SarError::NoFrequencies);
+        }
+        if e_fields.len() != frequencies.len() {
+            return Err(SarError::ShapeMismatch {
+                path: "FieldData/FD".to_string(),
+                detail: format!(
+                    "{} field samples for {} frequencies",
+                    e_fields.len(),
+                    frequencies.len()
+                ),
+            });
+        }
+        let num_lines = [mesh[0].len(), mesh[1].len(), mesh[2].len()];
+        let cells = num_lines[0] * num_lines[1] * num_lines[2];
+        if volume.len() != cells || density.len() != cells {
+            return Err(SarError::ShapeMismatch {
+                path: "CellData".to_string(),
+                detail: format!(
+                    "{} volumes and {} densities for {cells} cells",
+                    volume.len(),
+                    density.len()
+                ),
+            });
+        }
+        if let Some(values) = &conductivity {
+            if values.len() != cells {
+                return Err(SarError::ShapeMismatch {
+                    path: "CellData/Conductivity".to_string(),
+                    detail: format!("{} values for {cells} cells", values.len()),
+                });
+            }
+        }
+        if j_fields.is_some_and(|fields| fields.len() != frequencies.len()) {
+            return Err(SarError::ShapeMismatch {
+                path: "FieldData/FD".to_string(),
+                detail: "the J-field sample count must match the frequencies".to_string(),
+            });
+        }
+
+        let mut calculation = SarCalculation::new(num_lines);
+        self.apply_method(&mut calculation);
+        calculation.averaging_mass = self.averaging_mass;
+        calculation.set_cell_width(widths);
+        calculation.set_cell_volume(volume);
+        calculation.set_cell_density(density);
+
+        for (index, frequency) in frequencies.iter().enumerate() {
+            match j_fields {
+                Some(fields) => calculation.add_e_field_and_j_field(
+                    *frequency,
+                    &e_fields[index],
+                    &fields[index],
+                ),
+                None => {
+                    let conductivity = conductivity
+                        .as_ref()
+                        .ok_or_else(|| SarError::ShapeMismatch {
+                            path: "CellData/Conductivity".to_string(),
+                            detail: "the conductivity is required without J fields".to_string(),
+                        })?;
+                    calculation.add_e_field_and_conductivity(
+                        *frequency,
+                        &e_fields[index],
+                        conductivity,
+                    );
+                }
+            }
         }
 
         calculation.calc_sar();
-        self.write_result(&calculation, &mesh, &frequencies, output)
+        self.write_result(&calculation, mesh, frequencies, output)
     }
 
     fn write_result(
@@ -462,4 +558,82 @@ fn read_scalar_field(file: &Hdf5File, path: &str) -> Result<Vec<f64>, SarError> 
     }
     let (_, values) = file.read_f64_dataset(path)?;
     Ok(values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn field(dims: [usize; 3], value: f64) -> crate::nf2ff::ComplexField {
+        let mut field = crate::nf2ff::ComplexField::new(dims);
+        for i in 0..dims[0] {
+            for j in 0..dims[1] {
+                for k in 0..dims[2] {
+                    field.set(
+                        0,
+                        i,
+                        j,
+                        k,
+                        crate::processing::ComplexPoint {
+                            re: value,
+                            im: 0.0,
+                        },
+                    );
+                }
+            }
+        }
+        field
+    }
+
+    #[test]
+    fn direct_result_dump_matches_the_local_sar_formula() {
+        let dims = [2, 2, 2];
+        let mesh = [
+            vec![0.0, 1.0],
+            vec![0.0, 1.0],
+            vec![0.0, 1.0],
+        ];
+        let widths = [vec![1.0, 1.0], vec![1.0, 1.0], vec![1.0, 1.0]];
+        let volume = vec![1.0; 8];
+        let density = vec![2.0; 8];
+        let e_field = field(dims, 1.0);
+        let j_field = field(dims, 4.0);
+
+        let path = std::env::temp_dir()
+            .join(format!("oems_sar_result_{}.h5", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let mut runner = SarRunner::new();
+        runner.averaging_mass = 0.0;
+        let ok = runner
+            .calc_from_fields(
+                &mesh,
+                widths,
+                volume,
+                density,
+                None,
+                &[1.0e9],
+                std::slice::from_ref(&e_field),
+                Some(std::slice::from_ref(&j_field)),
+                &path,
+            )
+            .expect("the SAR result must be written");
+        assert!(ok);
+
+        let file = Hdf5File::open(&path, false).expect("open the SAR result");
+        let (shape, values) = file
+            .read_f32_dataset("/FieldData/FD/f0")
+            .expect("read the SAR block");
+        assert_eq!(shape, vec![2, 2, 2]);
+        // 0.5 * |E| * |J| / rho = 0.5 * 1 * 4 / 2 = 1 W/kg
+        for value in &values {
+            assert!((value - 1.0).abs() < 1e-6, "value {value}");
+        }
+        let max = file
+            .read_f64_attribute("/FieldData/FD/f0", "maxSAR")
+            .expect("maxSAR attribute");
+        assert!((max - 1.0).abs() < 1e-6, "maxSAR {max}");
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
 }

@@ -1147,6 +1147,8 @@ impl OpenEMS {
                             engine,
                         ));
                         processing.set_file_type(dump.file_type());
+                        processing.set_dump_mode_value(dump.dump_mode());
+                        processing.set_sar_method(dump.sar_method());
                         processing.set_legacy_format(self.legacy_hdf5_dumps);
                         processing.set_process_interval(interval);
                         let fd_over = if dump.oversampling() >= 0 {
@@ -1176,11 +1178,42 @@ impl OpenEMS {
                         created += 1;
                     }
                     20..=22 => {
-                        eprintln!(
-                            "[openEMS] SetupFDTD: Warning: direct SAR dump type {} of property '{}' is not wired yet; write the raw dump (type 29) and run sar_calc... skipping",
-                            dump_type,
-                            property.name()
-                        );
+                        // Native `ProcessFieldsSAR` result dumps: the same
+                        // in-solver DFT as the raw dump, post-processed by the
+                        // shared `SAR_Calculation` writer.
+                        if dump.file_type() != 1 {
+                            eprintln!(
+                                "[openEMS] SetupFDTD: Warning: SAR result dump '{}' requires the HDF5 file type... skipping",
+                                property.name()
+                            );
+                            continue;
+                        }
+                        let mut processing =
+                            crate::processing::ProcessFieldsSAR::new(&name, dump_type);
+                        processing.set_cell_data(Self::build_sar_cell_data(&structure, engine));
+                        processing.set_file_type(dump.file_type());
+                        processing.set_dump_mode_value(dump.dump_mode());
+                        processing.set_sar_method(dump.sar_method());
+                        processing.set_legacy_format(self.legacy_hdf5_dumps);
+                        processing.set_process_interval(interval);
+                        let fd_over = if dump.oversampling() >= 0 {
+                            dump.oversampling().max(1) as u32
+                        } else {
+                            1
+                        };
+                        processing.set_fd_oversampling(fd_over);
+                        for frequency in dump.fd_samples() {
+                            processing.add_frequency(*frequency);
+                        }
+                        if processing.get_frequencies().is_empty() {
+                            eprintln!(
+                                "[openEMS] SetupFDTD: Warning: SAR dump '{}' has no <FD_Samples> frequencies... skipping",
+                                property.name()
+                            );
+                            continue;
+                        }
+                        array.add_processing(Box::new(processing));
+                        created += 1;
                     }
                     other => {
                         eprintln!(
