@@ -1044,14 +1044,6 @@ impl OpenEMS {
                 let dump_type = dump.dump_type();
                 match dump_type {
                     0..=5 => {
-                        if dump_type > 1 {
-                            eprintln!(
-                                "[openEMS] SetupFDTD: Warning: dump type {} of property '{}' needs the material field conversion and is not implemented yet... skipping",
-                                dump_type,
-                                property.name()
-                            );
-                            continue;
-                        }
                         let mut processing =
                             crate::processing::ProcessFieldsTD::new(&name, start, stop);
                         processing.set_bounds(start, stop);
@@ -1070,7 +1062,7 @@ impl OpenEMS {
                                 processing.set_opt_resolution(*value, axis as i32);
                             }
                         }
-                        if dump_type == 1 {
+                        if dump_type == 1 || dump_type == 5 {
                             processing.set_dual_time(true);
                             processing.set_dual_mesh(true);
                         }
@@ -1084,11 +1076,53 @@ impl OpenEMS {
                         created += 1;
                     }
                     10..=15 => {
-                        eprintln!(
-                            "[openEMS] SetupFDTD: Warning: frequency-domain dump type {} of property '{}' is not implemented yet... skipping",
-                            dump_type,
-                            property.name()
-                        );
+                        let base_type = dump_type - 10;
+                        let mut processing =
+                            crate::processing::ProcessFieldsFD::new(&name, start, stop);
+                        processing.set_bounds(start, stop);
+                        processing.set_dump_type(base_type);
+                        processing.set_file_type(dump.file_type());
+                        processing.set_dump_mode_value(dump.dump_mode());
+                        processing.set_legacy_format(self.legacy_hdf5_dumps);
+                        processing.set_process_interval(interval);
+                        // native: FD dumps default to the plain Nyquist rate
+                        let fd_over = if dump.oversampling() >= 0 {
+                            dump.oversampling().max(1) as u32
+                        } else {
+                            1
+                        };
+                        processing.set_fd_oversampling(fd_over);
+                        if dump.sub_sampling_enabled() {
+                            for (axis, value) in dump.sub_sampling().iter().enumerate() {
+                                processing.set_sub_sampling_value(*value as i32, axis as i32);
+                            }
+                        }
+                        if dump.optimal_resolution_enabled() {
+                            for (axis, value) in dump.optimal_resolution().iter().enumerate() {
+                                processing.set_opt_resolution_value(*value, axis as i32);
+                            }
+                        }
+                        if base_type == 1 || base_type == 5 {
+                            processing.set_dual_time(true);
+                            processing.set_dual_mesh(true);
+                        }
+                        match dump.dump_mode() {
+                            1 => processing.set_dual_mesh(false),
+                            2 => processing.set_dual_mesh(true),
+                            _ => {}
+                        }
+                        for frequency in dump.fd_samples() {
+                            processing.add_frequency(*frequency);
+                        }
+                        if processing.get_frequencies().is_empty() {
+                            eprintln!(
+                                "[openEMS] SetupFDTD: Warning: frequency-domain dump '{}' has no <Frequency> samples... skipping",
+                                property.name()
+                            );
+                            continue;
+                        }
+                        array.add_processing(Box::new(processing));
+                        created += 1;
                     }
                     other => {
                         eprintln!(
@@ -1351,6 +1385,10 @@ impl OpenEMS {
                 num_lines,
                 disc_lines,
                 dt,
+                materials: engine
+                    .op
+                    .material_grid_data()
+                    .map(|grid| std::sync::Arc::new(grid.to_vec())),
             }
         };
         let max_ts_time = if self.max_time > 0.0 && dt > 0.0 {

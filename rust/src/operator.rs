@@ -3743,6 +3743,10 @@ impl Default for Operator {
 }
 
 impl OperatorBase for Operator {
+    fn material_grid_data(&self) -> Option<&[CellMaterial]> {
+        self.material_grid.as_deref()
+    }
+
     fn set_geometry_csx(&mut self, geo: *mut std::ffi::c_void) -> bool {
         self.base.set_geometry_csx(geo)
     }

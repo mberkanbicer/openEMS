@@ -48,6 +48,11 @@ pub struct EngineMeta {
     /// Mesh line coordinates in metres.
     pub disc_lines: [Vec<f64>; 3],
     pub dt: f64,
+    /// Per-component material grid, `component * nx * ny * nz + (i * ny + j) * nz + k`.
+    ///
+    /// Needed by the J/D/B field conversions (native `m_kappa_ptr`,
+    /// `m_epsR_ptr`, `m_mueR_ptr`).
+    pub materials: Option<std::sync::Arc<Vec<crate::operator::CellMaterial>>>,
 }
 
 impl EngineMeta {
@@ -94,6 +99,24 @@ impl EngineMeta {
         } else {
             lines[index]
         }
+    }
+
+    /// Material at a component/index position, if a grid is attached.
+    pub fn material_at(&self, component: usize, pos: [usize; 3]) -> Option<&crate::operator::CellMaterial> {
+        let grid = self.materials.as_deref()?;
+        let nx = self.num_lines[0];
+        let ny = self.num_lines[1];
+        let nz = self.num_lines[2];
+        let index = component * nx * ny * nz + pos[0] * ny * nz + pos[1] * nz + pos[2];
+        grid.get(index)
+    }
+
+    /// Face area of component `axis` at `pos`, in square metres (native
+    /// `GetEdgeArea`).
+    pub fn edge_area(&self, axis: usize, pos: [usize; 3]) -> f64 {
+        let n_p = (axis + 1) % 3;
+        let n_pp = (axis + 2) % 3;
+        self.edge_length(n_p, pos[n_p]) * self.edge_length(n_pp, pos[n_pp])
     }
 
     /// Primary edge length of component `axis` at `index`, in metres.
@@ -1218,45 +1241,15 @@ impl ProcessFieldsTD {
     }
 
     /// Mesh indices written by this dump, mirroring `ProcessFields::CalcMeshPos`.
-    /// A positive optical resolution wins over the integer sub-sampling rate.
     pub fn dump_indices(&self, axis: usize, meta: &EngineMeta) -> Vec<usize> {
-        let count = meta.num_lines[axis];
-        if count == 0 {
-            return Vec::new();
-        }
-        let coordinate = |index: usize| {
-            if self.dual_mesh {
-                meta.dual_line(axis, index)
-            } else {
-                meta.disc_lines[axis][index]
-            }
-        };
-        let (first, last) = match self.bounds {
-            Some((start, stop)) => {
-                let low = meta.snap_to_mesh_line(axis, start[axis], self.dual_mesh, true);
-                let high = meta.snap_to_mesh_line(axis, stop[axis], self.dual_mesh, true);
-                (low.min(high), low.max(high))
-            }
-            None => (0, count - 1),
-        };
-        if self.opt_resolution[axis] > 0.0 && last > first {
-            let resolution = self.opt_resolution[axis];
-            let mut indices = vec![first];
-            let mut previous = coordinate(first);
-            for index in (first + 1)..last {
-                if (coordinate(index + 1) - previous).abs() >= resolution - 1e-15 {
-                    indices.push(index);
-                    previous = coordinate(index);
-                }
-            }
-            if first != last {
-                indices.push(last);
-            }
-            indices
-        } else {
-            let stride = self.sub_sampling[axis].max(1) as usize;
-            (first..=last).step_by(stride).collect()
-        }
+        compute_dump_indices(
+            meta,
+            axis,
+            self.bounds,
+            self.dual_mesh,
+            &self.sub_sampling,
+            &self.opt_resolution,
+        )
     }
 
     pub fn set_dump_mode_2_node(&mut self) {
@@ -1349,7 +1342,7 @@ impl Processing for ProcessFieldsTD {
         if !self.check_timestep(num_ts) {
             return 0;
         }
-        let field = if self.dump_type == 1 {
+        let field = if matches!(self.dump_type, 1 | 3 | 5) {
             interface.curr
         } else {
             interface.volt
@@ -1378,7 +1371,14 @@ impl Processing for ProcessFieldsTD {
         });
         let coordinate_refs: [&[f64]; 3] = [&coordinates[0], &coordinates[1], &coordinates[2]];
         let reduced =
-            extract_physical_field(field, &indices, interface.meta, self.dual_mesh, self.dump_mode);
+            extract_physical_field(
+                field,
+                &indices,
+                interface.meta,
+                self.dual_mesh,
+                self.dump_mode,
+                self.dump_type,
+            );
 
         if self.file_type == HDF5_FILETYPE {
             // Native: /FieldData/TD/<8-digit timestep> + a `time` attribute.
@@ -1448,6 +1448,20 @@ pub struct ProcessFieldsFD {
     acc_re: Vec<Vec<f32>>,
     acc_im: Vec<Vec<f32>>,
     initialized: bool,
+    /// Dump box bounds in metres (native `DefineStartStopCoord`).
+    bounds: Option<([f64; 3], [f64; 3])>,
+    sub_sampling: [i32; 3],
+    opt_resolution: [f64; 3],
+    /// Dual (cell-centre) mesh, native `SetDualMesh`.
+    dual_mesh: bool,
+    /// Half-timestep sampling, native `SetDualTime`.
+    dual_time: bool,
+    /// Native `DumpMode`: 0 no interpolation, 1 node, 2 cell.
+    dump_mode: i32,
+    /// Legacy (Octave/MATLAB) HDF5 layout.
+    legacy_fmt: bool,
+    /// Cached reduced mesh indices.
+    indices: Option<[Vec<usize>; 3]>,
 }
 
 impl ProcessFieldsFD {
@@ -1469,7 +1483,72 @@ impl ProcessFieldsFD {
             acc_re: Vec::new(),
             acc_im: Vec::new(),
             initialized: false,
+            bounds: None,
+            sub_sampling: [1; 3],
+            opt_resolution: [0.0; 3],
+            dual_mesh: false,
+            dual_time: false,
+            dump_mode: 0,
+            legacy_fmt: false,
+            indices: None,
         }
+    }
+
+    /// Restrict the dump to a box (metres), native `DefineStartStopCoord`.
+    pub fn set_bounds(&mut self, start: [f64; 3], stop: [f64; 3]) {
+        let mut low = [0.0f64; 3];
+        let mut high = [0.0f64; 3];
+        for axis in 0..3 {
+            low[axis] = start[axis].min(stop[axis]);
+            high[axis] = start[axis].max(stop[axis]);
+        }
+        self.bounds = Some((low, high));
+        self.indices = None;
+    }
+
+    pub fn set_dump_mode_value(&mut self, mode: i32) {
+        self.dump_mode = mode;
+    }
+
+    pub fn set_dual_mesh_value(&mut self, dual: bool) {
+        self.dual_mesh = dual;
+        self.indices = None;
+    }
+
+    pub fn set_dual_time_value(&mut self, dual: bool) {
+        self.dual_time = dual;
+    }
+
+    pub fn set_legacy_format(&mut self, legacy: bool) {
+        self.legacy_fmt = legacy;
+    }
+
+    pub fn get_legacy_format(&self) -> bool {
+        self.legacy_fmt
+    }
+
+    pub fn set_sub_sampling_value(&mut self, value: i32, axis: i32) {
+        if value < 1 {
+            return;
+        }
+        if (0..=2).contains(&axis) {
+            self.sub_sampling[axis as usize] = value;
+        } else {
+            self.sub_sampling = [value; 3];
+        }
+        self.indices = None;
+    }
+
+    pub fn set_opt_resolution_value(&mut self, value: f64, axis: i32) {
+        if !(value > 0.0) {
+            return;
+        }
+        if (0..=2).contains(&axis) {
+            self.opt_resolution[axis as usize] = value;
+        } else {
+            self.opt_resolution = [value; 3];
+        }
+        self.indices = None;
     }
 
     pub fn get_processing_name(&self) -> String {
@@ -1599,6 +1678,23 @@ impl Processing for ProcessFieldsFD {
         self.fd_oversampling = factor.max(1);
     }
 
+    fn set_dual_mesh(&mut self, val: bool) {
+        self.dual_mesh = val;
+        self.indices = None;
+    }
+
+    fn get_dual_mesh(&self) -> bool {
+        self.dual_mesh
+    }
+
+    fn set_dual_time(&mut self, val: bool) {
+        self.dual_time = val;
+    }
+
+    fn get_dual_time(&self) -> bool {
+        self.dual_time
+    }
+
     fn add_frequency(&mut self, freq: f64) {
         ProcessFieldsFD::add_frequency(self, freq);
     }
@@ -1620,18 +1716,75 @@ impl Processing for ProcessFieldsFD {
         if !num_ts.is_multiple_of(interval) {
             return 0;
         }
-        let dims = interface.meta.num_lines;
-        self.ensure_accumulators(dims);
-        if self.disc_lines.is_none() {
-            self.disc_lines = Some(interface.meta.disc_lines.clone());
+        if self.indices.is_none() {
+            let indices = [
+                compute_dump_indices(
+                    interface.meta,
+                    0,
+                    self.bounds,
+                    self.dual_mesh,
+                    &self.sub_sampling,
+                    &self.opt_resolution,
+                ),
+                compute_dump_indices(
+                    interface.meta,
+                    1,
+                    self.bounds,
+                    self.dual_mesh,
+                    &self.sub_sampling,
+                    &self.opt_resolution,
+                ),
+                compute_dump_indices(
+                    interface.meta,
+                    2,
+                    self.bounds,
+                    self.dual_mesh,
+                    &self.sub_sampling,
+                    &self.opt_resolution,
+                ),
+            ];
+            self.dims = Some([
+                indices[0].len(),
+                indices[1].len(),
+                indices[2].len(),
+            ]);
+            self.disc_lines = Some([0, 1, 2].map(|axis| {
+                indices[axis]
+                    .iter()
+                    .map(|&index| {
+                        if self.dual_mesh {
+                            interface.meta.dual_line(axis, index)
+                        } else {
+                            interface.meta.disc_lines[axis][index]
+                        }
+                    })
+                    .collect()
+            }));
+            self.indices = Some(indices);
         }
-        let field = if self.dump_type == 1 {
+        let indices = self.indices.clone().expect("indices built above");
+        let dims = [
+            indices[0].len(),
+            indices[1].len(),
+            indices[2].len(),
+        ];
+        self.ensure_accumulators(dims);
+        let field = if matches!(self.dump_type, 1 | 3 | 5) {
             interface.curr
         } else {
             interface.volt
         };
+        let reduced = extract_physical_field(
+            field,
+            &indices,
+            interface.meta,
+            self.dual_mesh,
+            self.dump_mode,
+            self.dump_type,
+        );
         let [nx, ny, nz] = dims;
-        let time = num_ts as f64 * interface.meta.dt;
+        let time =
+            (num_ts as f64 + if self.dual_time { 0.5 } else { 0.0 }) * interface.meta.dt;
         let scale = 2.0 * interface.meta.dt * interval as f64;
         for (frequency, (re, im)) in self
             .frequencies
@@ -1646,7 +1799,7 @@ impl Processing for ProcessFieldsFD {
                 for i in 0..nx {
                     for j in 0..ny {
                         for k in 0..nz {
-                            let value = *field.get(n, i, j, k) as f64;
+                            let value = *reduced.get(n, i, j, k) as f64;
                             re[index] += (value * cosine) as f32;
                             im[index] += (value * sine) as f32;
                             index += 1;
@@ -1724,7 +1877,7 @@ impl ProcessFieldsFD {
                     &self.acc_im[index],
                     dims,
                     *frequency,
-                    true,
+                    self.legacy_fmt,
                 )?;
             }
             Ok(())
@@ -2273,6 +2426,58 @@ impl HDF5FileWriter {
 /// Flatten a field array into `(n, i, j, k)` linear order.
 /// Copy the selected mesh indices out of a full field array, preserving the
 /// `(n, i, j, k)` component-major layout used by the writers.
+/// Mesh indices of one axis of a field dump (native `CalcMeshPos`).
+///
+/// A positive optical resolution wins over the integer sub-sampling rate, the
+/// box bounds snap with the native rule and `dual_mesh` selects the cell-centre
+/// coordinates.
+fn compute_dump_indices(
+    meta: &EngineMeta,
+    axis: usize,
+    bounds: Option<([f64; 3], [f64; 3])>,
+    dual_mesh: bool,
+    sub_sampling: &[i32; 3],
+    opt_resolution: &[f64; 3],
+) -> Vec<usize> {
+    let count = meta.num_lines[axis];
+    if count == 0 {
+        return Vec::new();
+    }
+    let coordinate = |index: usize| {
+        if dual_mesh {
+            meta.dual_line(axis, index)
+        } else {
+            meta.disc_lines[axis][index]
+        }
+    };
+    let (first, last) = match bounds {
+        Some((start, stop)) => {
+            let low = meta.snap_to_mesh_line(axis, start[axis], dual_mesh, true);
+            let high = meta.snap_to_mesh_line(axis, stop[axis], dual_mesh, true);
+            (low.min(high), low.max(high))
+        }
+        None => (0, count - 1),
+    };
+    if opt_resolution[axis] > 0.0 && last > first {
+        let resolution = opt_resolution[axis];
+        let mut indices = vec![first];
+        let mut previous = coordinate(first);
+        for index in (first + 1)..last {
+            if (coordinate(index + 1) - previous).abs() >= resolution - 1e-15 {
+                indices.push(index);
+                previous = coordinate(index);
+            }
+        }
+        if first != last {
+            indices.push(last);
+        }
+        indices
+    } else {
+        let stride = sub_sampling[axis].max(1) as usize;
+        (first..=last).step_by(stride).collect()
+    }
+}
+
 fn extract_field(values: &FieldArray, indices: &[Vec<usize>; 3]) -> FieldArray {
     let dims = [indices[0].len(), indices[1].len(), indices[2].len()];
     let mut out = FieldArray::new("dump", dims);
@@ -2295,6 +2500,7 @@ fn physical_at(
     dual: bool,
     component: usize,
     pos: [usize; 3],
+    dump_type: i32,
 ) -> f64 {
     if pos[0] >= meta.num_lines[0] || pos[1] >= meta.num_lines[1] || pos[2] >= meta.num_lines[2]
     {
@@ -2308,7 +2514,58 @@ fn physical_at(
     if length <= 0.0 {
         return 0.0;
     }
-    *values.get(component, pos[0], pos[1], pos[2]) as f64 / length
+    let raw = *values.get(component, pos[0], pos[1], pos[2]) as f64;
+    // native `GetRawField` / `GetRawDualField`; the enum is
+    // E=0, H=1, J=2, rotH=3, D=4, B=5.
+    match dump_type {
+        2 => {
+            // current density J = kappa * E
+            let kappa = meta
+                .material_at(component, pos)
+                .map(|material| material.kappa)
+                .unwrap_or(0.0);
+            raw * kappa / length
+        }
+        3 => {
+            // rot(H) on the primary cell (native `GetRawField` type 2)
+            let n_p = (component + 1) % 3;
+            let n_pp = (component + 2) % 3;
+            let area = meta.edge_area(component, pos);
+            if area <= 0.0 {
+                return 0.0;
+            }
+            let mut value = *values.get(n_pp, pos[0], pos[1], pos[2]) as f64
+                - *values.get(n_p, pos[0], pos[1], pos[2]) as f64;
+            if pos[n_pp] > 0 {
+                let mut lower = pos;
+                lower[n_pp] -= 1;
+                value += *values.get(n_p, lower[0], lower[1], lower[2]) as f64;
+            }
+            if pos[n_p] > 0 {
+                let mut lower = pos;
+                lower[n_p] -= 1;
+                value -= *values.get(n_pp, lower[0], lower[1], lower[2]) as f64;
+            }
+            value / area
+        }
+        4 => {
+            // electric flux density D = eps_r * E
+            let eps_r = meta
+                .material_at(component, pos)
+                .map(|material| material.eps_r)
+                .unwrap_or(1.0);
+            raw * eps_r / length
+        }
+        5 => {
+            // magnetic flux density B = mue_r * H
+            let mue_r = meta
+                .material_at(component, pos)
+                .map(|material| material.mue_r)
+                .unwrap_or(1.0);
+            raw * mue_r / length
+        }
+        _ => raw / length,
+    }
 }
 
 /// Extract a field dump, mirroring the native `GetRawInterpolatedField` and
@@ -2326,7 +2583,9 @@ fn extract_physical_field(
     meta: &EngineMeta,
     dual: bool,
     mode: i32,
+    dump_type: i32,
 ) -> FieldArray {
+    let mode_type = dump_type;
     let dims = [indices[0].len(), indices[1].len(), indices[2].len()];
     let mut out = FieldArray::new("dump", dims);
     let last = [
@@ -2348,10 +2607,10 @@ fn extract_physical_field(
                                 if pos[n] == last[n] {
                                     let mut lower = pos;
                                     lower[n] = lower[n].saturating_sub(1);
-                                    physical_at(values, meta, false, n, lower)
+                                    physical_at(values, meta, false, n, lower, mode_type)
                                 } else {
                                     let delta = meta.edge_length(n, pos[n]);
-                                    let upper = physical_at(values, meta, false, n, pos);
+                                    let upper = physical_at(values, meta, false, n, pos, mode_type);
                                     if delta <= 0.0 {
                                         0.0
                                     } else if pos[n] == 0 {
@@ -2362,7 +2621,7 @@ fn extract_physical_field(
                                         let delta_down = meta.edge_length(n, lower[n]);
                                         let ratio = delta / (delta + delta_down);
                                         upper * (1.0 - ratio)
-                                            + physical_at(values, meta, false, n, lower) * ratio
+                                            + physical_at(values, meta, false, n, lower, mode_type) * ratio
                                     }
                                 }
                             }
@@ -2371,18 +2630,18 @@ fn extract_physical_field(
                                 if pos.iter().zip(last.iter()).any(|(p, l)| *p >= *l) {
                                     0.0
                                 } else {
-                                    let mut summed = physical_at(values, meta, false, n, pos);
+                                    let mut summed = physical_at(values, meta, false, n, pos, mode_type);
                                     let mut probe = pos;
                                     probe[n_p] += 1;
-                                    summed += physical_at(values, meta, false, n, probe);
+                                    summed += physical_at(values, meta, false, n, probe, mode_type);
                                     probe[n_pp] += 1;
-                                    summed += physical_at(values, meta, false, n, probe);
+                                    summed += physical_at(values, meta, false, n, probe, mode_type);
                                     probe[n_p] -= 1;
-                                    summed += physical_at(values, meta, false, n, probe);
+                                    summed += physical_at(values, meta, false, n, probe, mode_type);
                                     summed / 4.0
                                 }
                             }
-                            _ => physical_at(values, meta, false, n, pos),
+                            _ => physical_at(values, meta, false, n, pos, mode_type),
                         }
                     } else {
                         match mode {
@@ -2394,14 +2653,14 @@ fn extract_physical_field(
                                 {
                                     0.0
                                 } else {
-                                    let mut summed = physical_at(values, meta, true, n, pos);
+                                    let mut summed = physical_at(values, meta, true, n, pos, mode_type);
                                     let mut probe = pos;
                                     probe[n_p] -= 1;
-                                    summed += physical_at(values, meta, true, n, probe);
+                                    summed += physical_at(values, meta, true, n, probe, mode_type);
                                     probe[n_pp] -= 1;
-                                    summed += physical_at(values, meta, true, n, probe);
+                                    summed += physical_at(values, meta, true, n, probe, mode_type);
                                     probe[n_p] += 1;
-                                    summed += physical_at(values, meta, true, n, probe);
+                                    summed += physical_at(values, meta, true, n, probe, mode_type);
                                     summed / 4.0
                                 }
                             }
@@ -2411,7 +2670,7 @@ fn extract_physical_field(
                                     0.0
                                 } else {
                                     let delta = meta.dual_edge_length(n, pos[n]);
-                                    let lower = physical_at(values, meta, true, n, pos);
+                                    let lower = physical_at(values, meta, true, n, pos, mode_type);
                                     let mut probe = pos;
                                     probe[n] += 1;
                                     let delta_up = meta.dual_edge_length(n, probe[n]);
@@ -2420,11 +2679,11 @@ fn extract_physical_field(
                                     } else {
                                         let ratio = delta / (delta + delta_up);
                                         lower * (1.0 - ratio)
-                                            + physical_at(values, meta, true, n, probe) * ratio
+                                            + physical_at(values, meta, true, n, probe, mode_type) * ratio
                                     }
                                 }
                             }
-                            _ => physical_at(values, meta, true, n, pos),
+                            _ => physical_at(values, meta, true, n, pos, mode_type),
                         }
                     };
                     *out.get_mut(n, ii, jj, kk) = value as f32;
@@ -3071,6 +3330,7 @@ mod engine_interface_tests {
             num_lines: [3, 3, 3],
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt: 1.0e-12,
+            materials: None,
         };
         let mut volt = FieldArray::new("volt", [3, 3, 3]);
         *volt.get_mut(0, 1, 1, 1) = 3.5;
@@ -3097,6 +3357,7 @@ mod engine_interface_tests {
             num_lines: [3, 3, 3],
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt: 1.0e-12,
+            materials: None,
         };
         let mut volt = FieldArray::new("volt", [3, 3, 3]);
         let curr = FieldArray::new("curr", [3, 3, 3]);
@@ -3154,6 +3415,7 @@ mod vtk_tests {
             num_lines: [3, 3, 3],
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt: 1.0e-12,
+            materials: None,
         };
         let mut volt = FieldArray::new("volt", [3, 3, 3]);
         *volt.get_mut(0, 1, 1, 1) = 5.0;
@@ -3190,6 +3452,7 @@ mod fd_dump_tests {
             num_lines: [3, 3, 3],
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt,
+            materials: None,
         }
     }
 
@@ -3311,6 +3574,7 @@ mod hdf5_dump_tests {
             num_lines: [3, 3, 3],
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt,
+            materials: None,
         }
     }
 
@@ -3332,6 +3596,9 @@ mod hdf5_dump_tests {
         }
         let mut dump = ProcessFieldsTD::new(&prefix, [0.0; 3], [2.0; 3]);
         dump.set_file_type(HDF5_FILETYPE);
+        // the native default is the NXYZ layout; Octave passes --legacyHDF5Dumps
+        assert!(!dump.get_legacy_format());
+        dump.set_legacy_format(true);
         let interface = EngineInterface {
             meta: &meta,
             volt: &volt,
@@ -3377,6 +3644,81 @@ mod hdf5_dump_tests {
     }
 
     #[test]
+    fn material_field_conversions_match_the_native_formulas() {
+        let mut meta = meta(1.0e-12);
+        // 3x3x3 cells, eps_r = 2, mue_r = 3, kappa = 4 on every component
+        meta.materials = Some(std::sync::Arc::new(vec![
+            crate::operator::CellMaterial {
+                eps_r: 2.0,
+                mue_r: 3.0,
+                kappa: 4.0,
+                sigma: 4.0,
+                is_pec: false,
+            };
+            3 * 3 * 3 * 3
+        ]));
+        let mut volt = FieldArray::new("volt", [3, 3, 3]);
+        let mut curr = FieldArray::new("curr", [3, 3, 3]);
+        *volt.get_mut(0, 1, 1, 1) = 5.0;
+        *curr.get_mut(0, 1, 1, 1) = 7.0;
+        // rot(H)_x at (1,1,1): (Hz(1,1,1) - Hy(1,1,1) + Hy(1,1,0) - Hz(1,0,1)) / area
+        *curr.get_mut(2, 1, 1, 1) = 2.0;
+        *curr.get_mut(1, 1, 1, 1) = 1.0;
+        *curr.get_mut(1, 1, 1, 0) = 3.0;
+        *curr.get_mut(2, 1, 0, 1) = 1.0;
+        let indices = [vec![1], vec![1], vec![1]];
+        // edge lengths are 1 m in this test mesh, so E = 5 V/m
+        let e_field = extract_physical_field(&volt, &indices, &meta, false, 0, 0);
+        assert_eq!(*e_field.get(0, 0, 0, 0), 5.0);
+        // J = kappa * E = 4 * 5
+        let j_field = extract_physical_field(&volt, &indices, &meta, false, 0, 2);
+        assert_eq!(*j_field.get(0, 0, 0, 0), 20.0);
+        // D = eps_r * E = 2 * 5
+        let d_field = extract_physical_field(&volt, &indices, &meta, false, 0, 4);
+        assert_eq!(*d_field.get(0, 0, 0, 0), 10.0);
+        // B = mue_r * H = 3 * 7
+        let b_field = extract_physical_field(&curr, &indices, &meta, false, 0, 5);
+        assert_eq!(*b_field.get(0, 0, 0, 0), 21.0);
+        // rot(H)_x = (2 - 1 + 3 - 1) / 1
+        let rot = extract_physical_field(&curr, &indices, &meta, false, 0, 3);
+        assert_eq!(*rot.get(0, 0, 0, 0), 3.0);
+    }
+
+    #[test]
+    fn frequency_domain_dump_crops_to_the_box() {
+        let prefix = temp_prefix("fd_crop");
+        let meta = meta(1.0e-12);
+        let volt = FieldArray::new("volt", [3, 3, 3]);
+        let curr = FieldArray::new("curr", [3, 3, 3]);
+        let mut dump = ProcessFieldsFD::new(&prefix, [1.0, 1.0, 1.0], [2.0, 2.0, 2.0]);
+        dump.set_bounds([1.0, 1.0, 1.0], [2.0, 2.0, 2.0]);
+        dump.set_file_type(HDF5_FILETYPE);
+        dump.add_frequency(1.0e9);
+        let interface = EngineInterface {
+            meta: &meta,
+            volt: &volt,
+            curr: &curr,
+        };
+        dump.process_fields(0, &interface);
+        dump.post_process();
+        let path = format!("{prefix}.h5");
+        let file = Hdf5File::open(&path, false).expect("open dump");
+        let (dims, x) = file.read_f64_dataset("/Mesh/x").unwrap();
+        assert_eq!(dims, vec![2]);
+        assert_eq!(x, vec![1.0, 2.0]);
+        let (field_dims, _, _) = file
+            .read_complex_f32_dataset("/FieldData/FD/f0")
+            .or_else(|_| {
+                file.read_f32_dataset("/FieldData/FD/f0_real")
+                    .map(|(dims, values)| (dims, values.clone(), Vec::new()))
+            })
+            .expect("field dataset");
+        assert_eq!(field_dims[field_dims.len() - 3..], [2, 2, 2]);
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn frequency_domain_dump_writes_native_hdf5_layout() {
         let prefix = temp_prefix("fd_h5");
         let meta = meta(1.0e-12);
@@ -3384,6 +3726,7 @@ mod hdf5_dump_tests {
         let curr = FieldArray::new("curr", [3, 3, 3]);
         let mut dump = ProcessFieldsFD::new(&prefix, [0.0; 3], [2.0; 3]);
         dump.set_file_type(HDF5_FILETYPE);
+        dump.set_legacy_format(true);
         dump.add_frequency(1.0e9);
         for step in 0..400u32 {
             let time = step as f64 * meta.dt;
@@ -3438,6 +3781,7 @@ mod dump_scheduling_tests {
             num_lines: [5, 5, 5],
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt: 1.0e-12,
+            materials: None,
         }
     }
 
@@ -3456,6 +3800,7 @@ mod dump_scheduling_tests {
             num_lines: [lines.len(), lines.len(), lines.len()],
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt: 1.0e-12,
+            materials: None,
         };
         assert_eq!(dump.dump_indices(0, &meta), vec![0, 1, 2, 3, 4]);
 

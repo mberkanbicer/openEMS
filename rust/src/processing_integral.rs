@@ -421,6 +421,7 @@ mod tests {
             num_lines: [3, 3, 3],
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt,
+            materials: None,
         }
     }
 
@@ -709,6 +710,7 @@ mod port_integral_tests {
             num_lines: [5, 5, 5],
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt: 1.0e-12,
+            materials: None,
         }
     }
 
@@ -724,7 +726,8 @@ mod port_integral_tests {
             num_lines: [101, 101, 201],
             disc_lines: [x.clone(), x, z],
             dt: 9.629166e-12,
-        };
+                materials: None,
+            };
         // native voltage probe: (0.0975,-0.0025,0.5) -> [70,50,100] and
         // (0.2275,-0.0025,0.5) -> [96,50,100]
         assert_eq!(
@@ -1178,6 +1181,7 @@ mod mode_match_tests {
             num_lines: [5, 5, 5],
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt: 1.0e-12,
+            materials: None,
         }
     }
 

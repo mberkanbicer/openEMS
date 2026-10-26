@@ -76,16 +76,17 @@ struct Args {
     exact_end_criteria: bool,
 
     /// Show probe discretization information.
-    #[arg(long = "showProbeDiscretization")]
-    show_probe_discretization: bool,
+    #[arg(long = "showProbeDiscretization", action = ArgAction::Count)]
+    show_probe_discretization: u8,
 
     /// Dump all fields using the native field components.
-    #[arg(long = "nativeFieldDumps")]
-    native_field_dumps: bool,
+    #[arg(long = "nativeFieldDumps", action = ArgAction::Count)]
+    native_field_dumps: u8,
 
-    /// Dump all fields using the legacy HDF5 layout.
-    #[arg(long = "legacyHDF5Dumps")]
-    legacy_hdf5_dumps: bool,
+    /// Dump all fields using the legacy HDF5 layout (repeatable, matching the
+    /// native boolean switch).
+    #[arg(long = "legacyHDF5Dumps", action = ArgAction::Count)]
+    legacy_hdf5_dumps: u8,
 
     /// Verbose level (repeatable: -v, -vv, -vvv).
     #[arg(short = 'v', long = "verbose", action = ArgAction::Count)]
@@ -155,7 +156,7 @@ fn main() -> ExitCode {
     sim.set_verbose_level(args.verbose as i32);
     sim.set_engine(&args.engine);
     sim.set_enable_dumps(!args.disable_dumps);
-    sim.set_legacy_hdf5_dumps(args.legacy_hdf5_dumps);
+    sim.set_legacy_hdf5_dumps(args.legacy_hdf5_dumps > 0);
     sim.set_no_simulation(args.no_simulation);
     sim.set_dump_statistics(args.dump_statistics);
     sim.set_exact_end_criteria(args.exact_end_criteria);
@@ -188,14 +189,14 @@ fn main() -> ExitCode {
         threads
     });
 
-    if args.show_probe_discretization {
+    if args.show_probe_discretization > 0 {
         if let Some(array) = sim.processing_array.as_ref() {
             println!("openEMS - probe process intervals: {:?}", array.process_intervals());
         } else {
             println!("openEMS - no probes registered");
         }
     }
-    if args.native_field_dumps {
+    if args.native_field_dumps > 0 {
         eprintln!(
             "openEMS - --nativeFieldDumps is not applied yet by the Rust dump layer"
         );

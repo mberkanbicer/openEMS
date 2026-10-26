@@ -45,6 +45,12 @@ pub trait OperatorBase {
     /// Get the grid drawing unit in m.
     fn get_grid_delta(&self) -> f64;
 
+    /// Per-component material grid, if the operator has one (native
+    /// `m_kappa_ptr` / `m_epsR_ptr` / `m_mueR_ptr` sources for field dumps).
+    fn material_grid_data(&self) -> Option<&[crate::operator::CellMaterial]> {
+        None
+    }
+
     /// Get the disc line in direction n at position pos (in drawing units).
     fn get_disc_line(&self, n: i32, pos: u32, dual_mesh: bool) -> f64;
 
