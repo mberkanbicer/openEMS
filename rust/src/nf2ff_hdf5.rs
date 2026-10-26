@@ -84,6 +84,51 @@ impl Nf2ffRunner {
         self.verbose = level;
     }
 
+    /// Set the relative permittivity of the surrounding medium.
+    ///
+    /// A single value applies to every frequency, a vector must match the
+    /// frequency count (native `nf2ff::SetPermittivity`).
+    pub fn set_permittivity(&mut self, permittivity: &[f64]) -> bool {
+        if permittivity.is_empty() {
+            return true;
+        }
+        if permittivity.len() != 1 && permittivity.len() != self.calculators.len() {
+            eprintln!(
+                "nf2ff::SetPermittivity: Error, permittivity vector size must match number of set frequencies! skipping!"
+            );
+            return false;
+        }
+        for (index, calculator) in self.calculators.iter_mut().enumerate() {
+            calculator.permittivity = if permittivity.len() == 1 {
+                permittivity[0]
+            } else {
+                permittivity[index]
+            };
+        }
+        true
+    }
+
+    /// Set the relative permeability of the surrounding medium.
+    pub fn set_permeability(&mut self, permeability: &[f64]) -> bool {
+        if permeability.is_empty() {
+            return true;
+        }
+        if permeability.len() != 1 && permeability.len() != self.calculators.len() {
+            eprintln!(
+                "nf2ff::SetPermeability: Error, permeability vector size must match number of set frequencies! skipping!"
+            );
+            return false;
+        }
+        for (index, calculator) in self.calculators.iter_mut().enumerate() {
+            calculator.permeability = if permeability.len() == 1 {
+                permeability[0]
+            } else {
+                permeability[index]
+            };
+        }
+        true
+    }
+
     pub fn set_legacy_format(&mut self, legacy: bool) {
         self.legacy_fmt = legacy;
     }
@@ -162,9 +207,6 @@ impl Nf2ffRunner {
         }
 
         let e_frequencies = read_frequencies(&e_dump)?;
-        if e_frequencies.is_empty() {
-            return Err(Nf2ffError::NoFrequencies);
-        }
         let h_frequencies = read_frequencies(&h_dump)?;
         let same_frequencies = e_frequencies.len() == h_frequencies.len()
             && e_frequencies
@@ -244,8 +286,7 @@ impl Nf2ffRunner {
         file.write_f32_dataset("/Mesh", "theta", &theta, None)?;
         file.write_f32_dataset("/Mesh", "phi", &phi, None)?;
         file.write_f32_dataset("/Mesh", "r", &[self.radius as f32], None)?;
-        file.write_f32_dataset("/Mesh", "MeshType", &[2.0], None)?;
-        file.write_i32_attribute("/Mesh", "mesh_type", 2)?;
+        file.write_f32_attribute_vector("/Mesh", "MeshType", &[2.0])?;
         file.write_f64_attribute("/", "openEMS_HDF5_version", 0.3)?;
         if self.legacy_fmt {
             file.write_bool_attribute("/", "legacy_fmt", true)?;
@@ -385,14 +426,40 @@ fn read_mesh(file: &Hdf5File) -> Result<MeshData, Nf2ffError> {
 }
 
 fn read_frequencies(file: &Hdf5File) -> Result<Vec<f64>, Nf2ffError> {
+    // A time-domain-only dump has no `/FieldData/FD` group at all; the native
+    // reader treats this as "no frequency data" and falls back to the DFT.
     match file.read_f64_attribute_vector("/FieldData/FD", "frequency") {
         Ok(values) => Ok(values),
-        Err(_) => Ok(file
-            .read_f32_attribute_vector("/FieldData/FD", "frequency")?
-            .into_iter()
-            .map(f64::from)
-            .collect()),
+        Err(_) => match file.read_f32_attribute_vector("/FieldData/FD", "frequency") {
+            Ok(values) => Ok(values.into_iter().map(f64::from).collect()),
+            Err(_) => Ok(Vec::new()),
+        },
     }
+}
+
+/// Read a stored component-major field and undo the `d_order` permutation.
+///
+/// Legacy Octave/MATLAB dumps store `(n, k, j, i)` (`NZYX`); everything else
+/// is `(n, i, j, k)`.
+fn read_field_nxyz(
+    file: &Hdf5File,
+    path: &str,
+) -> Result<([usize; 3], Vec<f32>), Nf2ffError> {
+    let (stored, values) = file.read_f32_dataset(path)?;
+    let order = file.read_string_attribute(path, "d_order").unwrap_or_default();
+    if stored.len() == 4 && stored[0] == 3 {
+        if order.to_ascii_uppercase().starts_with("NZYX") {
+            let dims = [stored[3], stored[2], stored[1]];
+            return Ok((dims, crate::hdf5::field_from_nzyx(&values, dims)));
+        }
+        return Ok(([stored[1], stored[2], stored[3]], values));
+    }
+    let dims = [
+        stored.get(2).copied().unwrap_or(0),
+        stored.get(1).copied().unwrap_or(0),
+        stored.get(0).copied().unwrap_or(0),
+    ];
+    Ok((dims, values))
 }
 
 fn read_complex_field(
@@ -401,7 +468,15 @@ fn read_complex_field(
     num_lines: [usize; 3],
 ) -> Result<ComplexField, Nf2ffError> {
     let path = format!("/FieldData/FD/f{index}");
-    let (dims, re, im) = file.read_complex_f32_dataset(&path)?;
+    // legacy dumps split the complex data into `<name>_real` / `<name>_imag`
+    let (dims, re, im) = match file.read_complex_f32_dataset(&path) {
+        Ok((dims, re, im)) => (dims, re, im),
+        Err(_) => {
+            let (real_dims, re) = read_field_nxyz(file, &format!("{path}_real"))?;
+            let (_, im) = read_field_nxyz(file, &format!("{path}_imag"))?;
+            (vec![3, real_dims[0], real_dims[1], real_dims[2]], re, im)
+        }
+    };
     if dims.len() != 4 || dims[0] < 3 {
         return Err(Nf2ffError::MissingData(path));
     }
@@ -456,13 +531,10 @@ fn read_time_domain(file: &Hdf5File) -> Result<TimeDomainData, Nf2ffError> {
     let mut dims = [0usize; 3];
     for (index, name) in names.iter().enumerate() {
         let path = format!("/FieldData/TD/{name}");
-        let (shape, values) = file.read_f32_dataset(&path)?;
-        if shape.len() != 4 || shape[0] < 3 {
-            return Err(Nf2ffError::MissingData(path));
-        }
+        let (shape, values) = read_field_nxyz(file, &path)?;
         if index == 0 {
-            dims = [shape[1], shape[2], shape[3]];
-        } else if [shape[1], shape[2], shape[3]] != dims {
+            dims = shape;
+        } else if shape != dims {
             return Err(Nf2ffError::MeshMismatch(format!(
                 "{path}: sample shape changed"
             )));

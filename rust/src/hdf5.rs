@@ -119,6 +119,25 @@ pub fn field_to_nzyx(values: &[f32], dims: [usize; 3]) -> Vec<f32> {
     out
 }
 
+/// Inverse of [`field_to_nzyx`]: restore `(n, i, j, k)` order from a stored
+/// `NZYX` dataset with dims `[nz, ny, nx]`.
+pub fn field_from_nzyx(values: &[f32], dims: [usize; 3]) -> Vec<f32> {
+    let [nx, ny, nz] = dims;
+    let mut out = vec![0.0f32; 3 * nx * ny * nz];
+    for n in 0..3 {
+        for k in 0..nz {
+            for j in 0..ny {
+                for i in 0..nx {
+                    let stored = n * nz * ny * nx + k * ny * nx + j * nx + i;
+                    out[n * nx * ny * nz + i * ny * nz + j * nz + k] =
+                        values.get(stored).copied().unwrap_or(0.0);
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(feature = "hdf5")]
 mod backend {
     use super::*;

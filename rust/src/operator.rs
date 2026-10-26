@@ -1432,14 +1432,25 @@ impl Operator {
                 return extension;
             };
             let params = structure.parameters();
-            let mut candidates: Vec<(i32, &ExcitationProperties, &Primitive)> = Vec::new();
+            let mut candidates: Vec<(
+                i32,
+                &ExcitationProperties,
+                &Primitive,
+                csxcad_core::grid::CoordinateSystem,
+            )> = Vec::new();
             for index in 0..structure.property_count() {
                 let Some(property) = structure.property_by_index(index) else {
                     continue;
                 };
                 if let Some(excitation) = property.excitation() {
+                    let coordinate_system = property.coordinate_input_type();
                     for primitive in property.primitives() {
-                        candidates.push((primitive.priority(), excitation, primitive));
+                        candidates.push((
+                            primitive.priority(),
+                            excitation,
+                            primitive,
+                            coordinate_system,
+                        ));
                     }
                 }
             }
@@ -1467,7 +1478,9 @@ impl Operator {
                                     yee_coordinates(disc_lines, counts, n, [i, j, k], dual);
                                 let mut winner: Option<&ExcitationProperties> = None;
                                 let mut winner_priority = i32::MIN;
-                                for (priority, excitation, primitive) in &candidates {
+                                let mut winner_coordinate_system =
+                                    csxcad_core::grid::CoordinateSystem::Cartesian;
+                                for (priority, excitation, primitive, coordinate_system) in &candidates {
                                     if winner.is_some() && *priority <= winner_priority {
                                         continue;
                                     }
@@ -1477,11 +1490,13 @@ impl Operator {
                                     {
                                         winner = Some(*excitation);
                                         winner_priority = *priority;
+                                        winner_coordinate_system = *coordinate_system;
                                     }
                                 }
                                 let Some(excitation) = winner else {
                                     continue;
                                 };
+                                let coordinate_system = winner_coordinate_system;
                                 if !excitation.is_enabled()
                                     || excitation.active_direction(n) != Some(true)
                                 {
@@ -1493,16 +1508,25 @@ impl Operator {
                                 if dual != is_current {
                                     continue;
                                 }
+                                // Native `GetWeightedExcitation`: the weight
+                                // function is evaluated at the Yee vertex that
+                                // the operator exposes (metres, as returned by
+                                // `GetYeeCoords`), including the origin shift.
+                                let vertex = coordinate;
+                                let weight = excitation
+                                    .weighted_excitation_weight(
+                                        n,
+                                        Some(params),
+                                        vertex,
+                                        coordinate_system,
+                                    )
+                                    .unwrap_or(1.0);
                                 let base_amp = excitation
                                     .excitation(n, Some(params))
                                     .ok()
                                     .flatten()
                                     .unwrap_or(0.0)
-                                    * excitation
-                                        .weighting(n, Some(params))
-                                        .ok()
-                                        .flatten()
-                                        .unwrap_or(1.0);
+                                    * weight;
                                 if base_amp == 0.0 {
                                     continue;
                                 }
@@ -3325,6 +3349,7 @@ impl Operator {
         let iv = self.iv_ptr.as_mut().ok_or("iv coefficients not allocated")?;
 
         let mut extensions = Vec::new();
+        let debug_upml = std::env::var_os("OPENEMS_DEBUG_UPML").is_some();
         for (start, stop) in regions {
             if start.iter().zip(stop.iter()).any(|(low, high)| low > high) {
                 continue;
@@ -3334,6 +3359,14 @@ impl Operator {
                 stop[1] - start[1] + 1,
                 stop[2] - start[2] + 1,
             ];
+            if debug_upml {
+                eprintln!(
+                    "[debug] UPML region {start:?}..{stop:?} ({} cells), bc={bc:?} sizes={sizes:?}",
+                    local[0] * local[1] * local[2]
+                );
+            }
+            let mut enabled_cells = 0usize;
+            let mut disabled_cells = 0usize;
             let mut extension = EngineExtUPML::new(start, local);
             for l0 in 0..local[0] {
                 for l1 in 0..local[1] {
@@ -3373,6 +3406,7 @@ impl Operator {
                                 && main_vv + main_vi != 0.0
                                 && edge_area > 0.0
                             {
+                                enabled_cells += 1;
                                 let denom = 2.0 * EPS0 + kappa_v[n_p] * dt;
                                 let vv_new = ((2.0 * EPS0 - kappa_v[n_p] * dt) / denom) as f32;
                                 let vi_new = ((2.0 * EPS0 * dt) / denom * edge_len / edge_area)
@@ -3390,6 +3424,7 @@ impl Operator {
                                     ((2.0 * EPS0 - kappa_v[n] * dt) / denom_pp / eps_scale)
                                         as f32;
                             } else {
+                                disabled_cells += 1;
                                 *extension.vv[n].get_mut(0, l0, l1, l2) = main_vv;
                                 *vv.get_mut(n, pos[0], pos[1], pos[2]) = 0.0;
                                 *extension.vvfo[n].get_mut(0, l0, l1, l2) = 0.0;
@@ -3430,6 +3465,11 @@ impl Operator {
                 }
             }
             extensions.push(extension);
+            if debug_upml {
+                eprintln!(
+                    "[debug] UPML region {start:?}..{stop:?}: {enabled_cells} enabled, {disabled_cells} disabled component cells"
+                );
+            }
         }
         Ok(extensions)
     }

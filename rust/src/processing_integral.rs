@@ -5,6 +5,19 @@
 
 use crate::processing::{ComplexPoint, EngineInterface, EngineMeta, Processing};
 
+/// Format a sample the way C++ `setprecision(p)` does (general format, `p`
+/// significant digits).
+///
+/// Rust's `Display` for floats always uses fixed notation, which would quantise
+/// a 1.44e-10 time step to 1 ps and break the uniform sampling grid the
+/// Octave/MATLAB FFT assumes.
+fn format_sample(value: f64, precision: usize) -> String {
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    format!("{:.*e}", precision.saturating_sub(1), value)
+}
+
 /// One integral quantity computed from the running fields.
 ///
 /// Mirrors the `ProcessIntegral::CalcMultipleIntegrals` override point in the
@@ -189,14 +202,10 @@ impl ProcessIntegral {
             );
             return;
         };
-        let mut line = format!("{:.precision$}", time, precision = self.precision);
+        let mut line = format_sample(time, self.precision);
         for value in &self.results {
             line.push('\t');
-            line.push_str(&format!(
-                "{:.precision$}",
-                value * self.weight,
-                precision = self.precision
-            ));
+            line.push_str(&format_sample(value * self.weight, self.precision));
         }
         line.push('\n');
         if let Err(error) = file.write_all(line.as_bytes()) {
@@ -231,7 +240,7 @@ impl ProcessIntegral {
         }
         text.push('\n');
         for (index, frequency) in self.fd_samples.iter().enumerate() {
-            text.push_str(&format!("{frequency:.precision$}", precision = self.precision));
+            text.push_str(&format_sample(*frequency, self.precision));
             for row in 0..self.results.len() {
                 let value = self
                     .fd_results
@@ -239,12 +248,10 @@ impl ProcessIntegral {
                     .and_then(|values| values.get(index))
                     .copied()
                     .unwrap_or_default();
-                text.push_str(&format!(
-                    "\t{:.precision$}\t{:.precision$}",
-                    value.re * factor,
-                    value.im * factor,
-                    precision = self.precision
-                ));
+                text.push('\t');
+                text.push_str(&format_sample(value.re * factor, self.precision));
+                text.push('\t');
+                text.push_str(&format_sample(value.im * factor, self.precision));
             }
             text.push('\n');
         }
@@ -491,7 +498,17 @@ mod tests {
         let fd_file = format!("{filename}_FD");
         let fd_text = std::fs::read_to_string(&fd_file).expect("FD file");
         assert!(fd_text.contains("frequency-domain integral"));
-        assert!(fd_text.contains("10000000000"));
+        let first_data = fd_text
+            .lines()
+            .skip(3)
+            .next()
+            .expect("FD data row")
+            .split_whitespace()
+            .next()
+            .expect("frequency column")
+            .parse::<f64>()
+            .expect("numeric frequency");
+        assert!((first_data - 10.0e9).abs() <= 1.0e-3);
 
         let _ = std::fs::remove_file(&filename);
         let _ = std::fs::remove_file(fd_file);
@@ -521,8 +538,8 @@ impl VoltageIntegral {
         if let Some(indices) = self.snapped {
             return Some(indices);
         }
-        let start = meta.index_from_coordinates(self.start)?;
-        let stop = meta.index_from_coordinates(self.stop)?;
+        let start = meta.snap_to_mesh(self.start, false, false);
+        let stop = meta.snap_to_mesh(self.stop, false, false);
         self.snapped = Some((start, stop));
         Some((start, stop))
     }
@@ -590,8 +607,9 @@ impl CurrentIntegral {
         if let Some(indices) = self.snapped {
             return Some(indices);
         }
-        let start = meta.index_from_coordinates(self.start)?;
-        let stop = meta.index_from_coordinates(self.stop)?;
+        // current probes live on the dual mesh (native `SetDualMesh`)
+        let start = meta.snap_to_mesh(self.start, true, false);
+        let stop = meta.snap_to_mesh(self.stop, true, false);
         self.snapped = Some((start, stop));
         Some((start, stop))
     }
@@ -694,59 +712,103 @@ mod port_integral_tests {
         }
     }
 
+    /// The native `SnapToMeshLine` on the Coax mesh.
+    ///
+    /// The reference values are taken from the native openEMS 0.37.0 probe
+    /// headers for `combinedtests/Coax` (5 mm grid starting at -252.5 mm).
+    #[test]
+    fn snapping_reproduces_the_native_coax_indices() {
+        let x: Vec<f64> = (0..101).map(|index| (-252.5 + 5.0 * index as f64) * 1e-3).collect();
+        let z: Vec<f64> = (0..201).map(|index| (5.0 * index as f64) * 1e-3).collect();
+        let meta = EngineMeta {
+            num_lines: [101, 101, 201],
+            disc_lines: [x.clone(), x, z],
+            dt: 9.629166e-12,
+        };
+        // native voltage probe: (0.0975,-0.0025,0.5) -> [70,50,100] and
+        // (0.2275,-0.0025,0.5) -> [96,50,100]
+        assert_eq!(
+            meta.snap_to_mesh([0.1, 0.0, 0.5], false, false),
+            [70, 50, 100]
+        );
+        assert_eq!(
+            meta.snap_to_mesh([0.23, 0.0, 0.5], false, false),
+            [96, 50, 100]
+        );
+        // native current probe: (-0.1175,-0.1175,0.495) -> [27,27,99] and
+        // (0.1125,0.1125,0.495) -> [73,73,99]
+        assert_eq!(
+            meta.snap_to_mesh([-0.115, -0.115, 0.5], true, false),
+            [27, 27, 99]
+        );
+        assert_eq!(
+            meta.snap_to_mesh([0.115, 0.115, 0.5], true, false),
+            [73, 73, 99]
+        );
+        // dumps use the full mesh, so the last line is reachable
+        assert_eq!(
+            meta.snap_to_mesh([0.2525, 0.2525, 1.0], false, true),
+            [100, 100, 200]
+        );
+    }
+
     #[test]
     fn voltage_integral_sums_the_line_voltages() {
+        let meta = meta();
         let mut volt = FieldArray::new("volt", [5, 5, 5]);
         let curr = FieldArray::new("curr", [5, 5, 5]);
-        for i in 2..5 {
-            *volt.get_mut(0, i, 1, 1) = 1.0;
+        let start = meta.snap_to_mesh([2.0, 1.0, 1.0], false, false);
+        let stop = meta.snap_to_mesh([3.5, 1.0, 1.0], false, false);
+        assert_eq!(start, [2, 1, 1]);
+        assert_eq!(stop, [3, 1, 1]);
+        for i in start[0]..stop[0] {
+            *volt.get_mut(0, i, start[1], start[2]) = 5.0;
         }
-        let meta = meta();
         let interface = EngineInterface {
             meta: &meta,
             volt: &volt,
             curr: &curr,
         };
-        // Coordinates map to indices 2..4; the native integral uses [start, stop).
-        let mut voltage = VoltageIntegral::new([0.0, 1.0, 1.0], [4.0, 1.0, 1.0]);
-        assert_eq!(voltage.calc(1, &interface), vec![2.0]);
-        // Reversed direction flips the sign.
-        let mut reversed = VoltageIntegral::new([4.0, 1.0, 1.0], [0.0, 1.0, 1.0]);
-        assert_eq!(reversed.calc(1, &interface), vec![-2.0]);
+        // the native integral uses [start, stop)
+        let mut voltage = VoltageIntegral::new([2.0, 1.0, 1.0], [3.5, 1.0, 1.0]);
+        assert_eq!(voltage.calc(1, &interface), vec![5.0]);
+        // reversed direction flips the sign
+        let mut reversed = VoltageIntegral::new([3.5, 1.0, 1.0], [2.0, 1.0, 1.0]);
+        assert_eq!(reversed.calc(1, &interface), vec![-5.0]);
     }
 
     #[test]
     fn current_integral_walks_the_surface_perimeter() {
-        let volt = FieldArray::new("volt", [5, 5, 5]);
-        let mut curr = FieldArray::new("curr", [5, 5, 5]);
-        // x-normal surface at x=2, y in 1..=3, z in 1..=3.
-        // y-currents on the z-low edge (positive) and z-high edge (negative).
-        for y in 2..=3 {
-            *curr.get_mut(1, 2, y, 1) = 2.0;
-            *curr.get_mut(1, 2, y, 3) = 2.0;
-        }
-        // z-currents on the y-high edge (positive) and y-low edge (negative).
-        for z in 2..=3 {
-            *curr.get_mut(2, 2, 3, z) = 3.0;
-            *curr.get_mut(2, 2, 1, z) = 3.0;
-        }
         let meta = meta();
+        let volt = FieldArray::new("volt", [5, 5, 5]);
+        let start = meta.snap_to_mesh([2.0, 1.0, 1.0], true, false);
+        let stop = meta.snap_to_mesh([2.0, 3.0, 3.0], true, false);
+        let mut curr = FieldArray::new("curr", [5, 5, 5]);
+        // y-currents on the z-low edge (positive) and z-high edge (negative)
+        for y in (start[1] + 1)..=stop[1] {
+            *curr.get_mut(1, stop[0], y, start[2]) = 2.0;
+            *curr.get_mut(1, stop[0], y, stop[2]) = 2.0;
+        }
+        // z-currents on the y-high edge (positive) and y-low edge (negative)
+        for z in (start[2] + 1)..=stop[2] {
+            *curr.get_mut(2, stop[0], stop[1], z) = 3.0;
+            *curr.get_mut(2, stop[0], start[1], z) = 3.0;
+        }
         let interface = EngineInterface {
             meta: &meta,
             volt: &volt,
             curr: &curr,
         };
         let mut current = CurrentIntegral::new([2.0, 1.0, 1.0], [2.0, 3.0, 3.0], 0);
-        // +2*2 (y, z-low) + 3*2 (z, y-high) - 2*2 (y, z-high) - 3*2 (z, y-low)
         assert_eq!(current.calc(1, &interface), vec![0.0]);
 
-        // Remove the negative edges: the loop becomes 4 + 6 = 10.
+        // only the positive edges remain: 4 + 6 = 10
         let mut curr2 = FieldArray::new("curr", [5, 5, 5]);
-        for y in 2..=3 {
-            *curr2.get_mut(1, 2, y, 1) = 2.0;
+        for y in (start[1] + 1)..=stop[1] {
+            *curr2.get_mut(1, stop[0], y, start[2]) = 2.0;
         }
-        for z in 2..=3 {
-            *curr2.get_mut(2, 2, 3, z) = 3.0;
+        for z in (start[2] + 1)..=stop[2] {
+            *curr2.get_mut(2, stop[0], stop[1], z) = 3.0;
         }
         let interface = EngineInterface {
             meta: &meta,
@@ -777,7 +839,8 @@ impl FieldProbeIntegral {
         if let Some(index) = self.snapped {
             return Some(index);
         }
-        let index = meta.index_from_coordinates(self.position)?;
+        // native `SetDualMesh` for H-field probes
+        let index = meta.snap_to_mesh(self.position, self.field_type == 1, false);
         self.snapped = Some(index);
         Some(index)
     }
@@ -801,6 +864,8 @@ impl IntegralCalculator for FieldProbeIntegral {
         let Some(index) = self.index(interface.meta) else {
             return vec![0.0; 3];
         };
+        // native `GetEField` / `GetHField`: the EC voltage/current divided by
+        // the edge length (dual mesh for H).
         let field = if self.field_type == 0 {
             interface.volt
         } else {
@@ -808,7 +873,17 @@ impl IntegralCalculator for FieldProbeIntegral {
         };
         (0..3)
             .map(|component| {
-                *field.get(component, index[0], index[1], index[2]) as f64
+                let raw = *field.get(component, index[0], index[1], index[2]) as f64;
+                let length = if self.field_type == 0 {
+                    interface.meta.edge_length(component, index[component])
+                } else {
+                    interface.meta.dual_edge_length(component, index[component])
+                };
+                if length > 0.0 {
+                    raw / length
+                } else {
+                    0.0
+                }
             })
             .collect()
     }

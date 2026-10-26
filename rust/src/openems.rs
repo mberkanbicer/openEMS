@@ -56,6 +56,9 @@ pub struct OpenEMS {
     /// Cylindrical multi-grid radii (native `m_CC_MultiGrid`).
     pub multi_grid: Vec<f64>,
     pub max_time: f64,
+    /// Write field dumps in the legacy Octave/MATLAB HDF5 layout
+    /// (native `--legacyHDF5Dumps` / `g_settings.GetLegacyHDF5Dumps`).
+    pub legacy_hdf5_dumps: bool,
     pub time_step_method: i32,
     pub time_step: f64,
     pub time_step_factor: f64,
@@ -109,7 +112,10 @@ impl OpenEMS {
             mur_v_ph: [0.0; 6],
             multi_grid: Vec::new(),
             max_time: 0.0,
-            time_step_method: 0,
+            legacy_hdf5_dumps: false,
+            // native `openEMS::openEMS()` default: 3 (Rennings_2), the largest
+            // stable step on rectilinear meshes
+            time_step_method: 3,
             time_step: 0.0,
             time_step_factor: 1.0,
             abort: false,
@@ -193,6 +199,15 @@ impl OpenEMS {
     /// Set maximum simulation time (overrides nr_ts if reached first).
     pub fn set_max_time(&mut self, val: f64) {
         self.max_time = val;
+    }
+
+    /// Write field dumps in the legacy Octave/MATLAB HDF5 layout.
+    pub fn set_legacy_hdf5_dumps(&mut self, val: bool) {
+        self.legacy_hdf5_dumps = val;
+    }
+
+    pub fn get_legacy_hdf5_dumps(&self) -> bool {
+        self.legacy_hdf5_dumps
     }
 
     /// Set the timestep method.
@@ -340,6 +355,35 @@ impl OpenEMS {
             }
         }
         match &options.excitation {
+            Some(crate::fdtd_options::FdtdExcitation::Gauss { f0, fc }) => {
+                self.set_gauss_excite(*f0, *fc);
+            }
+            Some(crate::fdtd_options::FdtdExcitation::Sinus { f0 }) => {
+                self.set_sinus_excite(*f0);
+            }
+            Some(crate::fdtd_options::FdtdExcitation::Dirac { f_max }) => {
+                self.set_dirac_excite(*f_max);
+            }
+            Some(crate::fdtd_options::FdtdExcitation::Step { f_max }) => {
+                self.set_step_excite(*f_max);
+            }
+            Some(crate::fdtd_options::FdtdExcitation::Custom { function, f0, f_max }) => {
+                self.set_custom_excite(function, *f0, *f_max);
+            }
+            None => {}
+        }
+    }
+
+    /// Apply the `<Excitation>` child of `<FDTD>` if the document has one.
+    ///
+    /// Native `openEMS::ParseFDTDSetup` reads the excitation from the input
+    /// file; only an input file without any excitation falls back to the
+    /// default pulse.
+    pub fn apply_excitation_option(
+        &mut self,
+        excitation: Option<&crate::fdtd_options::FdtdExcitation>,
+    ) {
+        match excitation {
             Some(crate::fdtd_options::FdtdExcitation::Gauss { f0, fc }) => {
                 self.set_gauss_excite(*f0, *fc);
             }
@@ -708,6 +752,22 @@ impl OpenEMS {
         if let Some(value) = options.coord_system {
             self.cylinder_coords = value == 1;
         }
+        // The `<Excitation>` child of `<FDTD>` defines the source waveform
+        // (native `ParseFDTDSetup`); without one the documented default pulse
+        // below applies.
+        self.apply_excitation_option(options.excitation.as_ref());
+        if std::env::var_os("OPENEMS_DEBUG_PROBES").is_some() {
+            eprintln!("[debug] parsed excitation: {:?}", options.excitation);
+        }
+        // `<BoundaryCond>` of `<FDTD>` sets the six faces and their PML
+        // thicknesses (native `ParseFDTDSetup` + boundary setup).
+        if let Some(bc) = options.bc_type {
+            self.bc_type = bc;
+            self.bc_type_set = true;
+        }
+        if let Some(pml) = options.pml_size {
+            self.pml_size = pml;
+        }
         let mut op = Operator::new();
         if let Err(error) = op.load_csx(&xml) {
             eprintln!("[openEMS] Failed to load CSXCAD geometry: {error}");
@@ -914,19 +974,20 @@ impl OpenEMS {
         self.fdtd_eng = Some(Box::new(engine));
         self.fdtd_op = None; // operator is owned by the engine
 
-        // Native `SetupProcessing`: every `ProbeBox` property becomes a
-        // processing object that streams its time-domain data to a file.
+        // Native `SetupProcessing`: every `ProbeBox` and `DumpBox` property
+        // becomes a processing object that streams its data to a file.
         self.setup_csx_probes(&xml);
+        self.setup_csx_dumps(&xml);
 
         true
     }
 
-    /// Create the probe processings from the CSX `ProbeBox` properties.
+    /// Create the field-dump processings from the CSX `DumpBox` properties.
     ///
-    /// Mirrors `openEMS::SetupProcessing` for probe boxes: voltage probes use a
-    /// line integral, current probes a surface integral, field probes all three
-    /// components at one cell, and mode-match probes an overlap integral.
-    fn setup_csx_probes(&mut self, xml: &str) {
+    /// Mirrors `openEMS::SetupProcessing` for dump boxes: time-domain dumps
+    /// (`DumpType` 0..5) use the global oversampling, H- and B-field dumps the
+    /// dual mesh and the half timestep, and both are cropped to the box.
+    fn setup_csx_dumps(&mut self, xml: &str) {
         let Ok(structure) = csxcad_core::model::Structure::from_xml_str(xml) else {
             return;
         };
@@ -950,6 +1011,151 @@ impl OpenEMS {
         } else {
             1
         };
+
+        let mut array = self
+            .processing_array
+            .take()
+            .unwrap_or_else(|| ProcessingArray::new(u32::MAX));
+        let mut created = 0usize;
+        for property in structure.properties_by_type(csxcad_core::model::PropertyType::DumpBox) {
+            let Some(dump) = property.dump_box() else {
+                continue;
+            };
+            let multiple = property.primitive_count() > 1;
+            for (index, primitive) in property.primitives().iter().enumerate() {
+                let name = if multiple {
+                    format!("{}_{}", property.name(), index)
+                } else {
+                    property.name().to_string()
+                };
+                let Ok(bounds) = primitive.bounding_box(None, true) else {
+                    continue;
+                };
+                let start = [
+                    bounds[0] * grid_delta,
+                    bounds[2] * grid_delta,
+                    bounds[4] * grid_delta,
+                ];
+                let stop = [
+                    bounds[1] * grid_delta,
+                    bounds[3] * grid_delta,
+                    bounds[5] * grid_delta,
+                ];
+                let dump_type = dump.dump_type();
+                match dump_type {
+                    0..=5 => {
+                        if dump_type > 1 {
+                            eprintln!(
+                                "[openEMS] SetupFDTD: Warning: dump type {} of property '{}' needs the material field conversion and is not implemented yet... skipping",
+                                dump_type,
+                                property.name()
+                            );
+                            continue;
+                        }
+                        let mut processing =
+                            crate::processing::ProcessFieldsTD::new(&name, start, stop);
+                        processing.set_bounds(start, stop);
+                        processing.set_dump_type(dump_type);
+                        processing.set_file_type(dump.file_type());
+                        processing.set_dump_mode(dump.dump_mode());
+                        processing.set_legacy_format(self.legacy_hdf5_dumps);
+                        processing.set_process_interval(interval);
+                        if dump.sub_sampling_enabled() {
+                            for (axis, value) in dump.sub_sampling().iter().enumerate() {
+                                processing.set_sub_sampling(*value as i32, axis as i32);
+                            }
+                        }
+                        if dump.optimal_resolution_enabled() {
+                            for (axis, value) in dump.optimal_resolution().iter().enumerate() {
+                                processing.set_opt_resolution(*value, axis as i32);
+                            }
+                        }
+                        if dump_type == 1 {
+                            processing.set_dual_time(true);
+                            processing.set_dual_mesh(true);
+                        }
+                        // native `SetDumpMode` overrides the H dual-mesh default
+                        match dump.dump_mode() {
+                            1 => processing.set_dual_mesh(false),
+                            2 => processing.set_dual_mesh(true),
+                            _ => {}
+                        }
+                        array.add_processing(Box::new(processing));
+                        created += 1;
+                    }
+                    10..=15 => {
+                        eprintln!(
+                            "[openEMS] SetupFDTD: Warning: frequency-domain dump type {} of property '{}' is not implemented yet... skipping",
+                            dump_type,
+                            property.name()
+                        );
+                    }
+                    other => {
+                        eprintln!(
+                            "[openEMS] SetupFDTD: unknown dump box type {} of property '{}'... skipping",
+                            other,
+                            property.name()
+                        );
+                    }
+                }
+            }
+        }
+        self.processing_array = Some(array);
+        if created > 0 && self.verbose_level > 0 {
+            println!("[openEMS] {} field dump(s) configured", created);
+        }
+    }
+
+    /// Create the probe processings from the CSX `ProbeBox` properties.
+    ///
+    /// Mirrors `openEMS::SetupProcessing` for probe boxes: voltage probes use a
+    /// line integral, current probes a surface integral, field probes all three
+    /// components at one cell, and mode-match probes an overlap integral.
+    fn setup_csx_probes(&mut self, xml: &str) {
+        let debug = std::env::var_os("OPENEMS_DEBUG_PROBES").is_some();
+        let structure = match csxcad_core::model::Structure::from_xml_str(xml) {
+            Ok(structure) => structure,
+            Err(error) => {
+                if debug {
+                    eprintln!("[debug] probe setup: CSX parse failed: {error}");
+                }
+                return;
+            }
+        };
+        if debug {
+            let count = structure
+                .properties_by_type(csxcad_core::model::PropertyType::ProbeBox)
+                .count();
+            eprintln!("[debug] probe setup: {count} probe box properties");
+        }
+        let Some(engine) = self.fdtd_eng.as_ref() else {
+            return;
+        };
+        let dt = engine.op.get_timestep();
+        let grid_delta = engine.op.get_grid_delta();
+        let f_max = self
+            .excitation
+            .as_ref()
+            .map(|signal| signal.f_max)
+            .unwrap_or(0.0);
+        let nyquist = if f_max > 0.0 && dt > 0.0 {
+            (1.0 / f_max / 2.0 / dt).floor() as u32
+        } else {
+            0
+        };
+        let interval = if nyquist > 0 {
+            (nyquist / self.over_sampling.max(1)).max(1)
+        } else {
+            1
+        };
+        if std::env::var_os("OPENEMS_DEBUG_PROBES").is_some() {
+            eprintln!(
+                "[debug] setup probes: dt={dt:e} f_max={f_max:e} f0={:?} fc={:?} nyquist={nyquist} over={} interval={interval}",
+                self.excitation.as_ref().map(|s| s.f0),
+                self.excitation.as_ref().map(|s| s.fc),
+                self.over_sampling
+            );
+        }
 
         let mut array = self
             .processing_array
@@ -1158,6 +1364,18 @@ impl OpenEMS {
             nr_ts.min(max_ts_time)
         };
 
+        // Native `Process` runs once at ts=0 before the first field update, so
+        // every stream starts with its t=0 sample.
+        if let Some(ref mut pa) = processing {
+            let engine = self.fdtd_eng.as_ref().expect("engine checked above");
+            let interface = EngineInterface {
+                meta: &engine_meta,
+                volt: &engine.volt_ptr,
+                curr: &engine.curr_ptr,
+            };
+            pa.process_fields(0, &interface);
+        }
+
         let mut ts = 0u32;
         let mut change: f64 = 1.0;
         let mut max_energy: f64 = 0.0;
@@ -1209,7 +1427,14 @@ impl OpenEMS {
 
             // Progress reporting every 100 steps.
             if ts.is_multiple_of(100) {
-                println!("[openEMS] Timestep: {}", ts);
+                if std::env::var_os("OPENEMS_DEBUG_ENERGY").is_some() {
+                    println!(
+                        "[openEMS] Timestep: {ts} || Energy change: {change:.3e} ({:.2} dB)",
+                        -10.0 * change.max(1e-300).log10()
+                    );
+                } else {
+                    println!("[openEMS] Timestep: {}", ts);
+                }
             }
         }
 
@@ -1551,7 +1776,8 @@ mod processing_wiring_tests {
         }));
         assert!(sim.setup_fdtd());
         assert!(sim.run_fdtd());
-        assert_eq!(calls.load(Ordering::Relaxed), 10);
+        // ten timesteps plus the native t=0 sample
+        assert_eq!(calls.load(Ordering::Relaxed), 11);
     }
 }
 
@@ -1560,6 +1786,7 @@ mod upml_absorption_tests {
     use crate::engine::Engine;
     use crate::excitation::Excitation;
     use crate::extensions::EngineExtExcitation;
+    use crate::openems::{BC_PEC, BC_PML};
     use crate::operator::Operator;
     use std::sync::Arc;
 
@@ -1587,24 +1814,28 @@ mod upml_absorption_tests {
     }
 
     fn run_pulse(pml: bool) -> Vec<f64> {
+        run_pulse_faces([pml; 6])
+    }
+
+    /// `pml_faces` selects which of the six faces get a PML; the rest are PEC.
+    fn run_pulse_faces(pml_faces: [bool; 6]) -> Vec<f64> {
         let (nx, ny, nz) = (41usize, 21usize, 21usize);
         let delta = 1.0e-3;
         let mut op = Operator::new();
         op.load_csx(&uniform_xml(nx, ny, nz, delta))
             .expect("uniform CSX should load");
-        op.base.m_bc = if pml {
-            [crate::openems::BC_PML; 6]
-        } else {
-            [crate::openems::BC_PEC; 6]
-        };
+        op.base.m_bc =
+            std::array::from_fn(|face| if pml_faces[face] { BC_PML } else { BC_PEC });
         op.calc_timestep();
         let dt = op.base.d_t;
         op.calc_ec_operator();
         op.apply_electric_bc();
         op.apply_magnetic_bc();
 
-        let extensions = if pml {
-            op.build_upml_extensions([8; 6]).expect("UPML should build")
+        let sizes: [u32; 6] = std::array::from_fn(|face| if pml_faces[face] { 8 } else { 0 });
+        let extensions = if pml_faces.iter().any(|&face| face) {
+            op.build_upml_extensions(sizes)
+                .expect("UPML should build")
         } else {
             Vec::new()
         };
@@ -1672,6 +1903,7 @@ mod upml_absorption_tests {
             "UPML tail {tail:e} should be far below PEC tail {pec_tail:e}"
         );
     }
+
 }
 
 #[cfg(test)]

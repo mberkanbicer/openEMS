@@ -155,6 +155,7 @@ fn main() -> ExitCode {
     sim.set_verbose_level(args.verbose as i32);
     sim.set_engine(&args.engine);
     sim.set_enable_dumps(!args.disable_dumps);
+    sim.set_legacy_hdf5_dumps(args.legacy_hdf5_dumps);
     sim.set_no_simulation(args.no_simulation);
     sim.set_dump_statistics(args.dump_statistics);
     sim.set_exact_end_criteria(args.exact_end_criteria);
@@ -194,10 +195,9 @@ fn main() -> ExitCode {
             println!("openEMS - no probes registered");
         }
     }
-    if args.native_field_dumps || args.legacy_hdf5_dumps {
+    if args.native_field_dumps {
         eprintln!(
-            "openEMS - the native/legacy dump-layout switches are not applied yet by the \
-             Rust dump layer"
+            "openEMS - --nativeFieldDumps is not applied yet by the Rust dump layer"
         );
     }
 

@@ -96,6 +96,94 @@ impl EngineMeta {
         }
     }
 
+    /// Primary edge length of component `axis` at `index`, in metres.
+    ///
+    /// Mirrors the native `GetEdgeLength(n, pos, false)`.
+    pub fn edge_length(&self, axis: usize, index: usize) -> f64 {
+        let lines = &self.disc_lines[axis];
+        let count = self.num_lines[axis];
+        if lines.len() < 2 || index >= count {
+            return 0.0;
+        }
+        if index + 1 < count && index + 1 < lines.len() {
+            lines[index + 1] - lines[index]
+        } else if index > 0 {
+            lines[index] - lines[index - 1]
+        } else {
+            0.0
+        }
+    }
+
+    /// Dual (cell-centre) edge length of component `axis` at `index`, in
+    /// metres. Mirrors the native `GetEdgeLength(n, pos, true)`.
+    pub fn dual_edge_length(&self, axis: usize, index: usize) -> f64 {
+        let lines = &self.disc_lines[axis];
+        let count = self.num_lines[axis];
+        if lines.len() < 2 || index >= count {
+            return 0.0;
+        }
+        if index > 0 {
+            self.dual_line(axis, index) - self.dual_line(axis, index - 1)
+        } else {
+            lines[1] - lines[0]
+        }
+    }
+
+    /// Native `Operator::SnapToMeshLine`.
+    ///
+    /// `dual` picks the dual (cell-centre) field, `full_mesh` selects the last
+    /// mesh line as the upper bound (dumps) instead of the last field line
+    /// (probes). Outside the mesh the index clamps to the boundary line.
+    pub fn snap_to_mesh_line(
+        &self,
+        axis: usize,
+        coordinate: f64,
+        dual: bool,
+        full_mesh: bool,
+    ) -> usize {
+        let count_all = self.num_lines[axis];
+        if count_all == 0 {
+            return 0;
+        }
+        let lines = &self.disc_lines[axis];
+        if lines.len() < 2 {
+            return 0;
+        }
+        if coordinate < lines[0] {
+            return 0;
+        }
+        let count = if full_mesh {
+            count_all
+        } else {
+            count_all.saturating_sub(1)
+        };
+        if count == 0 {
+            return 0;
+        }
+        if coordinate > lines[count - 1] {
+            return count - 1;
+        }
+        if !dual {
+            for index in 0..count {
+                if coordinate <= self.dual_line(axis, index) {
+                    return index;
+                }
+            }
+        } else {
+            for index in 1..count {
+                if coordinate <= lines[index] {
+                    return index - 1;
+                }
+            }
+        }
+        0
+    }
+
+    /// Snap a coordinate triple the way the native `SnapToMesh` does.
+    pub fn snap_to_mesh(&self, coordinates: [f64; 3], dual: bool, full_mesh: bool) -> [usize; 3] {
+        [0, 1, 2].map(|axis| self.snap_to_mesh_line(axis, coordinates[axis], dual, full_mesh))
+    }
+
     /// Map a physical coordinate to the nearest dual-mesh index.
     #[allow(dead_code)]
     pub fn index_from_dual_coordinates(&self, coordinates: [f64; 3]) -> Option<[usize; 3]> {
@@ -238,8 +326,16 @@ pub trait Processing {
     fn dump_box_to_file(&self, _vtk_filename_prefix: &str, _dual_mesh: bool) {}
     /// Set dual mesh flag.
     fn set_dual_mesh(&mut self, _val: bool) {}
+    /// Get dual mesh flag.
+    fn get_dual_mesh(&self) -> bool {
+        false
+    }
     /// Set dual time flag.
     fn set_dual_time(&mut self, _val: bool) {}
+    /// Get dual time flag.
+    fn get_dual_time(&self) -> bool {
+        false
+    }
 }
 
 /// Manages a collection of [`Processing`] objects.
@@ -1019,6 +1115,15 @@ pub struct ProcessFieldsTD {
     process_steps: Vec<u32>,
     ps_pos: usize,
     initialized: bool,
+    /// Dump box bounds in metres (native `DefineStartStopCoord`); `None` dumps
+    /// the whole grid.
+    bounds: Option<([f64; 3], [f64; 3])>,
+    /// Write the dual (cell-centre) mesh coordinates, native `SetDualMesh`.
+    dual_mesh: bool,
+    /// Sample at the half timestep, native `SetDualTime`.
+    dual_time: bool,
+    /// Write the legacy (Octave/MATLAB) HDF5 layout, native `--legacyHDF5Dumps`.
+    legacy_fmt: bool,
 }
 
 impl ProcessFieldsTD {
@@ -1037,7 +1142,31 @@ impl ProcessFieldsTD {
             process_steps: Vec::new(),
             ps_pos: 0,
             initialized: false,
+            bounds: None,
+            dual_mesh: false,
+            dual_time: false,
+            legacy_fmt: false,
         }
+    }
+
+    /// Select the legacy (Octave/MATLAB) HDF5 field layout.
+    pub fn set_legacy_format(&mut self, legacy: bool) {
+        self.legacy_fmt = legacy;
+    }
+
+    pub fn get_legacy_format(&self) -> bool {
+        self.legacy_fmt
+    }
+
+    /// Restrict the dump to a box (metres), native `DefineStartStopCoord`.
+    pub fn set_bounds(&mut self, start: [f64; 3], stop: [f64; 3]) {
+        let mut low = [0.0f64; 3];
+        let mut high = [0.0f64; 3];
+        for axis in 0..3 {
+            low[axis] = start[axis].min(stop[axis]);
+            high[axis] = start[axis].max(stop[axis]);
+        }
+        self.bounds = Some((low, high));
     }
 
     pub fn get_processing_name(&self) -> String {
@@ -1090,25 +1219,43 @@ impl ProcessFieldsTD {
 
     /// Mesh indices written by this dump, mirroring `ProcessFields::CalcMeshPos`.
     /// A positive optical resolution wins over the integer sub-sampling rate.
-    pub fn dump_indices(&self, axis: usize, lines: &[f64]) -> Vec<usize> {
-        let count = lines.len();
+    pub fn dump_indices(&self, axis: usize, meta: &EngineMeta) -> Vec<usize> {
+        let count = meta.num_lines[axis];
         if count == 0 {
             return Vec::new();
         }
-        if self.opt_resolution[axis] > 0.0 && count > 1 {
+        let coordinate = |index: usize| {
+            if self.dual_mesh {
+                meta.dual_line(axis, index)
+            } else {
+                meta.disc_lines[axis][index]
+            }
+        };
+        let (first, last) = match self.bounds {
+            Some((start, stop)) => {
+                let low = meta.snap_to_mesh_line(axis, start[axis], self.dual_mesh, true);
+                let high = meta.snap_to_mesh_line(axis, stop[axis], self.dual_mesh, true);
+                (low.min(high), low.max(high))
+            }
+            None => (0, count - 1),
+        };
+        if self.opt_resolution[axis] > 0.0 && last > first {
             let resolution = self.opt_resolution[axis];
-            let mut indices = Vec::new();
-            let mut last = f64::NEG_INFINITY;
-            for (index, &coordinate) in lines.iter().enumerate() {
-                if indices.is_empty() || (coordinate - last).abs() >= resolution - 1e-15 {
+            let mut indices = vec![first];
+            let mut previous = coordinate(first);
+            for index in (first + 1)..last {
+                if (coordinate(index + 1) - previous).abs() >= resolution - 1e-15 {
                     indices.push(index);
-                    last = coordinate;
+                    previous = coordinate(index);
                 }
+            }
+            if first != last {
+                indices.push(last);
             }
             indices
         } else {
             let stride = self.sub_sampling[axis].max(1) as usize;
-            (0..count).step_by(stride).collect()
+            (first..=last).step_by(stride).collect()
         }
     }
 
@@ -1162,6 +1309,22 @@ impl Processing for ProcessFieldsTD {
         self.process_interval
     }
 
+    fn set_dual_mesh(&mut self, val: bool) {
+        self.dual_mesh = val;
+    }
+
+    fn get_dual_mesh(&self) -> bool {
+        self.dual_mesh
+    }
+
+    fn set_dual_time(&mut self, val: bool) {
+        self.dual_time = val;
+    }
+
+    fn get_dual_time(&self) -> bool {
+        self.dual_time
+    }
+
     fn add_step(&mut self, step: u32) {
         if !self.process_steps.contains(&step) {
             self.process_steps.push(step);
@@ -1196,27 +1359,26 @@ impl Processing for ProcessFieldsTD {
         // Dump mesh: native `CalcMeshPos` reduces the written grid by
         // sub-sampling or optical resolution.
         let indices = [
-            self.dump_indices(0, &interface.meta.disc_lines[0]),
-            self.dump_indices(1, &interface.meta.disc_lines[1]),
-            self.dump_indices(2, &interface.meta.disc_lines[2]),
+            self.dump_indices(0, interface.meta),
+            self.dump_indices(1, interface.meta),
+            self.dump_indices(2, interface.meta),
         ];
         let dims = [indices[0].len(), indices[1].len(), indices[2].len()];
-        let coordinates: [Vec<f64>; 3] = [
-            indices[0]
+        let coordinates: [Vec<f64>; 3] = [0, 1, 2].map(|axis| {
+            indices[axis]
                 .iter()
-                .map(|&index| interface.meta.disc_lines[0][index])
-                .collect(),
-            indices[1]
-                .iter()
-                .map(|&index| interface.meta.disc_lines[1][index])
-                .collect(),
-            indices[2]
-                .iter()
-                .map(|&index| interface.meta.disc_lines[2][index])
-                .collect(),
-        ];
+                .map(|&index| {
+                    if self.dual_mesh {
+                        interface.meta.dual_line(axis, index)
+                    } else {
+                        interface.meta.disc_lines[axis][index]
+                    }
+                })
+                .collect()
+        });
         let coordinate_refs: [&[f64]; 3] = [&coordinates[0], &coordinates[1], &coordinates[2]];
-        let reduced = extract_field(field, &indices);
+        let reduced =
+            extract_physical_field(field, &indices, interface.meta, self.dual_mesh, self.dump_mode);
 
         if self.file_type == HDF5_FILETYPE {
             // Native: /FieldData/TD/<8-digit timestep> + a `time` attribute.
@@ -1224,14 +1386,21 @@ impl Processing for ProcessFieldsTD {
             let writer = HDF5FileWriter::new(&format!("{}.h5", self.name));
             let result = (|| -> Result<(), Hdf5Error> {
                 if !self.initialized {
-                    writer.create(self.dump_type, false, true)?;
+                    writer.create(self.dump_type, false, self.legacy_fmt)?;
                     writer.write_rect_mesh(dims, coordinate_refs, 0, 1.0)?;
                     self.initialized = true;
                 }
-                writer.write_vector_field("/FieldData/TD", &dataset, &reduced, dims, true)?;
+                writer.write_vector_field(
+                    "/FieldData/TD",
+                    &dataset,
+                    &reduced,
+                    dims,
+                    self.legacy_fmt,
+                )?;
                 writer.write_time_attribute(
                     &format!("/FieldData/TD/{dataset}"),
-                    (num_ts as f64 * interface.meta.dt) as f32,
+                    ((num_ts as f64 + if self.dual_time { 0.5 } else { 0.0 })
+                        * interface.meta.dt) as f32,
                 )
             })();
             if let Err(error) = result {
@@ -1555,6 +1724,7 @@ impl ProcessFieldsFD {
                     &self.acc_im[index],
                     dims,
                     *frequency,
+                    true,
                 )?;
             }
             Ok(())
@@ -2044,7 +2214,8 @@ impl HDF5FileWriter {
         }
     }
 
-    /// Write the real and imaginary parts of a complex field in legacy order.
+    /// Write one complex field, in the legacy split layout (`<name>_real` /
+    /// `<name>_imag`, `NZYX`) or as one compound `NXYZ` dataset.
     pub fn write_complex_field(
         &self,
         group: &str,
@@ -2053,8 +2224,22 @@ impl HDF5FileWriter {
         im: &[f32],
         dims: [usize; 3],
         frequency: f64,
+        legacy: bool,
     ) -> Result<(), Hdf5Error> {
         let file = Hdf5File::open(&self.filename, true)?;
+        if !legacy {
+            file.write_complex_f32_dataset(
+                group,
+                dataset,
+                &[3, dims[0], dims[1], dims[2]],
+                re,
+                im,
+                Some("NXYZ"),
+            )?;
+            let path = format!("{group}/{dataset}");
+            file.write_f64_attribute(&path, "frequency", frequency)?;
+            return Ok(());
+        }
         let real = crate::hdf5::field_to_nzyx(re, dims);
         let imag = crate::hdf5::field_to_nzyx(im, dims);
         let shape = [3, dims[2], dims[1], dims[0]];
@@ -2102,6 +2287,154 @@ fn extract_field(values: &FieldArray, indices: &[Vec<usize>; 3]) -> FieldArray {
     }
     out
 }
+/// Physical field value (native `GetRawField`): the EC voltage/current divided
+/// by the edge length. `dual` selects the dual (H/B) mesh.
+fn physical_at(
+    values: &FieldArray,
+    meta: &EngineMeta,
+    dual: bool,
+    component: usize,
+    pos: [usize; 3],
+) -> f64 {
+    if pos[0] >= meta.num_lines[0] || pos[1] >= meta.num_lines[1] || pos[2] >= meta.num_lines[2]
+    {
+        return 0.0;
+    }
+    let length = if dual {
+        meta.dual_edge_length(component, pos[component])
+    } else {
+        meta.edge_length(component, pos[component])
+    };
+    if length <= 0.0 {
+        return 0.0;
+    }
+    *values.get(component, pos[0], pos[1], pos[2]) as f64 / length
+}
+
+/// Extract a field dump, mirroring the native `GetRawInterpolatedField` and
+/// `GetRawInterpolatedDualField`:
+///
+/// * mode 0 (no interpolation): raw field at the mesh position,
+/// * mode 1 (node interpolation): E between two edges, H averaged over four,
+/// * mode 2 (cell interpolation): E averaged over four, H between two.
+///
+/// `dual` selects the dual array (H/B); the native `SetDumpMode` already
+/// selected the matching mesh.
+fn extract_physical_field(
+    values: &FieldArray,
+    indices: &[Vec<usize>; 3],
+    meta: &EngineMeta,
+    dual: bool,
+    mode: i32,
+) -> FieldArray {
+    let dims = [indices[0].len(), indices[1].len(), indices[2].len()];
+    let mut out = FieldArray::new("dump", dims);
+    let last = [
+        meta.num_lines[0].saturating_sub(1),
+        meta.num_lines[1].saturating_sub(1),
+        meta.num_lines[2].saturating_sub(1),
+    ];
+    for n in 0..3 {
+        let n_p = (n + 1) % 3;
+        let n_pp = (n + 2) % 3;
+        for (ii, &i) in indices[0].iter().enumerate() {
+            for (jj, &j) in indices[1].iter().enumerate() {
+                for (kk, &k) in indices[2].iter().enumerate() {
+                    let pos = [i, j, k];
+                    let value = if !dual {
+                        match mode {
+                            1 => {
+                                // node interpolation of the primary (E) field
+                                if pos[n] == last[n] {
+                                    let mut lower = pos;
+                                    lower[n] = lower[n].saturating_sub(1);
+                                    physical_at(values, meta, false, n, lower)
+                                } else {
+                                    let delta = meta.edge_length(n, pos[n]);
+                                    let upper = physical_at(values, meta, false, n, pos);
+                                    if delta <= 0.0 {
+                                        0.0
+                                    } else if pos[n] == 0 {
+                                        upper
+                                    } else {
+                                        let mut lower = pos;
+                                        lower[n] -= 1;
+                                        let delta_down = meta.edge_length(n, lower[n]);
+                                        let ratio = delta / (delta + delta_down);
+                                        upper * (1.0 - ratio)
+                                            + physical_at(values, meta, false, n, lower) * ratio
+                                    }
+                                }
+                            }
+                            2 => {
+                                // cell interpolation of the primary (E) field
+                                if pos.iter().zip(last.iter()).any(|(p, l)| *p >= *l) {
+                                    0.0
+                                } else {
+                                    let mut summed = physical_at(values, meta, false, n, pos);
+                                    let mut probe = pos;
+                                    probe[n_p] += 1;
+                                    summed += physical_at(values, meta, false, n, probe);
+                                    probe[n_pp] += 1;
+                                    summed += physical_at(values, meta, false, n, probe);
+                                    probe[n_p] -= 1;
+                                    summed += physical_at(values, meta, false, n, probe);
+                                    summed / 4.0
+                                }
+                            }
+                            _ => physical_at(values, meta, false, n, pos),
+                        }
+                    } else {
+                        match mode {
+                            1 => {
+                                // node interpolation of the dual (H) field
+                                if pos.iter().zip(last.iter()).any(|(p, l)| *p >= *l)
+                                    || pos[n_p] == 0
+                                    || pos[n_pp] == 0
+                                {
+                                    0.0
+                                } else {
+                                    let mut summed = physical_at(values, meta, true, n, pos);
+                                    let mut probe = pos;
+                                    probe[n_p] -= 1;
+                                    summed += physical_at(values, meta, true, n, probe);
+                                    probe[n_pp] -= 1;
+                                    summed += physical_at(values, meta, true, n, probe);
+                                    probe[n_p] += 1;
+                                    summed += physical_at(values, meta, true, n, probe);
+                                    summed / 4.0
+                                }
+                            }
+                            2 => {
+                                // cell interpolation of the dual (H) field
+                                if pos[n] >= last[n] {
+                                    0.0
+                                } else {
+                                    let delta = meta.dual_edge_length(n, pos[n]);
+                                    let lower = physical_at(values, meta, true, n, pos);
+                                    let mut probe = pos;
+                                    probe[n] += 1;
+                                    let delta_up = meta.dual_edge_length(n, probe[n]);
+                                    if delta + delta_up <= 0.0 {
+                                        0.0
+                                    } else {
+                                        let ratio = delta / (delta + delta_up);
+                                        lower * (1.0 - ratio)
+                                            + physical_at(values, meta, true, n, probe) * ratio
+                                    }
+                                }
+                            }
+                            _ => physical_at(values, meta, true, n, pos),
+                        }
+                    };
+                    *out.get_mut(n, ii, jj, kk) = value as f32;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn field_values(values: &FieldArray, dims: [usize; 3]) -> Vec<f32> {
     let [nx, ny, nz] = dims;
     let mut out = Vec::with_capacity(3 * nx * ny * nz);
@@ -3119,16 +3452,22 @@ mod dump_scheduling_tests {
     fn sub_sampling_and_optical_resolution_reduce_the_dump_mesh() {
         let lines = vec![0.0, 1.0, 2.0, 3.0, 4.0];
         let mut dump = ProcessFieldsTD::new("d", [0.0; 3], [4.0; 3]);
-        assert_eq!(dump.dump_indices(0, &lines), vec![0, 1, 2, 3, 4]);
+        let meta = EngineMeta {
+            num_lines: [lines.len(), lines.len(), lines.len()],
+            disc_lines: [lines.clone(), lines.clone(), lines],
+            dt: 1.0e-12,
+        };
+        assert_eq!(dump.dump_indices(0, &meta), vec![0, 1, 2, 3, 4]);
 
         dump.set_sub_sampling(2, -1);
-        assert_eq!(dump.dump_indices(0, &lines), vec![0, 2, 4]);
+        assert_eq!(dump.dump_indices(0, &meta), vec![0, 2, 4]);
         dump.set_sub_sampling(3, 1);
-        assert_eq!(dump.dump_indices(1, &lines), vec![0, 3]);
-        assert_eq!(dump.dump_indices(0, &lines), vec![0, 2, 4]);
+        assert_eq!(dump.dump_indices(1, &meta), vec![0, 3]);
+        assert_eq!(dump.dump_indices(0, &meta), vec![0, 2, 4]);
 
         dump.set_opt_resolution(2.5, -1);
-        assert_eq!(dump.dump_indices(0, &lines), vec![0, 3]);
+        // native CalcMeshPos keeps the index whose next line is far enough
+        assert_eq!(dump.dump_indices(0, &meta), vec![0, 2, 4]);
         assert_eq!(dump.sub_sampling, [1, 1, 1]);
     }
 
