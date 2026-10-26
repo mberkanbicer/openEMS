@@ -440,6 +440,7 @@ mod tests {
             dt,
             materials: None,
             mesh_type: crate::operator::MeshType::Cartesian,
+            grid_delta: 1.0,
         }
     }
 
@@ -750,6 +751,7 @@ mod port_integral_tests {
             dt: 1.0e-12,
             materials: None,
             mesh_type: crate::operator::MeshType::Cartesian,
+            grid_delta: 1.0,
         }
     }
 
@@ -767,6 +769,7 @@ mod port_integral_tests {
             dt: 9.629166e-12,
                 materials: None,
             mesh_type: crate::operator::MeshType::Cartesian,
+            grid_delta: 1.0,
             };
         // native voltage probe: (0.0975,-0.0025,0.5) -> [70,50,100] and
         // (0.2275,-0.0025,0.5) -> [96,50,100]
@@ -934,9 +937,9 @@ impl IntegralCalculator for FieldProbeIntegral {
             .map(|component| {
                 let raw = *field.get(component, index[0], index[1], index[2]) as f64;
                 let length = if self.field_type == 0 {
-                    interface.meta.edge_length(component, index[component])
+                    interface.meta.edge_length(component, index)
                 } else {
-                    interface.meta.dual_edge_length(component, index[component])
+                    interface.meta.dual_edge_length(component, index)
                 };
                 if length > 0.0 {
                     raw / length
@@ -1239,6 +1242,7 @@ mod mode_match_tests {
             dt: 1.0e-12,
             materials: None,
             mesh_type: crate::operator::MeshType::Cartesian,
+            grid_delta: 1.0,
         }
     }
 

@@ -55,6 +55,9 @@ pub struct EngineMeta {
     pub materials: Option<std::sync::Arc<Vec<crate::operator::CellMaterial>>>,
     /// Discretisation metric of the mesh (Cartesian or cylindrical).
     pub mesh_type: crate::operator::MeshType,
+    /// Simulation length unit in metres (native `GetGridDelta`), recorded in
+    /// the dump files as `mesh_scaling`.
+    pub grid_delta: f64,
 }
 
 impl EngineMeta {
@@ -116,21 +119,77 @@ impl EngineMeta {
     /// Face area of component `axis` at `pos`, in square metres (native
     /// `GetEdgeArea`).
     pub fn edge_area(&self, axis: usize, pos: [usize; 3]) -> f64 {
+        if self.is_cylindrical() {
+            return self.cyl_edge_area(axis, pos);
+        }
         let n_p = (axis + 1) % 3;
         let n_pp = (axis + 2) % 3;
-        self.edge_length(n_p, pos[n_p]) * self.edge_length(n_pp, pos[n_pp])
+        self.edge_length(n_p, pos) * self.edge_length(n_pp, pos)
     }
 
-    /// Primary edge length of component `axis` at `index`, in metres.
+    /// Primary edge length of component `axis` at `pos`, in metres.
     ///
-    /// Mirrors the native `GetEdgeLength(n, pos, false)`.
-    pub fn edge_length(&self, axis: usize, index: usize) -> f64 {
+    /// Mirrors the native `GetEdgeLength(n, pos, false)`: on a cylindrical
+    /// mesh an alpha edge carries the `rho` factor of the requested position
+    /// (`Operator_Cylinder::GetEdgeLength`). `disc_lines[0]` is metres and
+    /// `disc_lines[1]` radians, so the product is the physical length.
+    pub fn edge_length(&self, axis: usize, pos: [usize; 3]) -> f64 {
+        let base = self.base_width(axis, pos[axis], false);
+        if base == 0.0 {
+            return 0.0;
+        }
+        if axis == 1 && self.is_cylindrical() {
+            return base * self.line(0, pos[0]);
+        }
+        base
+    }
+
+    /// Dual (cell-centre) edge length of component `axis` at `pos`, in
+    /// metres. Mirrors the native `GetEdgeLength(n, pos, true)`.
+    pub fn dual_edge_length(&self, axis: usize, pos: [usize; 3]) -> f64 {
+        let base = self.base_width(axis, pos[axis], true);
+        if base == 0.0 {
+            return 0.0;
+        }
+        if axis == 1 && self.is_cylindrical() {
+            return base * self.dual_line(0, pos[0]);
+        }
+        base
+    }
+
+    /// Mesh line of `axis` clamped into the stored range (metres for rho and
+    /// z, radians for a cylindrical alpha).
+    fn line(&self, axis: usize, index: usize) -> f64 {
+        let lines = &self.disc_lines[axis];
+        if lines.is_empty() {
+            return 0.0;
+        }
+        lines[index.min(lines.len() - 1)]
+    }
+
+    /// True for a cylindrical `(rho, alpha, z)` mesh.
+    fn is_cylindrical(&self) -> bool {
+        matches!(
+            self.mesh_type,
+            crate::operator::MeshType::Cylindrical { .. }
+        )
+    }
+
+    /// Line-difference width across `index` without the cylindrical `rho`
+    /// factor (the base `Operator::GetEdgeLength`).
+    fn base_width(&self, axis: usize, index: usize, dual: bool) -> f64 {
         let lines = &self.disc_lines[axis];
         let count = self.num_lines[axis];
         if lines.len() < 2 || index >= count {
             return 0.0;
         }
-        if index + 1 < count && index + 1 < lines.len() {
+        if dual {
+            if index > 0 {
+                self.dual_line(axis, index) - self.dual_line(axis, index - 1)
+            } else {
+                lines[1] - lines[0]
+            }
+        } else if index + 1 < count && index + 1 < lines.len() {
             lines[index + 1] - lines[index]
         } else if index > 0 {
             lines[index] - lines[index - 1]
@@ -139,19 +198,73 @@ impl EngineMeta {
         }
     }
 
-    /// Dual (cell-centre) edge length of component `axis` at `index`, in
-    /// metres. Mirrors the native `GetEdgeLength(n, pos, true)`.
-    pub fn dual_edge_length(&self, axis: usize, index: usize) -> f64 {
-        let lines = &self.disc_lines[axis];
-        let count = self.num_lines[axis];
-        if lines.len() < 2 || index >= count {
-            return 0.0;
+    /// Native `Operator_Cylinder::GetEdgeArea(ny, pos, false)`: the rho face
+    /// is spanned by the dual alpha/z lengths, a z face is the annulus node
+    /// area and the alpha face falls back to the dual node widths.
+    fn cyl_edge_area(&self, axis: usize, pos: [usize; 3]) -> f64 {
+        if axis == 0 {
+            return self.dual_edge_length(1, pos) * self.dual_edge_length(2, pos);
         }
-        if index > 0 {
-            self.dual_line(axis, index) - self.dual_line(axis, index - 1)
+        if axis == 2 {
+            return self.cyl_node_area_z(pos, false);
+        }
+        // native fallback `GetNodeArea(1, pos, false)`, which is
+        // `GetNodeWidth(2,..,false) * GetNodeWidth(0,..,false)`, i.e. the
+        // dual (inverted flag) base widths of z and rho.
+        self.base_width(2, pos[2], true) * self.base_width(0, pos[0], true)
+    }
+
+    /// Native `Operator_Cylinder::GetNodeArea` for a z face: the annulus
+    /// segment between the rho lines that bound the requested cell. `da` uses
+    /// the requested mesh, the bounding rho lines the inverted one.
+    fn cyl_node_area_z(&self, pos: [usize; 3], dual: bool) -> f64 {
+        let da = self.base_width(1, pos[1], dual);
+        let (r1, r2) = if dual {
+            let r1 = self.line(0, pos[0]);
+            (r1, r1 + self.base_width(0, pos[0], false))
         } else {
-            lines[1] - lines[0]
+            let r2 = self.dual_line(0, pos[0]);
+            (r2 - self.base_width(0, pos[0], true), r2)
+        };
+        if r1 <= 0.0 {
+            0.5 * da * r2 * r2
+        } else {
+            0.5 * da * (r2 * r2 - r1 * r1)
         }
+    }
+
+    /// Native `Operator_Cylinder::FitToAlphaRange` (default `fullMesh=false`):
+    /// wrap an azimuthal coordinate into the mesh range.
+    pub fn fit_alpha(&self, coordinate: f64) -> f64 {
+        let lines = &self.disc_lines[1];
+        if lines.len() < 2 {
+            return coordinate;
+        }
+        let min = lines[0];
+        let max = self.line(1, self.num_lines[1].saturating_sub(2).saturating_sub(1));
+        if (coordinate >= min) && (coordinate <= max) {
+            return coordinate;
+        }
+        let mut value = coordinate;
+        while value < min {
+            value += std::f64::consts::TAU;
+            if value > max {
+                return value - std::f64::consts::TAU;
+            }
+            if value > min {
+                return value;
+            }
+        }
+        while value > max {
+            value -= std::f64::consts::TAU;
+            if value < min {
+                return value + std::f64::consts::TAU;
+            }
+            if value < max {
+                return value;
+            }
+        }
+        value
     }
 
     /// Native `Operator::SnapToMeshLine`.
@@ -174,6 +287,19 @@ impl EngineMeta {
         if lines.len() < 2 {
             return 0;
         }
+        // native `Operator_Cylinder::SnapToMeshLine`: an azimuthal coordinate
+        // wraps into the mesh range before the regular nearest-line search.
+        let coordinate = if axis == 1
+            && matches!(
+                self.mesh_type,
+                crate::operator::MeshType::Cylindrical {
+                    closed_alpha: true
+                }
+            ) {
+            self.fit_alpha(coordinate)
+        } else {
+            coordinate
+        };
         if coordinate < lines[0] {
             return 0;
         }
@@ -269,6 +395,15 @@ pub struct EngineInterface<'a> {
 pub enum MeshType {
     Cartesian,
     Cylindrical,
+}
+
+/// Native `Processing::MeshType` as the integer the HDF5/VTK writers use
+/// (`0` cartesian, `1` cylindrical).
+pub fn mesh_type_code(mesh_type: MeshType) -> i32 {
+    match mesh_type {
+        MeshType::Cartesian => 0,
+        MeshType::Cylindrical => 1,
+    }
 }
 
 /// Base trait for processing objects that sample the running simulation.
@@ -1160,6 +1295,8 @@ pub struct ProcessFieldsTD {
     dual_time: bool,
     /// Write the legacy (Octave/MATLAB) HDF5 layout, native `--legacyHDF5Dumps`.
     legacy_fmt: bool,
+    /// Mesh type for the dump files, native `SetMeshType`.
+    mesh_type: MeshType,
 }
 
 impl ProcessFieldsTD {
@@ -1182,7 +1319,13 @@ impl ProcessFieldsTD {
             dual_mesh: false,
             dual_time: false,
             legacy_fmt: false,
+            mesh_type: MeshType::Cartesian,
         }
+    }
+
+    /// Set the mesh type of the dump files, native `SetMeshType`.
+    pub fn set_mesh_type_value(&mut self, mesh_type: MeshType) {
+        self.mesh_type = mesh_type;
     }
 
     /// Select the legacy (Octave/MATLAB) HDF5 field layout.
@@ -1299,6 +1442,10 @@ impl Processing for ProcessFieldsTD {
         self.name.clone()
     }
 
+    fn set_mesh_type(&mut self, mesh_type: MeshType) {
+        self.mesh_type = mesh_type;
+    }
+
     fn set_name(&mut self, val: &str) {
         self.name = val.to_string();
     }
@@ -1400,7 +1547,13 @@ impl Processing for ProcessFieldsTD {
             let result = (|| -> Result<(), Hdf5Error> {
                 if !self.initialized {
                     writer.create(self.dump_type, false, self.legacy_fmt)?;
-                    writer.write_rect_mesh(dims, coordinate_refs, 0, 1.0)?;
+                    writer.write_rect_mesh(
+                        dims,
+                        coordinate_refs,
+                        mesh_type_code(self.mesh_type),
+                        1.0,
+                        interface.meta.grid_delta,
+                    )?;
                     self.initialized = true;
                 }
                 writer.write_vector_field(
@@ -1426,9 +1579,17 @@ impl Processing for ProcessFieldsTD {
             // Native VTK writer default pad length is 10.
             let prefix = format!("{}_{num_ts:010}", self.name);
             let writer = VTKFileWriter::new(&prefix);
-            if let Err(error) =
+            let result = if self.mesh_type == MeshType::Cylindrical {
+                writer.write_structured_grid_cylindrical(
+                    &field_name,
+                    dims,
+                    coordinate_refs,
+                    &reduced,
+                )
+            } else {
                 writer.write_structured_grid(&field_name, dims, coordinate_refs, &reduced)
-            {
+            };
+            if let Err(error) = result {
                 eprintln!("[openEMS] Failed to write time-domain dump '{prefix}': {error}");
             }
         }
@@ -1451,6 +1612,11 @@ pub struct ProcessFieldsFD {
     stop: [f64; 3],
     dump_type: i32,
     file_type: i32,
+    /// Mesh type for the dump files, native `SetMeshType`.
+    mesh_type: MeshType,
+    /// Simulation length unit captured from the engine meta (native
+    /// `GetGridDelta`), written as the `mesh_scaling` attribute.
+    grid_delta: f64,
     fd_oversampling: u32,
     frequencies: Vec<f64>,
     fd_interval: u32,
@@ -1489,6 +1655,8 @@ impl ProcessFieldsFD {
             stop,
             dump_type: 0, // E_FIELD_DUMP
             file_type: VTK_FILETYPE,
+            mesh_type: MeshType::Cartesian,
+            grid_delta: 1.0,
             fd_oversampling: 4,
             frequencies: Vec::new(),
             fd_interval: 0,
@@ -1688,6 +1856,10 @@ impl Processing for ProcessFieldsFD {
         self.name.clone()
     }
 
+    fn set_mesh_type(&mut self, mesh_type: MeshType) {
+        self.mesh_type = mesh_type;
+    }
+
     fn set_name(&mut self, val: &str) {
         self.name = val.to_string();
     }
@@ -1746,6 +1918,7 @@ impl Processing for ProcessFieldsFD {
         if !num_ts.is_multiple_of(interval) {
             return 0;
         }
+        self.grid_delta = interface.meta.grid_delta;
         if self.indices.is_none() {
             let indices = [
                 compute_dump_indices(
@@ -1896,7 +2069,13 @@ impl ProcessFieldsFD {
             writer.create(self.dump_type, false, true)?;
             if let Some(lines) = &self.disc_lines {
                 let references: [&[f64]; 3] = [&lines[0], &lines[1], &lines[2]];
-                writer.write_rect_mesh(dims, references, 0, 1.0)?;
+                writer.write_rect_mesh(
+                    dims,
+                    references,
+                    mesh_type_code(self.mesh_type),
+                    1.0,
+                    self.grid_delta,
+                )?;
             }
             writer.write_frequency_list(&self.frequencies)?;
             for (index, frequency) in self.frequencies.iter().enumerate() {
@@ -1954,14 +2133,16 @@ impl ProcessFieldsFD {
                     }
                 }
             }
-            let _ = write_rectilinear_vtr(
+            write_fd_dump(
+                self.mesh_type,
                 &format!("{}_f={label}_abs", self.name),
                 &field_name,
                 dims,
                 &coordinates,
                 &magnitude,
             );
-            let _ = write_rectilinear_vtr(
+            write_fd_dump(
+                self.mesh_type,
                 &format!("{}_f={label}_arg", self.name),
                 &field_name,
                 dims,
@@ -1989,7 +2170,8 @@ impl ProcessFieldsFD {
                     }
                 }
                 let degrees = (angle * 180.0 / std::f64::consts::PI).round() as i32;
-                let _ = write_rectilinear_vtr(
+                write_fd_dump(
+                    self.mesh_type,
                     &format!("{}_f={label}_p={degrees:03}", self.name),
                     &field_name,
                     dims,
@@ -2060,6 +2242,99 @@ fn write_rectilinear_vtr(
     text.push_str("      </Coordinates>\n");
     text.push_str("    </Piece>\n  </RectilinearGrid>\n</VTKFile>\n");
     std::fs::write(format!("{prefix}.vtr"), text)
+}
+
+/// Write a cylindrical mesh dump as a VTK XML structured grid (`.vts`),
+/// mirroring the native `VTK_File_Writer` with `MeshType == 1`: the points
+/// convert to Cartesian `x = r*cos(a)`, `y = r*sin(a)` and the field is one
+/// rotated vector array (`AddVectorField`).
+fn write_structured_vts_cylindrical(
+    prefix: &str,
+    field_name: &str,
+    dims: [usize; 3],
+    lines: &[Vec<f64>; 3],
+    values: &FieldArray,
+) -> std::io::Result<()> {
+    let [nx, ny, nz] = dims;
+    let mut text = String::new();
+    text.push_str("<?xml version=\"1.0\"?>\n");
+    text.push_str(
+        "<VTKFile type=\"StructuredGrid\" version=\"0.1\" byte_order=\"LittleEndian\">\n",
+    );
+    text.push_str(&format!(
+        "  <StructuredGrid WholeExtent=\"0 {} 0 {} 0 {}\">\n",
+        nx.saturating_sub(1),
+        ny.saturating_sub(1),
+        nz.saturating_sub(1)
+    ));
+    text.push_str(&format!(
+        "    <Piece Extent=\"0 {} 0 {} 0 {}\">\n",
+        nx.saturating_sub(1),
+        ny.saturating_sub(1),
+        nz.saturating_sub(1)
+    ));
+    text.push_str("      <PointData>\n");
+    text.push_str(&format!(
+        "        <DataArray type=\"Float32\" Name=\"{field_name}\" NumberOfComponents=\"3\" format=\"ascii\">\n          ",
+    ));
+    for k in 0..nz {
+        for j in 0..ny {
+            let (cos_a, sin_a) = (lines[1][j].cos(), lines[1][j].sin());
+            for i in 0..nx {
+                let v0 = f64::from(*values.get(0, i, j, k));
+                let v1 = f64::from(*values.get(1, i, j, k));
+                let v2 = f64::from(*values.get(2, i, j, k));
+                text.push_str(&format!(
+                    "{:e} {:e} {:e} ",
+                    v0 * cos_a - v1 * sin_a,
+                    v0 * sin_a + v1 * cos_a,
+                    v2
+                ));
+            }
+        }
+    }
+    text.push_str("\n        </DataArray>\n");
+    text.push_str("      </PointData>\n");
+    text.push_str("      <Points>\n");
+    text.push_str(
+        "        <DataArray type=\"Float64\" Name=\"Points\" NumberOfComponents=\"3\" format=\"ascii\">\n          ",
+    );
+    for k in 0..nz {
+        for j in 0..ny {
+            let (cos_a, sin_a) = (lines[1][j].cos(), lines[1][j].sin());
+            for i in 0..nx {
+                let rho = lines[0][i];
+                text.push_str(&format!(
+                    "{:e} {:e} {:e} ",
+                    rho * cos_a,
+                    rho * sin_a,
+                    lines[2][k]
+                ));
+            }
+        }
+    }
+    text.push_str("\n        </DataArray>\n");
+    text.push_str("      </Points>\n");
+    text.push_str("    </Piece>\n  </StructuredGrid>\n</VTKFile>\n");
+    std::fs::write(format!("{prefix}.vts"), text)
+}
+
+/// Route one frequency-domain field image to the writer matching the mesh
+/// type: `.vtr` rectilinear for Cartesian meshes, `.vts` structured with
+/// Cartesian-converted geometry for cylindrical meshes.
+fn write_fd_dump(
+    mesh_type: MeshType,
+    prefix: &str,
+    field_name: &str,
+    dims: [usize; 3],
+    coordinates: &[Vec<f64>; 3],
+    values: &FieldArray,
+) {
+    let _ = if mesh_type == MeshType::Cylindrical {
+        write_structured_vts_cylindrical(prefix, field_name, dims, coordinates, values)
+    } else {
+        write_rectilinear_vtr(prefix, field_name, dims, coordinates, values)
+    };
 }
 
 /// Per-cell material data needed by the SAR dumps
@@ -2867,22 +3142,38 @@ impl HDF5FileWriter {
     }
 
     /// Write the rectilinear mesh exactly like `HDF5_File_Writer::WriteRectMesh`.
+    ///
+    /// `scaling` multiplies the stored values (the mesh lines arrive in
+    /// metres, so callers pass `1.0`); `mesh_scaling` records the simulation
+    /// length unit like the native writer (`Op->GetGridDelta()`).
     pub fn write_rect_mesh(
         &self,
         num_lines: [usize; 3],
         disc_lines: [&[f64]; 3],
         mesh_type: i32,
         scaling: f64,
+        mesh_scaling: f64,
     ) -> Result<(), Hdf5Error> {
         let file = Hdf5File::open(&self.filename, true)?;
         file.create_group("/Mesh")?;
         file.write_i32_attribute("/Mesh", "mesh_type", mesh_type)?;
-        file.write_f64_attribute("/Mesh", "mesh_scaling", scaling)?;
-        let names = ["x", "y", "z"];
+        file.write_f64_attribute("/Mesh", "mesh_scaling", mesh_scaling)?;
+        // native `HDF5_File_Writer::WriteRectMesh`: a cylindrical mesh (type
+        // 1) names the axes rho/alpha/z and leaves the azimuth in radians.
+        let names: [&str; 3] = if mesh_type == 1 {
+            ["rho", "alpha", "z"]
+        } else {
+            ["x", "y", "z"]
+        };
         for axis in 0..3 {
             let mut values = Vec::with_capacity(num_lines[axis]);
             for &line in disc_lines[axis].iter().take(num_lines[axis]) {
-                values.push(line * scaling);
+                let value = if mesh_type == 1 && axis == 1 {
+                    line
+                } else {
+                    line * scaling
+                };
+                values.push(value);
             }
             file.write_f64_dataset("/Mesh", names[axis], &values)?;
         }
@@ -3003,6 +3294,20 @@ fn compute_dump_indices(
     if count == 0 {
         return Vec::new();
     }
+    // native `GetNumberOfLines(n, false)`: a closed azimuthal processing
+    // region drops the duplicated seam line and the padding line
+    let closed_alpha = axis == 1
+        && matches!(
+            meta.mesh_type,
+            crate::operator::MeshType::Cylindrical {
+                closed_alpha: true
+            }
+        );
+    let count_nonfull = if closed_alpha {
+        count.saturating_sub(2)
+    } else {
+        count
+    };
     let coordinate = |index: usize| {
         if dual_mesh {
             meta.dual_line(axis, index)
@@ -3012,9 +3317,32 @@ fn compute_dump_indices(
     };
     let (mut first, mut last) = match bounds {
         Some((start, stop)) => {
-            let low = meta.snap_to_mesh_line(axis, start[axis], dual_mesh, true);
-            let high = meta.snap_to_mesh_line(axis, stop[axis], dual_mesh, true);
-            (low.min(high), low.max(high))
+            // native `Operator_Cylinder::SnapBox2Mesh`: the azimuthal range of
+            // a closed mesh is re-centred around the wrapped centre and
+            // clamped into the mesh before the regular box snapping.
+            let (mut low, mut high) = (start[axis].min(stop[axis]), start[axis].max(stop[axis]));
+            if closed_alpha {
+                // native `Operator_Cylinder::SnapBox2Mesh`: the azimuthal range
+                // is re-centred around the wrapped centre and clamped into the
+                // processing region before the regular box snapping
+                let lines = &meta.disc_lines[1];
+                let a_min = lines.first().copied().unwrap_or(0.0);
+                let a_max = lines
+                    .get(count_nonfull.saturating_sub(1))
+                    .copied()
+                    .unwrap_or(0.0);
+                let size = high - low;
+                let centre = meta.fit_alpha(0.5 * (high + low));
+                low = centre - size / 2.0;
+                high = low + size;
+                high = high.clamp(a_min, a_max);
+                low = low.clamp(a_min, a_max);
+            }
+            // native `Processing::DefineStartStopCoord` snaps the box with
+            // `fullMesh = false`
+            let low_index = meta.snap_to_mesh_line(axis, low, dual_mesh, false);
+            let high_index = meta.snap_to_mesh_line(axis, high, dual_mesh, false);
+            (low_index.min(high_index), low_index.max(high_index))
         }
         None => (0, count - 1),
     };
@@ -3029,12 +3357,25 @@ fn compute_dump_indices(
                     meta.disc_lines[axis][index]
                 }
             };
-            let low = start[axis].min(stop[axis]);
-            let high = start[axis].max(stop[axis]);
+            let (mut low, mut high) = (start[axis].min(stop[axis]), start[axis].max(stop[axis]));
+            if closed_alpha {
+                let lines = &meta.disc_lines[1];
+                let a_min = lines.first().copied().unwrap_or(0.0);
+                let a_max = lines
+                    .get(count_nonfull.saturating_sub(1))
+                    .copied()
+                    .unwrap_or(0.0);
+                let size = high - low;
+                let centre = meta.fit_alpha(0.5 * (high + low));
+                low = centre - size / 2.0;
+                high = low + size;
+                high = high.clamp(a_min, a_max);
+                low = low.clamp(a_min, a_max);
+            }
             if line(first) > low && first > 0 {
                 first -= 1;
             }
-            if line(last) < high && last + 1 < count {
+            if line(last) < high && last + 1 < count_nonfull {
                 last += 1;
             }
         }
@@ -3088,9 +3429,9 @@ fn physical_at(
         return 0.0;
     }
     let length = if dual {
-        meta.dual_edge_length(component, pos[component])
+        meta.dual_edge_length(component, pos)
     } else {
-        meta.edge_length(component, pos[component])
+        meta.edge_length(component, pos)
     };
     if length <= 0.0 {
         return 0.0;
@@ -3178,32 +3519,56 @@ fn extract_physical_field(
         meta.num_lines[1].saturating_sub(1),
         meta.num_lines[2].saturating_sub(1),
     ];
+    // Native `Engine_Interface_Cylindrical_FDTD`: on a closed azimuth the
+    // duplicated seam plane wraps. Node interpolation reads the wrapped edge
+    // at `alpha = 0` and cell interpolation wraps the last azimuthal line.
+    let closed_seam = matches!(
+        meta.mesh_type,
+        crate::operator::MeshType::Cylindrical {
+            closed_alpha: true
+        }
+    );
+    let seam_hi = meta.num_lines[1].saturating_sub(2);
     for n in 0..3 {
         let n_p = (n + 1) % 3;
         let n_pp = (n + 2) % 3;
         for (ii, &i) in indices[0].iter().enumerate() {
-            for (jj, &j) in indices[1].iter().enumerate() {
+            for (jj, &j_raw) in indices[1].iter().enumerate() {
                 for (kk, &k) in indices[2].iter().enumerate() {
-                    let pos = [i, j, k];
+                    let j_mapped = if closed_seam {
+                        match mode {
+                            1 if j_raw == 0 => seam_hi,
+                            2 if j_raw == seam_hi => 0,
+                            _ => j_raw,
+                        }
+                    } else {
+                        j_raw
+                    };
+                    // the primary path keeps its boundary decisions on the
+                    // original index; the dual path is mapped before the
+                    // native base interface sees it at all
+                    let pos = [i, j_raw, k];
+                    let pos_read = [i, j_mapped, k];
                     let value = if !dual {
                         match mode {
                             1 => {
                                 // node interpolation of the primary (E) field
                                 if pos[n] == last[n] {
-                                    let mut lower = pos;
+                                    let mut lower = pos_read;
                                     lower[n] = lower[n].saturating_sub(1);
                                     physical_at(values, meta, false, n, lower, mode_type)
                                 } else {
-                                    let delta = meta.edge_length(n, pos[n]);
-                                    let upper = physical_at(values, meta, false, n, pos, mode_type);
+                                    let delta = meta.edge_length(n, pos_read);
+                                    let upper =
+                                        physical_at(values, meta, false, n, pos_read, mode_type);
                                     if delta <= 0.0 {
                                         0.0
                                     } else if pos[n] == 0 {
                                         upper
                                     } else {
-                                        let mut lower = pos;
+                                        let mut lower = pos_read;
                                         lower[n] -= 1;
-                                        let delta_down = meta.edge_length(n, lower[n]);
+                                        let delta_down = meta.edge_length(n, lower);
                                         let ratio = delta / (delta + delta_down);
                                         upper * (1.0 - ratio)
                                             + physical_at(values, meta, false, n, lower, mode_type) * ratio
@@ -3215,8 +3580,9 @@ fn extract_physical_field(
                                 if pos.iter().zip(last.iter()).any(|(p, l)| *p >= *l) {
                                     0.0
                                 } else {
-                                    let mut summed = physical_at(values, meta, false, n, pos, mode_type);
-                                    let mut probe = pos;
+                                    let mut summed =
+                                        physical_at(values, meta, false, n, pos_read, mode_type);
+                                    let mut probe = pos_read;
                                     probe[n_p] += 1;
                                     summed += physical_at(values, meta, false, n, probe, mode_type);
                                     probe[n_pp] += 1;
@@ -3226,9 +3592,11 @@ fn extract_physical_field(
                                     summed / 4.0
                                 }
                             }
-                            _ => physical_at(values, meta, false, n, pos, mode_type),
+                            _ => physical_at(values, meta, false, n, pos_read, mode_type),
                         }
                     } else {
+                        // the mapped seam index drives the whole dual path
+                        let pos = pos_read;
                         match mode {
                             1 => {
                                 // node interpolation of the dual (H) field
@@ -3254,11 +3622,11 @@ fn extract_physical_field(
                                 if pos[n] >= last[n] {
                                     0.0
                                 } else {
-                                    let delta = meta.dual_edge_length(n, pos[n]);
+                                    let delta = meta.dual_edge_length(n, pos);
                                     let lower = physical_at(values, meta, true, n, pos, mode_type);
                                     let mut probe = pos;
                                     probe[n] += 1;
-                                    let delta_up = meta.dual_edge_length(n, probe[n]);
+                                    let delta_up = meta.dual_edge_length(n, probe);
                                     if delta + delta_up <= 0.0 {
                                         0.0
                                     } else {
@@ -3347,6 +3715,68 @@ impl VTKFileWriter {
             w(&format!("{:.precision$}", v, precision = self.precision as usize));
         }
         w("\n");
+    }
+
+    /// Write a real 3-D vector field on a cylindrical `(rho, alpha, z)`
+    /// mesh. Like the native writer, the points convert to the Cartesian
+    /// basis `x = r*cos(a)`, `y = r*sin(a)` and the vector components rotate
+    /// into `(x, y, z)`.
+    pub fn write_structured_grid_cylindrical(
+        &self,
+        field_name: &str,
+        dims: [usize; 3],
+        coordinates: [&[f64]; 3],
+        values: &FieldArray,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+        let [nx, ny, nz] = dims;
+        let points = nx.saturating_mul(ny).saturating_mul(nz);
+        let filename = format!("{}.vtk", self.filename_prefix);
+        let mut file = std::fs::File::create(&filename)?;
+        let precision = self.precision as usize;
+        writeln!(file, "# vtk DataFile Version 3.0")?;
+        writeln!(file, "openEMS field data")?;
+        writeln!(file, "ASCII")?;
+        writeln!(file, "DATASET STRUCTURED_GRID")?;
+        writeln!(file, "DIMENSIONS {nx} {ny} {nz}")?;
+        writeln!(file, "POINTS {points} double")?;
+        for k in 0..nz {
+            for j in 0..ny {
+                let (cos_a, sin_a) = (coordinates[1][j].cos(), coordinates[1][j].sin());
+                for i in 0..nx {
+                    let rho = coordinates[0][i];
+                    writeln!(
+                        file,
+                        "{:.precision$} {:.precision$} {:.precision$}",
+                        rho * cos_a,
+                        rho * sin_a,
+                        coordinates[2].get(k).copied().unwrap_or(0.0),
+                        precision = precision
+                    )?;
+                }
+            }
+        }
+        writeln!(file, "POINT_DATA {points}")?;
+        writeln!(file, "VECTORS {field_name} double")?;
+        for k in 0..nz {
+            for j in 0..ny {
+                let (cos_a, sin_a) = (coordinates[1][j].cos(), coordinates[1][j].sin());
+                for i in 0..nx {
+                    let v0 = f64::from(*values.get(0, i, j, k));
+                    let v1 = f64::from(*values.get(1, i, j, k));
+                    let v2 = f64::from(*values.get(2, i, j, k));
+                    writeln!(
+                        file,
+                        "{:.precision$} {:.precision$} {:.precision$}",
+                        v0 * cos_a - v1 * sin_a,
+                        v0 * sin_a + v1 * cos_a,
+                        v2,
+                        precision = precision
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Write a real 3-D vector field on a rectilinear structured grid.
@@ -3911,6 +4341,7 @@ mod engine_interface_tests {
             dt: 1.0e-12,
             materials: None,
             mesh_type: crate::operator::MeshType::Cartesian,
+            grid_delta: 1.0,
         };
         let mut volt = FieldArray::new("volt", [3, 3, 3]);
         *volt.get_mut(0, 1, 1, 1) = 3.5;
@@ -3939,6 +4370,7 @@ mod engine_interface_tests {
             dt: 1.0e-12,
             materials: None,
             mesh_type: crate::operator::MeshType::Cartesian,
+            grid_delta: 1.0,
         };
         let mut volt = FieldArray::new("volt", [3, 3, 3]);
         let curr = FieldArray::new("curr", [3, 3, 3]);
@@ -3998,6 +4430,7 @@ mod vtk_tests {
             dt: 1.0e-12,
             materials: None,
             mesh_type: crate::operator::MeshType::Cartesian,
+            grid_delta: 1.0,
         };
         let mut volt = FieldArray::new("volt", [3, 3, 3]);
         *volt.get_mut(0, 1, 1, 1) = 5.0;
@@ -4036,6 +4469,7 @@ mod fd_dump_tests {
             dt,
             materials: None,
             mesh_type: crate::operator::MeshType::Cartesian,
+            grid_delta: 1.0,
         }
     }
 
@@ -4166,6 +4600,7 @@ mod hdf5_dump_tests {
             dt,
             materials: None,
             mesh_type: crate::operator::MeshType::Cartesian,
+            grid_delta: 1.0,
         }
     }
 
@@ -4382,6 +4817,7 @@ mod dump_scheduling_tests {
             dt: 1.0e-12,
             materials: None,
             mesh_type: crate::operator::MeshType::Cartesian,
+            grid_delta: 1.0,
         }
     }
 
@@ -4402,6 +4838,7 @@ mod dump_scheduling_tests {
             dt: 1.0e-12,
             materials: None,
             mesh_type: crate::operator::MeshType::Cartesian,
+            grid_delta: 1.0,
         };
         assert_eq!(dump.dump_indices(0, &meta), vec![0, 1, 2, 3, 4]);
 
@@ -4464,5 +4901,248 @@ mod dump_scheduling_tests {
         assert!(text.contains("POINTS 27 double"));
         assert!(text.contains("9.000000000000"));
         let _ = std::fs::remove_file(filename);
+    }
+}
+
+#[cfg(test)]
+mod cylindrical_dump_tests {
+    use super::*;
+
+    const TAU: f64 = std::f64::consts::TAU;
+
+    /// A 4-sector closed cylindrical mesh: 4+1 seam line plus the padding
+    /// line, exactly like the native `SetupCSXGrid` appends them.
+    fn closed_meta() -> EngineMeta {
+        let rho = vec![1.0e-3, 2.0e-3];
+        let alpha: Vec<f64> = (0..5)
+            .map(|sector| sector as f64 * TAU / 4.0)
+            .chain([TAU + TAU / 4.0])
+            .collect();
+        let z = vec![0.0, 1.0e-3];
+        EngineMeta {
+            num_lines: [2, 6, 2],
+            disc_lines: [rho, alpha, z],
+            dt: 1.0e-12,
+            materials: None,
+            mesh_type: crate::operator::MeshType::Cylindrical { closed_alpha: true },
+            grid_delta: 1.0e-3,
+        }
+    }
+
+    #[test]
+    fn cylindrical_alpha_lengths_carry_the_rho_factor() {
+        let meta = closed_meta();
+        // primary alpha edge at (i=1, j=0): dalpha * rho
+        let length = meta.edge_length(1, [1, 0, 0]);
+        let expected = (TAU / 4.0) * 2.0e-3;
+        assert!((length - expected).abs() / expected < 1e-12, "{length}");
+        // dual alpha edge: dual width times the dual rho line
+        let dual = meta.dual_edge_length(1, [1, 0, 0]);
+        let dual_rho = meta.dual_line(0, 1);
+        let expected_dual = (TAU / 4.0) * dual_rho;
+        assert!(
+            (dual - expected_dual).abs() / expected_dual < 1e-12,
+            "{dual}"
+        );
+        // rho and z edges stay plain widths
+        let rho_width = meta.edge_length(0, [0, 0, 0]);
+        assert!((rho_width - 1.0e-3).abs() < 1e-15);
+        let z_width = meta.edge_length(2, [0, 0, 0]);
+        assert!((z_width - 1.0e-3).abs() < 1e-15);
+    }
+
+    #[test]
+    fn cylindrical_areas_use_the_native_cylinder_metric() {
+        let meta = closed_meta();
+        // z node area (primary): the annulus around the dual rho cell
+        let area = meta.edge_area(2, [1, 0, 0]);
+        let da = TAU / 4.0;
+        let r2 = meta.dual_line(0, 1);
+        let r1 = r2 - 1.0e-3;
+        let expected = 0.5 * da * (r2 * r2 - r1 * r1);
+        assert!((area - expected).abs() / expected < 1e-12, "{area}");
+        // rho face: dual alpha times dual z
+        let rho_face = meta.edge_area(0, [1, 0, 0]);
+        let expected_face = meta.dual_edge_length(1, [1, 0, 0]) * 1.0e-3;
+        assert!(
+            (rho_face - expected_face).abs() / expected_face < 1e-12,
+            "{rho_face}"
+        );
+    }
+
+    #[test]
+    fn fit_alpha_wraps_into_the_mesh_range() {
+        let meta = closed_meta();
+        assert!((meta.fit_alpha(-std::f64::consts::PI) - std::f64::consts::PI).abs() < 1e-12);
+        assert!((meta.fit_alpha(0.1) - 0.1).abs() < 1e-12);
+        let wrapped = meta.fit_alpha(TAU + 0.1);
+        assert!((wrapped - 0.1).abs() < 1e-12, "{wrapped}");
+    }
+
+    #[test]
+    fn closed_alpha_dump_box_covers_the_full_ring() {
+        let meta = closed_meta();
+        let indices = compute_dump_indices(
+            &meta,
+            1,
+            Some((
+                [0.0, -std::f64::consts::PI, 0.0],
+                [2.0e-3, std::f64::consts::PI, 1.0e-3],
+            )),
+            false,
+            &[1, 1, 1],
+            &[0.0; 3],
+        );
+        // native `SnapBox2Mesh` recentres the wrapped range onto the mesh:
+        // the box [-pi, pi] becomes [0, pi] like on the native solver
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn seam_mapping_wraps_node_and_cell_interpolation() {
+        let meta = closed_meta();
+        let mut volt = FieldArray::new("volt", [2, 6, 2]);
+        // the wrapped edge behind alpha = 0 lives at the seam index 4
+        *volt.get_mut(1, 1, 4, 0) = 8.0;
+        *volt.get_mut(1, 1, 0, 0) = 1.0;
+        let indices = [vec![1], vec![0], vec![0]];
+
+        // node interpolation at alpha = 0 must read the seam edge
+        let node = extract_physical_field(&volt, &indices, &meta, false, 1, 0);
+        let length = meta.edge_length(1, [1, 4, 0]);
+        let expected = 8.0 / length;
+        assert!(
+            (*node.get(1, 0, 0, 0) as f64 - expected).abs() / expected < 1e-6,
+            "node {} vs {expected}",
+            node.get(1, 0, 0, 0)
+        );
+
+        // cell interpolation at the seam line wraps to alpha = 0
+        // the cell average walks (i,j,k) = (1,0,0), (1,0,1), (2,0,1), (2,0,0)
+        // for component 1, so the mesh needs three rho lines
+        let rho = vec![1.0e-3, 2.0e-3, 3.0e-3];
+        let mut meta = EngineMeta {
+            disc_lines: [rho, meta.disc_lines[1].clone(), meta.disc_lines[2].clone()],
+            num_lines: [3, 6, 2],
+            ..meta
+        };
+        let mut volt = FieldArray::new("volt", [3, 6, 2]);
+        for i in 1..3 {
+            *volt.get_mut(1, i, 0, 0) = 2.0;
+            *volt.get_mut(1, i, 0, 1) = 2.0;
+        }
+        let indices = [vec![1], vec![4], vec![0]];
+        let cell = extract_physical_field(&volt, &indices, &meta, false, 2, 0);
+        // the four walked edges sit at rho = 2 mm and rho = 3 mm, and each
+        // physical value divides by its own edge length
+        let length_inner = meta.edge_length(1, [1, 0, 0]);
+        let length_outer = meta.edge_length(1, [2, 0, 0]);
+        let expected = (2.0 / length_inner * 2.0 + 2.0 / length_outer * 2.0) / 4.0;
+        assert!(
+            (*cell.get(1, 0, 0, 0) as f64 - expected).abs() / expected < 1e-6,
+            "cell {} vs {expected}",
+            cell.get(1, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn time_domain_cylindrical_dump_rotates_the_vectors() {
+        let prefix = std::env::temp_dir()
+            .join(format!("oems_cyl_td_{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let rho = vec![1.0e-3, 2.0e-3, 3.0e-3];
+        let alpha = vec![0.0, std::f64::consts::FRAC_PI_2, std::f64::consts::PI];
+        let z = vec![0.0, 1.0e-3];
+        let meta = EngineMeta {
+            num_lines: [3, 3, 2],
+            disc_lines: [rho, alpha, z],
+            dt: 1.0e-12,
+            materials: None,
+            mesh_type: crate::operator::MeshType::Cylindrical { closed_alpha: false },
+            grid_delta: 1.0e-3,
+        };
+        let mut volt = FieldArray::new("volt", [3, 3, 2]);
+        *volt.get_mut(0, 1, 1, 1) = 1.0e-3;
+        let curr = FieldArray::new("curr", [3, 3, 2]);
+        let interface = EngineInterface {
+            meta: &meta,
+            volt: &volt,
+            curr: &curr,
+        };
+        let mut dump = ProcessFieldsTD::new(&prefix, [0.0; 3], [1.0; 3]);
+        dump.set_mesh_type_value(MeshType::Cylindrical);
+        dump.process_fields(1, &interface);
+
+        let filename = format!("{prefix}_0000000001.vtk");
+        let text = std::fs::read_to_string(&filename).expect("dump exists");
+        // alpha = pi/2 rotates an Erho pulse onto +y
+        assert!(text.contains("0.000000000000 1.000000000000"), "{text}");
+        let _ = std::fs::remove_file(filename);
+    }
+
+    #[test]
+    fn fd_cylindrical_dump_writes_a_structured_grid() {
+        let prefix = std::env::temp_dir()
+            .join(format!("oems_cyl_fd_{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let mut meta = closed_meta();
+        meta.num_lines = [2, 6, 2];
+        let mut volt = FieldArray::new("volt", [2, 6, 2]);
+        let curr = FieldArray::new("curr", [2, 6, 2]);
+        let mut dump = ProcessFieldsFD::new(&prefix, [0.0; 3], [1.0; 3]);
+        dump.set_mesh_type(MeshType::Cylindrical);
+        dump.add_frequency(1.0e9);
+        let interface = EngineInterface {
+            meta: &meta,
+            volt: &volt,
+            curr: &curr,
+        };
+        dump.process_fields(0, &interface);
+        dump.post_process();
+
+        let filename = format!("{prefix}_f=1000000000_abs.vts");
+        let text = std::fs::read_to_string(&filename).expect("vts exists");
+        assert!(text.contains("type=\"StructuredGrid\""), "{text}");
+        assert!(text.contains("Name=\"E-Field\" NumberOfComponents=\"3\""));
+        let _ = std::fs::remove_file(filename);
+    }
+
+    #[cfg(feature = "hdf5")]
+    #[test]
+    fn hdf5_cylindrical_mesh_uses_the_native_names() {
+        let prefix = std::env::temp_dir()
+            .join(format!("oems_cyl_h5_{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let mut meta = closed_meta();
+        meta.num_lines = [2, 6, 2];
+        let volt = FieldArray::new("volt", [2, 6, 2]);
+        let curr = FieldArray::new("curr", [2, 6, 2]);
+        let mut dump = ProcessFieldsFD::new(&prefix, [0.0; 3], [1.0; 3]);
+        dump.set_mesh_type(MeshType::Cylindrical);
+        dump.set_file_type(HDF5_FILETYPE);
+        dump.add_frequency(1.0e9);
+        let interface = EngineInterface {
+            meta: &meta,
+            volt: &volt,
+            curr: &curr,
+        };
+        dump.process_fields(0, &interface);
+        dump.post_process();
+
+        let path = format!("{prefix}.h5");
+        let file = Hdf5File::open(&path, false).expect("open dump");
+        assert_eq!(file.read_i32_attribute("/Mesh", "mesh_type").unwrap(), 1);
+        let (_, rho) = file.read_f64_dataset("/Mesh/rho").unwrap();
+        assert_eq!(rho, vec![1.0e-3, 2.0e-3]);
+        let (_, alpha) = file.read_f64_dataset("/Mesh/alpha").unwrap();
+        // the azimuth is written in radians, without the grid scaling
+        assert!((alpha[1] - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+        assert!(alpha.len() == 6);
+        assert!(file.exists("/Mesh/z"));
+        drop(file);
+        let _ = std::fs::remove_file(path);
     }
 }

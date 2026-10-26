@@ -1079,6 +1079,16 @@ impl OpenEMS {
             1
         };
 
+        let cylindrical = matches!(
+            engine.op.mesh_type(),
+            crate::operator::MeshType::Cylindrical { .. }
+        );
+        let mesh_type = if cylindrical {
+            crate::processing::MeshType::Cylindrical
+        } else {
+            crate::processing::MeshType::Cartesian
+        };
+
         let mut array = self
             .processing_array
             .take()
@@ -1098,15 +1108,24 @@ impl OpenEMS {
                 let Ok(bounds) = primitive.bounding_box(None, true) else {
                     continue;
                 };
+                // native `SnapBox2Mesh` receives drawing-unit coordinates; the
+                // cylindrical azimuth is an angle and never scales.
+                let scale = |axis: usize| -> f64 {
+                    if axis == 1 && cylindrical {
+                        1.0
+                    } else {
+                        grid_delta
+                    }
+                };
                 let start = [
-                    bounds[0] * grid_delta,
-                    bounds[2] * grid_delta,
-                    bounds[4] * grid_delta,
+                    bounds[0] * scale(0),
+                    bounds[2] * scale(1),
+                    bounds[4] * scale(2),
                 ];
                 let stop = [
-                    bounds[1] * grid_delta,
-                    bounds[3] * grid_delta,
-                    bounds[5] * grid_delta,
+                    bounds[1] * scale(0),
+                    bounds[3] * scale(1),
+                    bounds[5] * scale(2),
                 ];
                 let dump_type = dump.dump_type();
                 match dump_type {
@@ -1119,6 +1138,9 @@ impl OpenEMS {
                         processing.set_dump_mode(dump.dump_mode());
                         processing.set_legacy_format(self.legacy_hdf5_dumps);
                         processing.set_process_interval(interval);
+                        if cylindrical {
+                            processing.set_mesh_type(mesh_type);
+                        }
                         if dump.sub_sampling_enabled() {
                             for (axis, value) in dump.sub_sampling().iter().enumerate() {
                                 processing.set_sub_sampling(*value as i32, axis as i32);
@@ -1160,6 +1182,9 @@ impl OpenEMS {
                             1
                         };
                         processing.set_fd_oversampling(fd_over);
+                        if cylindrical {
+                            processing.set_mesh_type(mesh_type);
+                        }
                         if dump.sub_sampling_enabled() {
                             for (axis, value) in dump.sub_sampling().iter().enumerate() {
                                 processing.set_sub_sampling_value(*value as i32, axis as i32);
@@ -1418,6 +1443,10 @@ fn build_sar_cell_data(
         };
         let dt = engine.op.get_timestep();
         let grid_delta = engine.op.get_grid_delta();
+        let probe_cylindrical = matches!(
+            engine.op.mesh_type(),
+            crate::operator::MeshType::Cylindrical { .. }
+        );
         let f_max = self
             .excitation
             .as_ref()
@@ -1462,15 +1491,24 @@ fn build_sar_cell_data(
                 let Ok(bounds) = primitive.bounding_box(None, true) else {
                     continue;
                 };
+                // like the dump boxes, the azimuth coordinate is an angle and
+                // never scales by the grid delta
+                let probe_scale = |axis: usize| -> f64 {
+                    if axis == 1 && probe_cylindrical {
+                        1.0
+                    } else {
+                        grid_delta
+                    }
+                };
                 let start = [
-                    bounds[0] * grid_delta,
-                    bounds[2] * grid_delta,
-                    bounds[4] * grid_delta,
+                    bounds[0] * probe_scale(0),
+                    bounds[2] * probe_scale(1),
+                    bounds[4] * probe_scale(2),
                 ];
                 let stop = [
-                    bounds[1] * grid_delta,
-                    bounds[3] * grid_delta,
-                    bounds[5] * grid_delta,
+                    bounds[1] * probe_scale(0),
+                    bounds[3] * probe_scale(1),
+                    bounds[5] * probe_scale(2),
                 ];
 
                 let calculator: Box<dyn crate::processing_integral::IntegralCalculator> =
@@ -1624,12 +1662,23 @@ fn build_sar_cell_data(
         let engine_meta = {
             let engine = self.fdtd_eng.as_ref().expect("engine checked above");
             let num_lines = engine.num_lines;
+            let mesh_type = engine.op.mesh_type();
             let mut disc_lines: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
             for axis in 0..3 {
+                // native `GetDiscLine` keeps the drawing units; the cylindrical
+                // azimuth is an angle, so it never scales by the grid delta.
+                let scale = if axis == 1
+                    && matches!(
+                        mesh_type,
+                        crate::operator::MeshType::Cylindrical { .. }
+                    ) {
+                    1.0
+                } else {
+                    engine.op.get_grid_delta()
+                };
                 for index in 0..num_lines[axis] {
                     disc_lines[axis].push(
-                        engine.op.get_disc_line(axis as i32, index as u32, false)
-                            * engine.op.get_grid_delta(),
+                        engine.op.get_disc_line(axis as i32, index as u32, false) * scale,
                     );
                 }
             }
@@ -1642,6 +1691,7 @@ fn build_sar_cell_data(
                     .material_grid_data()
                     .map(|grid| std::sync::Arc::new(grid.to_vec())),
                 mesh_type: engine.op.mesh_type(),
+                grid_delta: engine.op.get_grid_delta(),
             }
         };
         let max_ts_time = if self.max_time > 0.0 && dt > 0.0 {
