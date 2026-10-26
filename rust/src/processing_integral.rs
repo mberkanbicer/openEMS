@@ -422,6 +422,7 @@ mod tests {
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt,
             materials: None,
+            mesh_type: crate::operator::MeshType::Cartesian,
         }
     }
 
@@ -711,6 +712,7 @@ mod port_integral_tests {
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt: 1.0e-12,
             materials: None,
+            mesh_type: crate::operator::MeshType::Cartesian,
         }
     }
 
@@ -727,6 +729,7 @@ mod port_integral_tests {
             disc_lines: [x.clone(), x, z],
             dt: 9.629166e-12,
                 materials: None,
+            mesh_type: crate::operator::MeshType::Cartesian,
             };
         // native voltage probe: (0.0975,-0.0025,0.5) -> [70,50,100] and
         // (0.2275,-0.0025,0.5) -> [96,50,100]
@@ -1182,6 +1185,7 @@ mod mode_match_tests {
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt: 1.0e-12,
             materials: None,
+            mesh_type: crate::operator::MeshType::Cartesian,
         }
     }
 

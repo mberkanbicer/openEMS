@@ -53,6 +53,8 @@ pub struct EngineMeta {
     /// Needed by the J/D/B field conversions (native `m_kappa_ptr`,
     /// `m_epsR_ptr`, `m_mueR_ptr`).
     pub materials: Option<std::sync::Arc<Vec<crate::operator::CellMaterial>>>,
+    /// Discretisation metric of the mesh (Cartesian or cylindrical).
+    pub mesh_type: crate::operator::MeshType,
 }
 
 impl EngineMeta {
@@ -175,10 +177,21 @@ impl EngineMeta {
         if coordinate < lines[0] {
             return 0;
         }
-        let count = if full_mesh {
-            count_all
+        // Native `Operator::GetNumberOfLines(ny, full)` returns the full line
+        // count; only the cylindrical override reduces a non-full azimuthal
+        // snap by the two duplicated seam lines.
+        let count = if !full_mesh
+            && axis == 1
+            && matches!(
+                self.mesh_type,
+                crate::operator::MeshType::Cylindrical {
+                    closed_alpha: true
+                }
+            )
+        {
+            count_all.saturating_sub(2)
         } else {
-            count_all.saturating_sub(1)
+            count_all
         };
         if count == 0 {
             return 0;
@@ -3573,6 +3586,7 @@ mod engine_interface_tests {
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt: 1.0e-12,
             materials: None,
+            mesh_type: crate::operator::MeshType::Cartesian,
         };
         let mut volt = FieldArray::new("volt", [3, 3, 3]);
         *volt.get_mut(0, 1, 1, 1) = 3.5;
@@ -3600,6 +3614,7 @@ mod engine_interface_tests {
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt: 1.0e-12,
             materials: None,
+            mesh_type: crate::operator::MeshType::Cartesian,
         };
         let mut volt = FieldArray::new("volt", [3, 3, 3]);
         let curr = FieldArray::new("curr", [3, 3, 3]);
@@ -3658,6 +3673,7 @@ mod vtk_tests {
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt: 1.0e-12,
             materials: None,
+            mesh_type: crate::operator::MeshType::Cartesian,
         };
         let mut volt = FieldArray::new("volt", [3, 3, 3]);
         *volt.get_mut(0, 1, 1, 1) = 5.0;
@@ -3695,6 +3711,7 @@ mod fd_dump_tests {
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt,
             materials: None,
+            mesh_type: crate::operator::MeshType::Cartesian,
         }
     }
 
@@ -3817,6 +3834,7 @@ mod hdf5_dump_tests {
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt,
             materials: None,
+            mesh_type: crate::operator::MeshType::Cartesian,
         }
     }
 
@@ -4024,6 +4042,7 @@ mod dump_scheduling_tests {
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt: 1.0e-12,
             materials: None,
+            mesh_type: crate::operator::MeshType::Cartesian,
         }
     }
 
@@ -4043,6 +4062,7 @@ mod dump_scheduling_tests {
             disc_lines: [lines.clone(), lines.clone(), lines],
             dt: 1.0e-12,
             materials: None,
+            mesh_type: crate::operator::MeshType::Cartesian,
         };
         assert_eq!(dump.dump_indices(0, &meta), vec![0, 1, 2, 3, 4]);
 

@@ -749,6 +749,9 @@ impl OpenEMS {
         if let Some(value) = options.time_step_method {
             self.time_step_method = value;
         }
+        if let Some(value) = options.cylinder_coords {
+            self.cylinder_coords = value;
+        }
         if let Some(value) = options.coord_system {
             self.cylinder_coords = value == 1;
         }
@@ -956,13 +959,25 @@ impl OpenEMS {
         registry.add(Box::new(MurOperatorExtension {
             phase_velocity: self.mur_v_ph,
         }));
-        let engine_extensions = match registry.build(&mut op) {
+        let mut engine_extensions = match registry.build(&mut op) {
             Ok(extensions) => extensions,
             Err(error) => {
                 eprintln!("[openEMS] Failed to build an operator extension: {error}");
                 return false;
             }
         };
+        // Native `Operator_Ext_Cylinder`: a closed azimuthal mesh is periodic.
+        if let Some(cylinder) = op.build_cylinder_extension() {
+            engine_extensions.push(Box::new(cylinder));
+        }
+        if op.is_cylindrical() && self.verbose_level > 0 {
+            println!(
+                "[openEMS] cylindrical mesh: rho = {:?}..{:?}, alpha closed = {}",
+                op.base.disc_lines[0].as_ref().and_then(|l| l.first()),
+                op.base.disc_lines[0].as_ref().and_then(|l| l.last()),
+                op.closed_alpha()
+            );
+        }
 
         // Box as trait object for the engine (unsizing coercion).
         let op_dyn: Box<dyn OperatorBase> = Box::new(op);
@@ -1537,6 +1552,7 @@ fn build_sar_cell_data(
                     .op
                     .material_grid_data()
                     .map(|grid| std::sync::Arc::new(grid.to_vec())),
+                mesh_type: engine.op.mesh_type(),
             }
         };
         let max_ts_time = if self.max_time > 0.0 && dt > 0.0 {

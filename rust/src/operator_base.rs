@@ -45,6 +45,16 @@ pub trait OperatorBase {
     /// Get the grid drawing unit in m.
     fn get_grid_delta(&self) -> f64;
 
+    /// Discretisation metric of the mesh (Cartesian or cylindrical).
+    fn mesh_type(&self) -> crate::operator::MeshType {
+        crate::operator::MeshType::Cartesian
+    }
+
+    /// True for a full `2*pi` azimuthal mesh with a duplicated seam plane.
+    fn closed_alpha(&self) -> bool {
+        false
+    }
+
     /// Per-component material grid, if the operator has one (native
     /// `m_kappa_ptr` / `m_epsR_ptr` / `m_mueR_ptr` sources for field dumps).
     fn material_grid_data(&self) -> Option<&[crate::operator::CellMaterial]> {

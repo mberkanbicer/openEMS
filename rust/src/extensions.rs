@@ -2710,4 +2710,5 @@ mod excitation_period_tests {
         assert_eq!(EngineExtExcitation::sample_index(&signal, 10, 10), Some(0));
         assert_eq!(EngineExtExcitation::sample_index(&signal, 1_013, 10), Some(3));
     }
+
 }

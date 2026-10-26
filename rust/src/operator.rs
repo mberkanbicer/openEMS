@@ -29,6 +29,123 @@ pub struct CellMaterial {
     pub is_pec: bool,
 }
 
+/// Discretisation metric of the operator mesh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MeshType {
+    /// Cartesian `(x, y, z)` mesh.
+    #[default]
+    Cartesian,
+    /// Cylindrical `(rho, alpha, z)` mesh. `closed_alpha` marks a mesh that
+    /// spans the full `2*pi` with a duplicated boundary plane (native
+    /// `Operator_Cylinder`).
+    Cylindrical { closed_alpha: bool },
+}
+
+/// Geometry of one mesh: edge lengths, face areas and cell volumes.
+///
+/// Mirrors the native `GetEdgeLength` / `GetEdgeArea` / `GetCellVolume`
+/// family, including the `Operator_Cylinder` overrides: an alpha edge carries
+/// the factor `rho`, and a z face is the annulus segment
+/// `dalpha/2 * (r2^2 - r1^2)`.
+#[derive(Clone, Copy)]
+pub struct MeshMetric<'a> {
+    pub lines: &'a [Option<Vec<f64>>; 3],
+    pub counts: [u32; 3],
+    pub grid_delta: f64,
+    pub mesh: MeshType,
+}
+
+impl<'a> MeshMetric<'a> {
+    pub fn new(
+        lines: &'a [Option<Vec<f64>>; 3],
+        counts: [u32; 3],
+        grid_delta: f64,
+        mesh: MeshType,
+    ) -> Self {
+        Self {
+            lines,
+            counts,
+            grid_delta,
+            mesh,
+        }
+    }
+
+    pub fn is_cylindrical(&self) -> bool {
+        matches!(self.mesh, MeshType::Cylindrical { .. })
+    }
+
+    /// Mesh line in drawing units (native `GetDiscLine`).
+    pub fn line(&self, axis: usize, pos: usize, dual: bool) -> f64 {
+        disc_line_value(&self.lines[axis], self.counts[axis] as usize, pos, dual)
+    }
+
+    /// Cartesian edge length in metres (native base `GetEdgeLength`).
+    fn base_length(&self, n: usize, pos: [usize; 3], dual: bool) -> f64 {
+        edge_length_value(self.lines, self.counts, n, pos, dual, self.grid_delta)
+    }
+
+    /// Native `GetEdgeLength`: an alpha edge is scaled by `rho`.
+    pub fn edge_length(&self, n: usize, pos: [usize; 3], dual: bool) -> f64 {
+        let mut length = self.base_length(n, pos, dual);
+        if n == 1 && self.is_cylindrical() {
+            length *= self.line(0, pos[0], dual);
+        }
+        length
+    }
+
+    /// Native `Operator_Cylinder::GetNodeWidth`: the base length across the
+    /// node, with the `rho` factor taken from the requested mesh.
+    pub fn node_width(&self, n: usize, pos: [usize; 3], dual: bool) -> f64 {
+        let mut width = self.base_length(n, pos, !dual);
+        if n == 1 && self.is_cylindrical() {
+            width *= self.line(0, pos[0], dual);
+        }
+        width
+    }
+
+    /// Native `Operator_Cylinder::GetNodeArea`: a z face is the annulus
+    /// segment between `r1` and `r2`.
+    pub fn node_area(&self, n: usize, pos: [usize; 3], dual: bool) -> f64 {
+        if n == 2 && self.is_cylindrical() {
+            let da = disc_delta_value(
+                &self.lines[1],
+                self.counts[1] as usize,
+                pos[1],
+                dual,
+            );
+            let (r1, r2) = if dual {
+                let r1 = self.line(0, pos[0], false) * self.grid_delta;
+                (r1, r1 + self.base_length(0, pos, false))
+            } else {
+                let r2 = self.line(0, pos[0], true) * self.grid_delta;
+                (r2 - self.base_length(0, pos, true), r2)
+            };
+            if r1 <= 0.0 {
+                0.5 * da * r2 * r2
+            } else {
+                0.5 * da * (r2 * r2 - r1 * r1)
+            }
+        } else {
+            self.node_width((n + 1) % 3, pos, dual) * self.node_width((n + 2) % 3, pos, dual)
+        }
+    }
+
+    /// Native `Operator_Cylinder::GetEdgeArea`: the rho face is spanned by the
+    /// alpha and z edge lengths, every other face is the node area.
+    pub fn edge_area(&self, n: usize, pos: [usize; 3], dual: bool) -> f64 {
+        if n == 0 && self.is_cylindrical() {
+            self.edge_length(1, pos, !dual) * self.edge_length(2, pos, !dual)
+        } else {
+            self.node_area(n, pos, dual)
+        }
+    }
+
+    /// Native `Operator_Cylinder::GetCellVolume`.
+    pub fn cell_volume(&self, pos: [usize; 3], dual: bool) -> f64 {
+        self.edge_area(2, pos, dual) * self.edge_length(2, pos, dual)
+    }
+}
+
 /// Anisotropic material values used while resolving a mesh edge.
 #[derive(Clone, Copy, Debug)]
 struct AnisoMaterial {
@@ -85,6 +202,11 @@ pub struct Operator {
     pub material_grid: Option<Vec<CellMaterial>>,
     /// Parsed CSXCAD structure, retained for extension setup (excitation, Mur).
     pub structure: Option<csxcad_core::model::Structure>,
+    /// Discretisation metric of the mesh (Cartesian or cylindrical).
+    pub mesh_type: MeshType,
+    /// A cylindrical mesh that includes the `rho = 0` axis (native
+    /// `CC_R0_included`).
+    pub r0_included: bool,
 }
 
 impl Operator {
@@ -102,7 +224,52 @@ impl Operator {
             ec_r: Vec::new(),
             material_grid: None,
             structure: None,
+            mesh_type: MeshType::Cartesian,
+            r0_included: false,
         }
+    }
+
+    /// Geometry helper for the current mesh.
+    pub fn metric(&self) -> MeshMetric<'_> {
+        MeshMetric::new(
+            &self.base.disc_lines,
+            self.base.num_lines,
+            self.base.grid_delta,
+            self.mesh_type,
+        )
+    }
+
+    /// True for a cylindrical `(rho, alpha, z)` mesh.
+    pub fn is_cylindrical(&self) -> bool {
+        matches!(self.mesh_type, MeshType::Cylindrical { .. })
+    }
+
+    /// Build the azimuthal seam extension of a cylindrical mesh.
+    /// Mirrors `Operator_Ext_Cylinder::CreateEngineExtention`; the `rho = 0`
+    /// axis update is not reachable because such meshes are rejected in
+    /// `load_csx` (RM-137).
+    pub fn build_cylinder_extension(&self) -> Option<crate::extensions::EngineExtCylinder> {
+        if !self.is_cylindrical() {
+            return None;
+        }
+        let mut extension = crate::extensions::EngineExtCylinder::new([
+            self.base.num_lines[0] as usize,
+            self.base.num_lines[1] as usize,
+            self.base.num_lines[2] as usize,
+        ]);
+        extension.set_closed_alpha(self.closed_alpha());
+        extension.set_r0_included(self.r0_included);
+        Some(extension)
+    }
+
+    /// True for a full `2*pi` azimuthal mesh with a duplicated seam plane.
+    pub fn closed_alpha(&self) -> bool {
+        matches!(
+            self.mesh_type,
+            MeshType::Cylindrical {
+                closed_alpha: true
+            }
+        )
     }
 
     /// Index into the flat per-component EC arrays.
@@ -216,18 +383,6 @@ impl Operator {
         let mut structure = csxcad_core::model::Structure::from_xml_str(xml)
             .map_err(|e| format!("CSXCAD XML parse error: {}", e))?;
 
-        // The cylindrical operator variants (`Operator_Cylinder`,
-        // `Operator_CylinderMultiGrid`) are not ported yet; see ADR 0002.
-        // Silently treating a cylindrical model as Cartesian would produce a
-        // physically different simulation, so reject it explicitly.
-        if structure.coordinate_system() == csxcad_core::grid::CoordinateSystem::Cylindrical {
-            return Err(
-                "cylindrical coordinates (CSX CoordSystem=1) are not implemented in the Rust \
-                 operator; see docs/migration/adr/0002-wave-a-scope.md"
-                    .to_string(),
-            );
-        }
-
         // --- Grid ---
         // Keep the native representation: discLines hold drawing units and
         // grid_delta is the unit in metres. Non-uniform spacing is preserved.
@@ -245,6 +400,49 @@ impl Operator {
         if !delta_unit.is_finite() || delta_unit <= 0.0 {
             return Err("CSXCAD grid delta unit must be positive".to_string());
         }
+
+        // --- Mesh metric (Cartesian or cylindrical) ---
+        // Native `Operator_Cylinder::SetupCSXGrid`: a mesh spanning the full
+        // `2*pi` is periodic, so the last line is pinned to `2*pi` and one
+        // padding line is appended for the dual-mesh operations at the seam.
+        let mut mesh_type = MeshType::Cartesian;
+        let mut r0_included = false;
+        if structure.coordinate_system() == csxcad_core::grid::CoordinateSystem::Cylindrical {
+            if grid_lines[0].first().copied().unwrap_or(0.0) < 0.0 {
+                return Err(
+                    "cylindrical mesh: negative rho coordinates are not allowed".to_string(),
+                );
+            }
+            let first = grid_lines[1].first().copied().unwrap_or(0.0);
+            let span = grid_lines[1].last().copied().unwrap_or(0.0) - first;
+            if span > 2.0 * std::f64::consts::PI + 1e-6 {
+                return Err(
+                    "cylindrical mesh: the alpha range must not exceed 2*pi".to_string(),
+                );
+            }
+            let closed_alpha = (span - 2.0 * std::f64::consts::PI).abs() < 1e-6;
+            if closed_alpha {
+                let second = grid_lines[1][1];
+                let last = grid_lines[1].len() - 1;
+                let padded = first + 2.0 * std::f64::consts::PI;
+                grid_lines[1][last] = padded;
+                grid_lines[1].push(padded + (second - first));
+                structure.grid_mut().set_line(1, last, padded);
+                structure.grid_mut().add_line(1, padded + (second - first));
+                num_lines[1] = grid_lines[1].len() as u32;
+            }
+            r0_included = grid_lines[0][0] == 0.0 && closed_alpha;
+            if r0_included {
+                return Err(
+                    "cylindrical mesh: a mesh that includes the rho = 0 axis needs the \
+                     dedicated axis update, which is not ported yet (RM-137)"
+                        .to_string(),
+                );
+            }
+            mesh_type = MeshType::Cylindrical { closed_alpha };
+        }
+        self.mesh_type = mesh_type;
+        self.r0_included = r0_included;
         self.base.grid_delta = delta_unit;
         self.base.num_lines = num_lines;
         self.base.disc_lines = [
@@ -479,7 +677,8 @@ impl Operator {
                                 } else {
                                     -delta_pp_m * 0.25
                                 };
-                            let area = edge_area_value(&disc_lines, counts, n, loc, true, 1.0);
+                            let area = MeshMetric::new(&disc_lines, counts, 1.0, mesh_type)
+                                .edge_area(n, loc, true);
                             if area <= 0.0 {
                                 continue;
                             }
@@ -515,8 +714,8 @@ impl Operator {
                                 }
                                 loc[n] -= 1;
                             }
-                            let width =
-                                edge_length_value(&disc_lines, counts, n, loc, false, 1.0);
+                            let width = MeshMetric::new(&disc_lines, counts, 1.0, mesh_type)
+                                .edge_length(n, loc, false);
                             if width <= 0.0 {
                                 continue;
                             }
@@ -586,6 +785,7 @@ impl Operator {
         let counts = self.base.num_lines;
         let grid_delta = self.base.grid_delta;
         let disc_lines = &self.base.disc_lines;
+        let metric = MeshMetric::new(disc_lines, counts, grid_delta, self.mesh_type);
         let material_grid = self.material_grid.as_ref();
 
         let nx = counts[0] as usize;
@@ -629,11 +829,10 @@ impl Operator {
 
                         // Per-direction edge geometry from the real mesh.
                         let pos = [i, j, k];
-                        let area = edge_area_value(disc_lines, counts, n, pos, false, grid_delta);
-                        let delta = edge_length_value(disc_lines, counts, n, pos, false, grid_delta);
-                        let area_dual = edge_area_value(disc_lines, counts, n, pos, true, grid_delta);
-                        let delta_dual =
-                            edge_length_value(disc_lines, counts, n, pos, true, grid_delta);
+                        let area = metric.edge_area(n, pos, false);
+                        let delta = metric.edge_length(n, pos, false);
+                        let area_dual = metric.edge_area(n, pos, true);
+                        let delta_dual = metric.edge_length(n, pos, true);
 
                         let c = if delta > 0.0 {
                             (eps_r * EPS0 * area / delta) as FDTD_FLOAT
@@ -1207,22 +1406,9 @@ impl Operator {
     fn get_ec_c(&self, n: i32, i: usize, j: usize, k: usize) -> f64 {
         let dir = n.rem_euclid(3) as usize;
         let pos = [i, j, k];
-        let area = edge_area_value(
-            &self.base.disc_lines,
-            self.base.num_lines,
-            dir,
-            pos,
-            false,
-            self.base.grid_delta,
-        );
-        let delta = edge_length_value(
-            &self.base.disc_lines,
-            self.base.num_lines,
-            dir,
-            pos,
-            false,
-            self.base.grid_delta,
-        );
+        let metric = self.metric();
+        let area = metric.edge_area(dir, pos, false);
+        let delta = metric.edge_length(dir, pos, false);
         if delta <= 0.0 {
             return 0.0;
         }
@@ -1241,22 +1427,9 @@ impl Operator {
     fn get_ec_l(&self, n: i32, i: usize, j: usize, k: usize) -> f64 {
         let dir = n.rem_euclid(3) as usize;
         let pos = [i, j, k];
-        let area = edge_area_value(
-            &self.base.disc_lines,
-            self.base.num_lines,
-            dir,
-            pos,
-            true,
-            self.base.grid_delta,
-        );
-        let delta = edge_length_value(
-            &self.base.disc_lines,
-            self.base.num_lines,
-            dir,
-            pos,
-            true,
-            self.base.grid_delta,
-        );
+        let metric = self.metric();
+        let area = metric.edge_area(dir, pos, true);
+        let delta = metric.edge_length(dir, pos, true);
         if delta <= 0.0 {
             return 0.0;
         }
@@ -1370,15 +1543,7 @@ impl Operator {
             let dims_pp = counts[n_pp] as usize;
             let mut pos = [0usize; 3];
             pos[dir] = line;
-            let delta = edge_length_value(
-                &self.base.disc_lines,
-                counts,
-                dir,
-                pos,
-                false,
-                self.base.grid_delta,
-            )
-            .abs();
+            let delta = self.metric().edge_length(dir, pos, false).abs();
             if delta <= 0.0 {
                 continue;
             }
@@ -1461,6 +1626,7 @@ impl Operator {
             let shared = Arc::new(signal.clone());
             let disc_lines = &self.base.disc_lines;
             let grid_delta = self.base.grid_delta;
+            let metric = MeshMetric::new(disc_lines, counts, grid_delta, self.mesh_type);
 
             for n in 0..3usize {
                 for i in 0..counts[0] as usize {
@@ -1530,14 +1696,7 @@ impl Operator {
                                 if base_amp == 0.0 {
                                     continue;
                                 }
-                                let length = edge_length_value(
-                                    disc_lines,
-                                    counts,
-                                    n,
-                                    [i, j, k],
-                                    dual,
-                                    grid_delta,
-                                );
+                                let length = metric.edge_length(n, [i, j, k], dual);
                                 let amp = (base_amp * length) as FDTD_FLOAT;
                                 if amp == 0.0 {
                                     continue;
@@ -1766,10 +1925,9 @@ impl Operator {
                     .properties
                     .thickness(Some(params))
                     .unwrap_or(0.0);
-                let edge_length =
-                    edge_length_value(&disc_lines, counts, n, pos, false, grid_delta);
-                let node_width =
-                    edge_length_value(&disc_lines, counts, t_dir, pos, true, grid_delta);
+                let metric = MeshMetric::new(&disc_lines, counts, grid_delta, self.mesh_type);
+                let edge_length = metric.edge_length(n, pos, false);
+                let node_width = metric.edge_length(t_dir, pos, true);
                 if edge_length <= 0.0 || node_width <= 0.0 {
                     continue;
                 }
@@ -2235,22 +2393,9 @@ impl Operator {
                         let Some(candidate) = debye_at(coordinate) else {
                             continue;
                         };
-                        let area = edge_area_value(
-                            &self.base.disc_lines,
-                            counts,
-                            n,
-                            pos,
-                            false,
-                            self.base.grid_delta,
-                        );
-                        let length = edge_length_value(
-                            &self.base.disc_lines,
-                            counts,
-                            n,
-                            pos,
-                            false,
-                            self.base.grid_delta,
-                        );
+                        let metric = self.metric();
+                        let area = metric.edge_area(n, pos, false);
+                        let length = metric.edge_length(n, pos, false);
                         if length <= 0.0 {
                             continue;
                         }
@@ -2647,14 +2792,7 @@ impl Operator {
                         extension.curr_delay_delta[n][0][1][ui_pos] =
                             (delay - delay.floor()) as FDTD_FLOAT;
                         extension.curr_amp[n][0][1][ui_pos] = (e_amp[n_p]
-                            * edge_length_value(
-                                &self.base.disc_lines,
-                                self.base.num_lines,
-                                n_p,
-                                pos,
-                                false,
-                                self.base.grid_delta,
-                            )) as FDTD_FLOAT;
+                            * self.metric().edge_length(n_p, pos, false)) as FDTD_FLOAT;
 
                         let coordinate = yee_coordinates(
                             &self.base.disc_lines,
@@ -2674,14 +2812,7 @@ impl Operator {
                         extension.curr_delay_delta[n][0][0][ui_pos] =
                             (delay - delay.floor()) as FDTD_FLOAT;
                         extension.curr_amp[n][0][0][ui_pos] = (e_amp[n_pp]
-                            * edge_length_value(
-                                &self.base.disc_lines,
-                                self.base.num_lines,
-                                n_pp,
-                                pos,
-                                false,
-                                self.base.grid_delta,
-                            )) as FDTD_FLOAT;
+                            * self.metric().edge_length(n_pp, pos, false)) as FDTD_FLOAT;
 
                         if pos[n] > 0 {
                             pos[n] -= 1;
@@ -2712,14 +2843,7 @@ impl Operator {
                         extension.curr_delay_delta[n][1][1][ui_pos] =
                             (delay - delay.floor()) as FDTD_FLOAT;
                         extension.curr_amp[n][1][1][ui_pos] = (e_amp[n_p]
-                            * edge_length_value(
-                                &self.base.disc_lines,
-                                self.base.num_lines,
-                                n_p,
-                                pos,
-                                false,
-                                self.base.grid_delta,
-                            )) as FDTD_FLOAT;
+                            * self.metric().edge_length(n_p, pos, false)) as FDTD_FLOAT;
 
                         let coordinate = yee_coordinates(
                             &self.base.disc_lines,
@@ -2739,14 +2863,7 @@ impl Operator {
                         extension.curr_delay_delta[n][1][0][ui_pos] =
                             (delay - delay.floor()) as FDTD_FLOAT;
                         extension.curr_amp[n][1][0][ui_pos] = (e_amp[n_pp]
-                            * edge_length_value(
-                                &self.base.disc_lines,
-                                self.base.num_lines,
-                                n_pp,
-                                pos,
-                                false,
-                                self.base.grid_delta,
-                            )) as FDTD_FLOAT;
+                            * self.metric().edge_length(n_pp, pos, false)) as FDTD_FLOAT;
 
                         let iv_p = self.iv_at(n_p, pos);
                         let iv_pp = self.iv_at(n_pp, pos);
@@ -2798,14 +2915,7 @@ impl Operator {
                         extension.volt_delay_delta[n][0][1][ui_pos] =
                             (delay - delay.floor()) as FDTD_FLOAT;
                         extension.volt_amp[n][0][1][ui_pos] = (h_amp[n_p]
-                            * edge_length_value(
-                                &self.base.disc_lines,
-                                self.base.num_lines,
-                                n_p,
-                                pos,
-                                true,
-                                self.base.grid_delta,
-                            )) as FDTD_FLOAT;
+                            * self.metric().edge_length(n_p, pos, true)) as FDTD_FLOAT;
 
                         let coordinate = yee_coordinates(
                             &self.base.disc_lines,
@@ -2825,14 +2935,7 @@ impl Operator {
                         extension.volt_delay_delta[n][0][0][ui_pos] =
                             (delay - delay.floor()) as FDTD_FLOAT;
                         extension.volt_amp[n][0][0][ui_pos] = (h_amp[n_pp]
-                            * edge_length_value(
-                                &self.base.disc_lines,
-                                self.base.num_lines,
-                                n_pp,
-                                pos,
-                                true,
-                                self.base.grid_delta,
-                            )) as FDTD_FLOAT;
+                            * self.metric().edge_length(n_pp, pos, true)) as FDTD_FLOAT;
 
                         pos[n] += 1;
                         let vi_p = self.vi_at(n_p, pos);
@@ -2861,14 +2964,7 @@ impl Operator {
                         extension.volt_delay_delta[n][1][1][ui_pos] =
                             (delay - delay.floor()) as FDTD_FLOAT;
                         extension.volt_amp[n][1][1][ui_pos] = (h_amp[n_p]
-                            * edge_length_value(
-                                &self.base.disc_lines,
-                                self.base.num_lines,
-                                n_p,
-                                pos,
-                                true,
-                                self.base.grid_delta,
-                            )) as FDTD_FLOAT;
+                            * self.metric().edge_length(n_p, pos, true)) as FDTD_FLOAT;
 
                         let coordinate = yee_coordinates(
                             &self.base.disc_lines,
@@ -2888,14 +2984,7 @@ impl Operator {
                         extension.volt_delay_delta[n][1][0][ui_pos] =
                             (delay - delay.floor()) as FDTD_FLOAT;
                         extension.volt_amp[n][1][0][ui_pos] = (h_amp[n_pp]
-                            * edge_length_value(
-                                &self.base.disc_lines,
-                                self.base.num_lines,
-                                n_pp,
-                                pos,
-                                true,
-                                self.base.grid_delta,
-                            )) as FDTD_FLOAT;
+                            * self.metric().edge_length(n_pp, pos, true)) as FDTD_FLOAT;
 
                         let vi_p = self.vi_at(n_p, pos);
                         let vi_pp = self.vi_at(n_pp, pos);
@@ -3336,6 +3425,7 @@ impl Operator {
 
         let disc_lines = &self.base.disc_lines;
         let grid_delta = self.base.grid_delta;
+        let metric = MeshMetric::new(disc_lines, counts, grid_delta, self.mesh_type);
         let material_grid = self.material_grid.as_deref();
         let background = (
             self.base.m_bg_eps_r,
@@ -3381,22 +3471,18 @@ impl Operator {
                                 pos,
                             );
                             let (kappa_v, kappa_i) = upml_grading_kappa(
-                                disc_lines, counts, grid_delta, bc, sizes, n, pos,
+                                &metric,
+                                bc,
+                                sizes,
+                                n,
+                                pos,
                             );
                             let n_p = (n + 1) % 3;
                             let n_pp = (n + 2) % 3;
-                            let edge_len = edge_length_value(
-                                disc_lines, counts, n, pos, false, grid_delta,
-                            );
-                            let edge_area = edge_area_value(
-                                disc_lines, counts, n, pos, false, grid_delta,
-                            );
-                            let dual_len = edge_length_value(
-                                disc_lines, counts, n, pos, true, grid_delta,
-                            );
-                            let dual_area = edge_area_value(
-                                disc_lines, counts, n, pos, true, grid_delta,
-                            );
+                            let edge_len = metric.edge_length(n, pos, false);
+                            let edge_area = metric.edge_area(n, pos, false);
+                            let dual_len = metric.edge_length(n, pos, true);
+                            let dual_area = metric.edge_area(n, pos, true);
 
                             let main_vv = *vv.get(n, pos[0], pos[1], pos[2]);
                             let main_vi = *vi.get(n, pos[0], pos[1], pos[2]);
@@ -3512,9 +3598,7 @@ fn default_upml_grading(depth: f64, dl: f64, width: f64) -> f64 {
 
 /// Grading conductivities for one edge direction at a global position.
 fn upml_grading_kappa(
-    lines: &[Option<Vec<f64>>; 3],
-    counts: [u32; 3],
-    grid_delta: f64,
+    metric: &MeshMetric<'_>,
     bc: [i32; 6],
     sizes: [u32; 6],
     n_edge: usize,
@@ -3522,10 +3606,9 @@ fn upml_grading_kappa(
 ) -> ([f64; 3], [f64; 3]) {
     let mut kappa_v = [0.0f64; 3];
     let mut kappa_i = [0.0f64; 3];
-    let line = |dir: usize, index: usize| {
-        disc_line_value(&lines[dir], counts[dir] as usize, index, false) * grid_delta
-    };
-    let edge = |dir: usize| edge_length_value(lines, counts, dir, pos, false, grid_delta);
+    let counts = metric.counts;
+    let line = |dir: usize, index: usize| metric.line(dir, index, false) * metric.grid_delta;
+    let edge = |dir: usize| metric.edge_length(dir, pos, false);
 
     for dir in 0..3 {
         let size_lo = sizes[2 * dir] as usize;
@@ -3535,10 +3618,16 @@ fn upml_grading_kappa(
         let upper = bc[2 * dir + 1] == 3 && size_hi > 0 && pos[dir] + size_hi >= last;
 
         if lower {
-            let width = (line(dir, size_lo) - line(dir, 0)).abs();
+            let mut width = (line(dir, size_lo) - line(dir, 0)).abs();
             let cells = size_lo as f64;
-            let dl = width / cells;
             let mut depth = width - (line(dir, pos[dir]) - line(dir, 0)).abs();
+            // Native `CalcGradingKappa`: an azimuthal PML is wider by `rho`.
+            if metric.is_cylindrical() && dir == 1 {
+                let rho = metric.line(0, pos[0], false);
+                width *= rho;
+                depth *= rho;
+            }
+            let dl = width / cells;
             if dir == n_edge {
                 depth -= edge(dir) / 2.0;
             }
@@ -3551,10 +3640,15 @@ fn upml_grading_kappa(
             }
             kappa_i[dir] = default_upml_grading(depth, dl, width);
         } else if upper {
-            let width = (line(dir, last) - line(dir, last - size_hi)).abs();
+            let mut width = (line(dir, last) - line(dir, last - size_hi)).abs();
             let cells = size_hi as f64;
-            let dl = width / cells;
             let mut depth = width - (line(dir, last) - line(dir, pos[dir])).abs();
+            if metric.is_cylindrical() && dir == 1 {
+                let rho = metric.line(0, pos[0], false);
+                width *= rho;
+                depth *= rho;
+            }
+            let dl = width / cells;
             if dir == n_edge {
                 depth += edge(dir) / 2.0;
             }
@@ -3743,6 +3837,14 @@ impl Default for Operator {
 }
 
 impl OperatorBase for Operator {
+    fn mesh_type(&self) -> MeshType {
+        self.mesh_type
+    }
+
+    fn closed_alpha(&self) -> bool {
+        Operator::closed_alpha(self)
+    }
+
     fn material_grid_data(&self) -> Option<&[CellMaterial]> {
         self.material_grid.as_deref()
     }
@@ -3853,13 +3955,10 @@ impl OperatorBase for Operator {
         if !(0..3).contains(&ny) {
             return 0.0;
         }
-        edge_length_value(
-            &self.base.disc_lines,
-            self.base.num_lines,
+        self.metric().edge_length(
             ny as usize,
             [pos[0] as usize, pos[1] as usize, pos[2] as usize],
             dual_mesh,
-            self.base.grid_delta,
         )
     }
 
@@ -3867,30 +3966,16 @@ impl OperatorBase for Operator {
         if !(0..3).contains(&ny) {
             return 0.0;
         }
-        edge_area_value(
-            &self.base.disc_lines,
-            self.base.num_lines,
+        self.metric().edge_area(
             ny as usize,
             [pos[0] as usize, pos[1] as usize, pos[2] as usize],
             dual_mesh,
-            self.base.grid_delta,
         )
     }
 
     fn get_cell_volume(&self, pos: [u32; 3], dual_mesh: bool) -> f64 {
         let ui = [pos[0] as usize, pos[1] as usize, pos[2] as usize];
-        (0..3)
-            .map(|n| {
-                edge_length_value(
-                    &self.base.disc_lines,
-                    self.base.num_lines,
-                    n,
-                    ui,
-                    dual_mesh,
-                    self.base.grid_delta,
-                )
-            })
-            .product()
+        self.metric().cell_volume(ui, dual_mesh)
     }
 
     fn get_vv(&self) -> Option<&FieldArray> {
@@ -5332,7 +5417,7 @@ mod lorentz_tests {
 mod coordinate_system_tests {
     use super::*;
 
-    fn mesh(coordinate_system: u32) -> String {
+    fn cartesian_mesh(coordinate_system: u32) -> String {
         let lines: Vec<String> = (0..5).map(|index| index.to_string()).collect();
         let joined = lines.join(",");
         format!(
@@ -5348,18 +5433,102 @@ mod coordinate_system_tests {
         )
     }
 
+    /// Cylindrical model with 1 mm rho/z cells and the given alpha lines.
+    fn cylindrical_mesh(rho: &str, alpha: &str) -> String {
+        format!(
+            r#"<ContinuousStructure CoordSystem="1">
+                <RectilinearGrid DeltaUnit="0.001">
+                    <XLines>{rho}</XLines>
+                    <YLines>{alpha}</YLines>
+                    <ZLines>0,1,2,3,4</ZLines>
+                </RectilinearGrid>
+                <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                <Properties/>
+            </ContinuousStructure>"#
+        )
+    }
+
     #[test]
-    fn cylindrical_coordinates_are_rejected_loudly() {
+    fn cylindrical_full_turn_is_accepted_and_padded() {
         let mut op = Operator::new();
-        let error = op
-            .load_csx(&mesh(1))
-            .expect_err("cylindrical CSX must be rejected");
-        assert!(
-            error.contains("cylindrical"),
-            "the error must name the unsupported feature: {error}"
-        );
+        op.load_csx(&cylindrical_mesh(
+            "1,2,3,4,5",
+            "0,1.5707963267948966,3.141592653589793,4.71238898038469,6.283185307179586",
+        ))
+        .expect("a cylindrical CSX must load");
+        assert!(op.is_cylindrical());
+        assert!(op.closed_alpha());
+        // Native `SetupCSXGrid` pins the last line to `2*pi` and appends one
+        // padding line for the dual-mesh operations at the seam.
+        let alpha = op.base.disc_lines[1].as_ref().unwrap();
+        assert_eq!(op.base.num_lines[1], 6);
+        assert!((alpha[4] - 2.0 * std::f64::consts::PI).abs() < 1e-12);
+        assert!((alpha[5] - (2.0 * std::f64::consts::PI + alpha[1])).abs() < 1e-12);
         // A Cartesian model still loads.
         let mut op = Operator::new();
-        op.load_csx(&mesh(0)).expect("Cartesian CSX must load");
+        op.load_csx(&cartesian_mesh(0))
+            .expect("Cartesian CSX must load");
+        assert!(!op.is_cylindrical());
+    }
+
+    #[test]
+    fn cylindrical_metric_uses_rho_and_annulus_areas() {
+        let mut op = Operator::new();
+        op.load_csx(&cylindrical_mesh(
+            "1,2,3,4,5",
+            "0,1.5707963267948966,3.141592653589793,4.71238898038469,6.283185307179586",
+        ))
+        .expect("cylindrical CSX must load");
+        let metric = op.metric();
+        // 1 mm cells, alpha step pi/2; rho line 1 is at 2 mm.
+        let rho_step = 1.0e-3;
+        let rho = 2.0e-3;
+        let dalpha = 0.5 * std::f64::consts::PI;
+        let length = metric.edge_length(1, [1, 0, 0], false);
+        assert!((length - dalpha * rho).abs() < 1e-15, "length {length}");
+        // A z face at rho index 1 is the annulus between 1.5 mm and 2.5 mm.
+        let area = metric.edge_area(2, [1, 0, 0], false);
+        let expected = 0.5 * dalpha * ((2.5e-3_f64).powi(2) - (1.5e-3_f64).powi(2));
+        assert!((area - expected).abs() / expected < 1e-12, "area {area}");
+        let volume = metric.cell_volume([1, 0, 0], false);
+        assert!((volume - expected * rho_step).abs() / volume < 1e-12);
+        // The Cartesian metric stays a plain box.
+        let mut cart = Operator::new();
+        cart.load_csx(&cartesian_mesh(0))
+            .expect("Cartesian CSX must load");
+        let metric = cart.metric();
+        assert!((metric.edge_length(1, [1, 0, 0], false) - 1.0e-3).abs() < 1e-15);
+        assert!((metric.edge_area(2, [1, 0, 0], false) - 1.0e-6).abs() < 1e-15);
+    }
+
+    #[test]
+    fn cylindrical_open_alpha_is_not_padded() {
+        let mut op = Operator::new();
+        op.load_csx(&cylindrical_mesh("1,2,3,4,5", "0,0.5,1.0,1.5"))
+            .expect("open cylindrical CSX must load");
+        assert!(op.is_cylindrical());
+        assert!(!op.closed_alpha());
+        assert_eq!(op.base.num_lines[1], 4);
+    }
+
+    #[test]
+    fn cylindrical_negative_rho_and_open_axis_are_rejected() {
+        let mut op = Operator::new();
+        let error = op
+            .load_csx(&cylindrical_mesh(
+                "-1,0,1,2,3",
+                "0,1.5707963267948966,3.141592653589793,4.71238898038469,6.283185307179586",
+            ))
+            .expect_err("negative rho must be rejected");
+        assert!(error.contains("negative rho"), "{error}");
+
+        let mut op = Operator::new();
+        let error = op
+            .load_csx(&cylindrical_mesh(
+                "0,1,2,3,4",
+                "0,1.5707963267948966,3.141592653589793,4.71238898038469,6.283185307179586",
+            ))
+            .expect_err("a rho = 0 axis must be rejected until RM-137 is ported");
+        assert!(error.contains("rho = 0"), "{error}");
     }
 }
