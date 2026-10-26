@@ -3001,20 +3001,24 @@ fn physical_at(
             value / area
         }
         4 => {
-            // electric flux density D = eps_r * E
+            // Electric flux density D = eps0 * eps_r * E. The native
+            // `m_epsR` array stores the absolute permittivity
+            // (`Calc_EffMatPos` fills `eps0 * eps_r`), so the field dump
+            // carries the `eps0` factor.
             let eps_r = meta
                 .material_at(component, pos)
                 .map(|material| material.eps_r)
                 .unwrap_or(1.0);
-            raw * eps_r / length
+            raw * crate::constants::EPS0 * eps_r / length
         }
         5 => {
-            // magnetic flux density B = mue_r * H
+            // Magnetic flux density B = mue0 * mue_r * H (native `m_mueR`
+            // stores the absolute permeability).
             let mue_r = meta
                 .material_at(component, pos)
                 .map(|material| material.mue_r)
                 .unwrap_or(1.0);
-            raw * mue_r / length
+            raw * crate::constants::MU0 * mue_r / length
         }
         _ => raw / length,
     }
@@ -4124,12 +4128,20 @@ mod hdf5_dump_tests {
         // J = kappa * E = 4 * 5
         let j_field = extract_physical_field(&volt, &indices, &meta, false, 0, 2);
         assert_eq!(*j_field.get(0, 0, 0, 0), 20.0);
-        // D = eps_r * E = 2 * 5
+        // D = eps0 * eps_r * E (native `m_epsR` stores absolute permittivity)
         let d_field = extract_physical_field(&volt, &indices, &meta, false, 0, 4);
-        assert_eq!(*d_field.get(0, 0, 0, 0), 10.0);
-        // B = mue_r * H = 3 * 7
+        let expected_d = crate::constants::EPS0 * 2.0 * 5.0;
+        assert!(
+            (*d_field.get(0, 0, 0, 0) as f64 - expected_d).abs()
+                <= 1e-6 * expected_d.abs()
+        );
+        // B = mue0 * mue_r * H (native `m_mueR` stores absolute permeability)
         let b_field = extract_physical_field(&curr, &indices, &meta, false, 0, 5);
-        assert_eq!(*b_field.get(0, 0, 0, 0), 21.0);
+        let expected_b = crate::constants::MU0 * 3.0 * 7.0;
+        assert!(
+            (*b_field.get(0, 0, 0, 0) as f64 - expected_b).abs()
+                <= 1e-6 * expected_b.abs()
+        );
         // rot(H)_x = (2 - 1 + 3 - 1) / 1
         let rot = extract_physical_field(&curr, &indices, &meta, false, 0, 3);
         assert_eq!(*rot.get(0, 0, 0, 0), 3.0);

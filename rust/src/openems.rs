@@ -714,6 +714,35 @@ impl OpenEMS {
         }
     }
 
+    /// Native `Excitation::DumpVoltageExcite` / `DumpCurrentExcite`: the
+    /// sampled source waveforms are written as `et` and `ht` next to the other
+    /// solver output, before the time loop.
+    fn dump_excitation_signals(&self, dt: f64) {
+        let Some(signal) = self.excitation.as_ref() else {
+            return;
+        };
+        let length = signal.signal_length() as usize;
+        let mut voltage = String::with_capacity(length * 24);
+        let mut current = String::with_capacity(length * 24);
+        for n in 0..length {
+            voltage.push_str(&format!(
+                "{}\t{}\n",
+                n as f64 * dt,
+                signal.voltage(n)
+            ));
+            current.push_str(&format!(
+                "{}\t{}\n",
+                n as f64 * dt + 0.5 * dt,
+                signal.current(n)
+            ));
+        }
+        for (name, contents) in [("et", voltage), ("ht", current)] {
+            if let Err(error) = std::fs::write(name, contents) {
+                eprintln!("[openEMS] Could not write '{name}': {error}");
+            }
+        }
+    }
+
     /// Initialize the FDTD operator from a CSX geometry.
     /// Mirrors C++ `SetupFDTD` (operator setup portion).
     ///
@@ -1524,6 +1553,18 @@ fn build_sar_cell_data(
             return true;
         }
         let started = std::time::Instant::now();
+
+        // Native `RunFDTD`: dump the sampled excitation waveforms (`et`,
+        // `ht`) before the time loop.
+        if self.enable_dumps {
+            let dt = self
+                .fdtd_eng
+                .as_ref()
+                .expect("engine checked above")
+                .op
+                .get_timestep();
+            self.dump_excitation_signals(dt);
+        }
 
         // Invoke PreProcess on all registered processings. The array is taken
         // out so that the field interface can borrow the engine immutably while
