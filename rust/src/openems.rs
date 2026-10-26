@@ -1124,6 +1124,49 @@ impl OpenEMS {
                         array.add_processing(Box::new(processing));
                         created += 1;
                     }
+                    29 => {
+                        let mut processing =
+                            crate::processing::ProcessFieldsSAR::new(&name, 29);
+                        processing.set_cell_data(Self::build_sar_cell_data(
+                            &structure,
+                            engine,
+                        ));
+                        processing.set_file_type(dump.file_type());
+                        processing.set_legacy_format(self.legacy_hdf5_dumps);
+                        processing.set_process_interval(interval);
+                        let fd_over = if dump.oversampling() >= 0 {
+                            dump.oversampling().max(1) as u32
+                        } else {
+                            1
+                        };
+                        processing.set_fd_oversampling(fd_over);
+                        for frequency in dump.fd_samples() {
+                            processing.add_frequency(*frequency);
+                        }
+                        if processing.get_frequencies().is_empty() {
+                            eprintln!(
+                                "[openEMS] SetupFDTD: Warning: SAR dump '{}' has no <FD_Samples> frequencies... skipping",
+                                property.name()
+                            );
+                            continue;
+                        }
+                        if dump.file_type() != 1 {
+                            eprintln!(
+                                "[openEMS] SetupFDTD: Warning: raw SAR dump '{}' requires the HDF5 file type... skipping",
+                                property.name()
+                            );
+                            continue;
+                        }
+                        array.add_processing(Box::new(processing));
+                        created += 1;
+                    }
+                    20..=22 => {
+                        eprintln!(
+                            "[openEMS] SetupFDTD: Warning: direct SAR dump type {} of property '{}' is not wired yet; write the raw dump (type 29) and run sar_calc... skipping",
+                            dump_type,
+                            property.name()
+                        );
+                    }
                     other => {
                         eprintln!(
                             "[openEMS] SetupFDTD: unknown dump box type {} of property '{}'... skipping",
@@ -1140,7 +1183,112 @@ impl OpenEMS {
         }
     }
 
-    /// Create the probe processings from the CSX `ProbeBox` properties.
+    /// Per-cell volume, mass density and conductivity for the SAR dumps.
+///
+/// Mirrors `ProcessFieldsSAR::DumpFDData`: the volume from the mesh, the mass
+/// density and conductivity from the material at the cell centre
+/// (`GetCellCenterMaterialAvgCoord` + `GetPropertyByCoordPriority`).
+fn build_sar_cell_data(
+    structure: &csxcad_core::model::Structure,
+    engine: &Engine,
+) -> crate::processing::SarCellData {
+    let params = structure.parameters();
+    let num_lines = engine.num_lines;
+    let grid_delta = engine.op.get_grid_delta();
+    let line = |axis: usize, index: usize| -> f64 {
+        engine.op.get_disc_line(axis as i32, index as u32, false)
+    };
+    let width = |axis: usize, index: usize| -> f64 {
+        let count = num_lines[axis];
+        if index + 1 < count {
+            (line(axis, index + 1) - line(axis, index)) * grid_delta
+        } else if index > 0 {
+            (line(axis, index) - line(axis, index - 1)) * grid_delta
+        } else {
+            0.0
+        }
+    };
+    let centre = |axis: usize, index: usize| -> f64 {
+        let count = num_lines[axis];
+        if index + 1 < count {
+            0.5 * (line(axis, index) + line(axis, index + 1))
+        } else if index > 0 {
+            line(axis, index) + 0.5 * (line(axis, index) - line(axis, index - 1))
+        } else {
+            line(axis, 0)
+        }
+    };
+
+    let cells = num_lines[0] * num_lines[1] * num_lines[2];
+    let mut data = crate::processing::SarCellData {
+        volume: vec![0.0; cells],
+        density: vec![0.0; cells],
+        conductivity: vec![0.0; cells],
+    };
+    for i in 0..num_lines[0] {
+        for j in 0..num_lines[1] {
+            for k in 0..num_lines[2] {
+                let index = (i * num_lines[1] + j) * num_lines[2] + k;
+                data.volume[index] = width(0, i) * width(1, j) * width(2, k);
+                // the material lookup uses drawing units, like the native
+                // GetPropertyByCoordPriority
+                let coordinate = [centre(0, i), centre(1, j), centre(2, k)];
+                let mut winner: Option<&csxcad_core::material::MaterialProperties> = None;
+                let mut winner_priority = i32::MIN;
+                for property in 0..structure.property_count() {
+                    let Some(property) = structure.property_by_index(property) else {
+                        continue;
+                    };
+                    let Some(material) = property.material() else {
+                        continue;
+                    };
+                    for primitive in property.primitives() {
+                        if winner.is_some() && primitive.priority() <= winner_priority {
+                            continue;
+                        }
+                        if primitive
+                            .is_inside(coordinate, Some(params))
+                            .unwrap_or(false)
+                        {
+                            winner = Some(material);
+                            winner_priority = primitive.priority();
+                        }
+                    }
+                }
+                if let Some(material) = winner {
+                    data.density[index] = material
+                        .weighted_density(
+                            Some(params),
+                            coordinate,
+                            csxcad_core::grid::CoordinateSystem::Cartesian,
+                        )
+                        .unwrap_or(0.0);
+                    data.conductivity[index] = material
+                        .weighted_value(
+                            csxcad_core::material::MaterialField::Kappa,
+                            0,
+                            Some(params),
+                            coordinate,
+                            csxcad_core::grid::CoordinateSystem::Cartesian,
+                        )
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0.0);
+                }
+            }
+        }
+    }
+    if std::env::var_os("OPENEMS_DEBUG_PROBES").is_some() {
+        let nonzero = data.density.iter().filter(|value| **value > 0.0).count();
+        eprintln!(
+            "[debug] SAR cell data: {nonzero} of {cells} cells with density, {} properties",
+            structure.property_count()
+        );
+    }
+    data
+}
+
+/// Create the probe processings from the CSX `ProbeBox` properties.
     ///
     /// Mirrors `openEMS::SetupProcessing` for probe boxes: voltage probes use a
     /// line integral, current probes a surface integral, field probes all three

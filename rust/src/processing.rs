@@ -1954,30 +1954,90 @@ impl ProcessFieldsFD {
     }
 }
 
-/// SAR (Specific Absorption Rate) field processing.
-/// Mirrors the C++ `ProcessFieldsSAR` concept (SAR-Local, SAR-1G, SAR-10G dumps).
-#[allow(dead_code)]
+/// Per-cell material data needed by the SAR dumps
+/// (native `ProcessFieldsSAR::DumpFDData`).
+#[derive(Clone, Debug, Default)]
+pub struct SarCellData {
+    /// Cell volume in m^3 (native `GetCellVolume`).
+    pub volume: Vec<f64>,
+    /// Mass density in kg/m^3 (`GetDensityWeighted`).
+    pub density: Vec<f64>,
+    /// Electric conductivity in S/m (`GetKappaWeighted(0)`).
+    pub conductivity: Vec<f64>,
+}
+
+/// SAR (Specific Absorption Rate) raw dump (`SAR_RAW_DATA`, dump type 29).
+///
+/// Mirrors the C++ `ProcessFieldsSAR` raw-data path: the running DFT of the
+/// electric field at the cell centres is written together with the cell
+/// volumes, mass densities and conductivities, which `sar_calc` /
+/// `SAR_Calculation::CalcFromHDF5` then post-processes.
 pub struct ProcessFieldsSAR {
     name: String,
     processing_name: String,
-    start: [f64; 3],
-    stop: [f64; 3],
-    dump_type: i32, // SAR_LOCAL_DUMP=20, SAR_1G_DUMP=21, SAR_10G_DUMP=22
+    dump_type: i32,
     file_type: i32,
-    mass_density: f64,
+    frequencies: Vec<f64>,
+    fd_oversampling: u32,
+    fd_interval: u32,
+    process_interval: u32,
+    legacy_fmt: bool,
+    cell_data: SarCellData,
+    dims: Option<[usize; 3]>,
+    disc_lines: Option<[Vec<f64>; 3]>,
+    acc_re: Vec<Vec<f32>>,
+    acc_im: Vec<Vec<f32>>,
+    sample_count: u32,
+    initialized: bool,
 }
 
 impl ProcessFieldsSAR {
-    pub fn new(name: &str, start: [f64; 3], stop: [f64; 3]) -> Self {
+    /// `dump_type` is the native `DumpType` (`29` for the raw SAR data).
+    pub fn new(name: &str, dump_type: i32) -> Self {
         Self {
             name: name.to_string(),
             processing_name: "SAR field processing".to_string(),
-            start,
-            stop,
-            dump_type: 20, // SAR_LOCAL_DUMP
-            file_type: VTK_FILETYPE,
-            mass_density: 1000.0, // kg/m^3 (water)
+            dump_type,
+            file_type: HDF5_FILETYPE,
+            frequencies: Vec::new(),
+            fd_oversampling: 1,
+            fd_interval: 0,
+            process_interval: 1,
+            legacy_fmt: false,
+            cell_data: SarCellData::default(),
+            dims: None,
+            disc_lines: None,
+            acc_re: Vec::new(),
+            acc_im: Vec::new(),
+            sample_count: 0,
+            initialized: false,
         }
+    }
+
+    pub fn set_cell_data(&mut self, cell_data: SarCellData) {
+        self.cell_data = cell_data;
+    }
+
+    pub fn cell_data(&self) -> &SarCellData {
+        &self.cell_data
+    }
+
+    pub fn add_frequency(&mut self, frequency: f64) {
+        if frequency > 0.0 && !self.frequencies.contains(&frequency) {
+            self.frequencies.push(frequency);
+        }
+    }
+
+    pub fn get_frequencies(&self) -> &[f64] {
+        &self.frequencies
+    }
+
+    pub fn set_fd_oversampling(&mut self, factor: u32) {
+        self.fd_oversampling = factor.max(1);
+    }
+
+    pub fn set_legacy_format(&mut self, legacy: bool) {
+        self.legacy_fmt = legacy;
     }
 
     pub fn get_processing_name(&self) -> String {
@@ -1992,20 +2052,12 @@ impl ProcessFieldsSAR {
         self.file_type
     }
 
-    pub fn get_mass_density(&self) -> f64 {
-        self.mass_density
-    }
-
     pub fn set_dump_type(&mut self, val: i32) {
         self.dump_type = val;
     }
 
     pub fn set_file_type(&mut self, val: i32) {
         self.file_type = val;
-    }
-
-    pub fn set_mass_density(&mut self, val: f64) {
-        self.mass_density = val;
     }
 
     pub fn need_conductivity(&self) -> bool {
@@ -2023,6 +2075,106 @@ impl ProcessFieldsSAR {
     pub fn calc_total_energy_estimate(&self) -> f64 {
         0.0
     }
+
+    /// Cell-centred electric field of the current step (native `CalcField`
+    /// with `CELL_INTERPOLATE`).
+    fn cell_field(&self, interface: &EngineInterface<'_>) -> FieldArray {
+        let dims = interface.meta.num_lines;
+        let indices = [
+            (0..dims[0]).collect::<Vec<_>>(),
+            (0..dims[1]).collect::<Vec<_>>(),
+            (0..dims[2]).collect::<Vec<_>>(),
+        ];
+        extract_physical_field(interface.volt, &indices, interface.meta, false, 2, 0)
+    }
+
+    fn update_interval(&mut self, dt: f64) {
+        let highest = self.frequencies.iter().copied().fold(0.0f64, f64::max);
+        if highest <= 0.0 || dt <= 0.0 {
+            self.fd_interval = 1;
+            return;
+        }
+        let nyquist_steps = 1.0 / (2.0 * highest * dt);
+        let oversampling = self.fd_oversampling.max(1) as f64;
+        self.fd_interval = ((nyquist_steps / oversampling).round() as u32).max(1);
+    }
+
+    fn ensure_accumulators(&mut self, dims: [usize; 3]) {
+        let cells = 3 * dims[0] * dims[1] * dims[2];
+        if self.dims != Some(dims) || self.acc_re.len() != self.frequencies.len() {
+            self.dims = Some(dims);
+            self.acc_re = vec![vec![0.0f32; cells]; self.frequencies.len()];
+            self.acc_im = vec![vec![0.0f32; cells]; self.frequencies.len()];
+            self.sample_count = 0;
+        }
+    }
+
+    /// Write the raw SAR dump (`/Mesh`, `/CellWidth`, `/CellData`,
+    /// `/FieldData/FD`), matching `SAR_Calculation::ReadFromHDF5`.
+    fn dump_raw(&self) -> Result<(), Hdf5Error> {
+        let Some(dims) = self.dims else {
+            return Ok(());
+        };
+        let file = Hdf5File::create(&format!("{}.h5", self.name))?;
+        file.write_f64_attribute("/", "openEMS_HDF5_version", OPENEMS_HDF5_VERSION)?;
+        file.write_i32_attribute("/", "dump_type", self.dump_type)?;
+        if self.legacy_fmt {
+            file.write_bool_attribute("/", "legacy_fmt", true)?;
+        }
+        let lines = self.disc_lines.clone().unwrap_or_default();
+        for (axis, name) in ["x", "y", "z"].iter().enumerate() {
+            file.write_f64_dataset("/Mesh", name, &lines[axis])?;
+        }
+        file.write_i32_attribute("/Mesh", "mesh_type", 0)?;
+        // native `WriteRectMesh(numLines, cellWidth, ..., "/CellWidth")` writes
+        // one width per mesh line
+        let mut widths: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for axis in 0..3 {
+            let count = dims[axis];
+            for index in 0..count {
+                let width = if index + 1 < lines[axis].len() {
+                    lines[axis][index + 1] - lines[axis][index]
+                } else if index > 0 {
+                    lines[axis][index] - lines[axis][index - 1]
+                } else {
+                    0.0
+                };
+                widths[axis].push(width);
+            }
+            file.write_f64_dataset("/CellWidth", ["x", "y", "z"][axis], &widths[axis])?;
+        }
+        let cells = dims[0] * dims[1] * dims[2];
+        for (name, values) in [
+            ("Conductivity", &self.cell_data.conductivity),
+            ("Density", &self.cell_data.density),
+            ("Volume", &self.cell_data.volume),
+        ] {
+            if values.len() != cells {
+                return Err(Hdf5Error::InvalidShape {
+                    path: format!("/CellData/{name}"),
+                    detail: format!("{} values, {cells} cells expected", values.len()),
+                });
+            }
+            let data: Vec<f32> = values.iter().map(|value| *value as f32).collect();
+            file.write_f32_dataset_nd("/CellData", name, &dims, &data, None)?;
+        }
+        file.create_group("/FieldData/FD")?;
+        let frequencies: Vec<f32> = self.frequencies.iter().map(|value| *value as f32).collect();
+        file.write_f32_attribute_vector("/FieldData/FD", "frequency", &frequencies)?;
+        for (index, frequency) in self.frequencies.iter().enumerate() {
+            file.write_complex_f32_dataset(
+                "/FieldData/FD",
+                &format!("f{index}"),
+                &[3, dims[0], dims[1], dims[2]],
+                &self.acc_re[index],
+                &self.acc_im[index],
+                Some("NXYZ"),
+            )?;
+            let path = format!("/FieldData/FD/f{index}");
+            file.write_f64_attribute(&path, "frequency", *frequency)?;
+        }
+        Ok(())
+    }
 }
 
 impl Processing for ProcessFieldsSAR {
@@ -2038,10 +2190,106 @@ impl Processing for ProcessFieldsSAR {
         self.processing_name.clone()
     }
 
-    fn set_process_interval(&mut self, _interval: u32) {}
+    fn set_process_interval(&mut self, interval: u32) {
+        self.process_interval = interval;
+    }
 
     fn get_process_interval(&self) -> u32 {
-        0
+        self.process_interval
+    }
+
+    fn set_fd_oversampling(&mut self, factor: u32) {
+        ProcessFieldsSAR::set_fd_oversampling(self, factor);
+    }
+
+    fn add_frequency(&mut self, freq: f64) {
+        ProcessFieldsSAR::add_frequency(self, freq);
+    }
+
+    fn add_frequencies(&mut self, freqs: &[f64]) {
+        for &freq in freqs {
+            ProcessFieldsSAR::add_frequency(self, freq);
+        }
+    }
+
+    fn process_fields(&mut self, num_ts: u32, interface: &EngineInterface<'_>) -> i32 {
+        if self.frequencies.is_empty() {
+            return 0;
+        }
+        if self.fd_interval == 0 {
+            self.update_interval(interface.meta.dt);
+        }
+        let interval = self.fd_interval.max(1);
+        if !num_ts.is_multiple_of(interval) {
+            return 0;
+        }
+        let dims = interface.meta.num_lines;
+        self.ensure_accumulators(dims);
+        if self.disc_lines.is_none() {
+            self.disc_lines = Some(interface.meta.disc_lines.clone());
+        }
+        let reduced = self.cell_field(interface);
+        let [nx, ny, nz] = dims;
+        let time = num_ts as f64 * interface.meta.dt;
+        let scale = 2.0 * interface.meta.dt * interval as f64;
+        for (frequency, (re, im)) in self
+            .frequencies
+            .iter()
+            .zip(self.acc_re.iter_mut().zip(self.acc_im.iter_mut()))
+        {
+            let argument = -2.0 * std::f64::consts::PI * frequency * time;
+            let cosine = argument.cos() * scale;
+            let sine = argument.sin() * scale;
+            let mut index = 0usize;
+            for n in 0..3 {
+                for i in 0..nx {
+                    for j in 0..ny {
+                        for k in 0..nz {
+                            let value = *reduced.get(n, i, j, k) as f64;
+                            re[index] += (value * cosine) as f32;
+                            im[index] += (value * sine) as f32;
+                            index += 1;
+                        }
+                    }
+                }
+            }
+        }
+        self.sample_count += 1;
+        self.get_next_interval(num_ts)
+    }
+
+    fn get_next_interval(&self, num_ts: u32) -> i32 {
+        let interval = self.fd_interval.max(1);
+        let next = interval as i32 - (num_ts % interval) as i32;
+        next.max(1)
+    }
+
+    fn check_timestep(&mut self, num_ts: u32) -> bool {
+        num_ts.is_multiple_of(self.fd_interval.max(1))
+    }
+
+    fn post_process(&mut self) {
+        if self.dims.is_none() || self.acc_re.is_empty() {
+            return;
+        }
+        if let Err(error) = self.dump_raw() {
+            eprintln!(
+                "[openEMS] Failed to write the raw SAR dump '{}': {error}",
+                self.name
+            );
+        }
+    }
+
+    fn reset(&mut self) {
+        for values in &mut self.acc_re {
+            values.fill(0.0);
+        }
+        for values in &mut self.acc_im {
+            values.fill(0.0);
+        }
+        self.sample_count = 0;
+        self.initialized = false;
+        self.fd_interval = 0;
     }
 }
 
@@ -3220,20 +3468,14 @@ mod tests {
 
     #[test]
     fn test_process_fields_sar_creation() {
-        let sar = ProcessFieldsSAR::new("sar_dump", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        let mut sar = ProcessFieldsSAR::new("sar_dump", 29);
         assert_eq!(sar.get_processing_name(), "SAR field processing");
-        assert_eq!(sar.get_dump_type(), 20); // SAR_LOCAL_DUMP
-        assert!((sar.get_mass_density() - 1000.0).abs() < 1e-12);
+        assert_eq!(sar.get_dump_type(), 29); // SAR_RAW_DATA
         assert!(sar.need_conductivity());
         assert!(!sar.need_permittivity());
         assert!(!sar.need_permeability());
-    }
-
-    #[test]
-    fn test_process_fields_sar_density() {
-        let mut sar = ProcessFieldsSAR::new("sar_dump", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
-        sar.set_mass_density(1050.0);
-        assert!((sar.get_mass_density() - 1050.0).abs() < 1e-12);
+        sar.add_frequency(1.0e9);
+        assert_eq!(sar.get_frequencies(), &[1.0e9]);
     }
 
     #[test]
