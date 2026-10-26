@@ -55,3 +55,10 @@ rust/output.vtk
 # Rust CLI binary linked next to openEMS.sh for the Octave interface
 /openEMS
 
+
+# Solver output written next to the run (native et/ht excitation waveforms)
+et
+ht
+/rust/et
+/rust/ht
+
