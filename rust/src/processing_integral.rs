@@ -627,8 +627,28 @@ impl CurrentIntegral {
             return Some(indices);
         }
         // current probes live on the dual mesh (native `SetDualMesh`)
-        let start = meta.snap_to_mesh(self.start, true, false);
-        let stop = meta.snap_to_mesh(self.stop, true, false);
+        let mut start = meta.snap_to_mesh(self.start, true, false);
+        let mut stop = meta.snap_to_mesh(self.stop, true, false);
+        // Native `ProcessCurrent::DefineStartStopCoord`: a current probe must be
+        // a surface, so a tangential axis that was requested with zero extent is
+        // grown by one dual line. Without this the +y/-y (or +z/-z) faces of the
+        // zero-thickness box cancel exactly and every excited-port current reads 0.
+        if (0..3).contains(&self.normal_dir) {
+            let normal = self.normal_dir as usize;
+            for axis in 0..3 {
+                if axis == normal || self.start[axis] != self.stop[axis] {
+                    continue;
+                }
+                if meta.dual_line(axis, start[axis]) > self.start[axis] && start[axis] > 0 {
+                    start[axis] -= 1;
+                }
+                if meta.dual_line(axis, start[axis]) < self.start[axis]
+                    && stop[axis] + 1 < meta.num_lines[axis]
+                {
+                    stop[axis] += 1;
+                }
+            }
+        }
         self.snapped = Some((start, stop));
         Some((start, stop))
     }
@@ -773,6 +793,22 @@ mod port_integral_tests {
             meta.snap_to_mesh([0.2525, 0.2525, 1.0], false, true),
             [100, 100, 200]
         );
+    }
+
+    /// Native `ProcessCurrent::DefineStartStopCoord` grows a zero-extent
+    /// tangential axis by one dual line so the probe is a real surface.
+    #[test]
+    fn current_probe_expands_a_zero_extent_tangential_axis() {
+        let meta = meta();
+        let mut probe = CurrentIntegral::new([2.0, 1.0, 2.0], [2.0, 3.0, 2.0], 0);
+        let (start, stop) = probe.indices(&meta).expect("snapped");
+        // The normal axis stays flat, the requested y extent is kept and the
+        // zero-thickness z axis is grown by exactly one line.
+        assert_eq!(start[0], stop[0]);
+        assert!(stop[1] > start[1]);
+        assert_eq!(stop[2] - start[2], 1);
+        // The snap is cached: repeated calls must not grow again.
+        assert_eq!(probe.indices(&meta), Some((start, stop)));
     }
 
     #[test]
