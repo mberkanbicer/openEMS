@@ -1220,6 +1220,10 @@ impl OpenEMS {
                     29 => {
                         let mut processing =
                             crate::processing::ProcessFieldsSAR::new(&name, 29);
+                        if cylindrical {
+                            processing.set_mesh_type(mesh_type);
+                        }
+                        processing.set_bounds(start, stop);
                         processing.set_cell_data(Self::build_sar_cell_data(
                             &structure,
                             engine,
@@ -1269,6 +1273,10 @@ impl OpenEMS {
                         }
                         let mut processing =
                             crate::processing::ProcessFieldsSAR::new(&name, dump_type);
+                        if cylindrical {
+                            processing.set_mesh_type(mesh_type);
+                        }
+                        processing.set_bounds(start, stop);
                         processing.set_cell_data(Self::build_sar_cell_data(&structure, engine));
                         processing.set_file_type(dump.file_type());
                         processing.set_dump_mode_value(dump.dump_mode());
@@ -1322,19 +1330,12 @@ fn build_sar_cell_data(
 ) -> crate::processing::SarCellData {
     let params = structure.parameters();
     let num_lines = engine.num_lines;
-    let grid_delta = engine.op.get_grid_delta();
+    let closed_alpha = matches!(
+        engine.op.mesh_type(),
+        crate::operator::MeshType::Cylindrical { .. }
+    );
     let line = |axis: usize, index: usize| -> f64 {
         engine.op.get_disc_line(axis as i32, index as u32, false)
-    };
-    let width = |axis: usize, index: usize| -> f64 {
-        let count = num_lines[axis];
-        if index + 1 < count {
-            (line(axis, index + 1) - line(axis, index)) * grid_delta
-        } else if index > 0 {
-            (line(axis, index) - line(axis, index - 1)) * grid_delta
-        } else {
-            0.0
-        }
     };
     let centre = |axis: usize, index: usize| -> f64 {
         let count = num_lines[axis];
@@ -1357,10 +1358,23 @@ fn build_sar_cell_data(
         for j in 0..num_lines[1] {
             for k in 0..num_lines[2] {
                 let index = (i * num_lines[1] + j) * num_lines[2] + k;
-                data.volume[index] = width(0, i) * width(1, j) * width(2, k);
+                // native `GetCellVolume`: the operator metric of the cell, so
+                // a cylindrical mesh yields annulus segments and the
+                // `rho = 0` axis cells their wedge volumes
+                data.volume[index] = engine.op.get_cell_volume(
+                    [i as u32, j as u32, k as u32],
+                    false,
+                );
                 // the material lookup uses drawing units, like the native
-                // GetPropertyByCoordPriority
-                let coordinate = [centre(0, i), centre(1, j), centre(2, k)];
+                // GetPropertyByCoordPriority; on a closed azimuth the seam and
+                // padding lines map back into the ring
+                // (native `GetCellCenterMaterialAvgCoord`)
+                let j_eff = if closed_alpha && j + 2 >= num_lines[1] {
+                    j - (num_lines[1] - 2)
+                } else {
+                    j
+                };
+                let coordinate = [centre(0, i), centre(1, j_eff), centre(2, k)];
                 let mut winner: Option<&csxcad_core::material::MaterialProperties> = None;
                 let mut winner_priority = i32::MIN;
                 for property in 0..structure.property_count() {

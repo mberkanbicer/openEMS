@@ -2369,14 +2369,16 @@ pub struct ProcessFieldsSAR {
     fd_interval: u32,
     process_interval: u32,
     legacy_fmt: bool,
+    /// Mesh type for the dump files, native `SetMeshType`.
+    mesh_type: MeshType,
+    /// Simulation length unit captured from the engine meta (native
+    /// `GetGridDelta`), written as the `mesh_scaling` attribute.
+    grid_delta: f64,
     cell_data: SarCellData,
     dims: Option<[usize; 3]>,
     disc_lines: Option<[Vec<f64>; 3]>,
     acc_re: Vec<Vec<f32>>,
     acc_im: Vec<Vec<f32>>,
-    /// Current-density DFT of the direct result dumps (`DumpType` 20..22).
-    j_acc_re: Vec<Vec<f32>>,
-    j_acc_im: Vec<Vec<f32>>,
     /// Native `DumpMode` of the dump box (0 none, 1 node, 2 cell).
     dump_mode: i32,
     /// Native `SAR_Method` averaging method (`Simple` by default).
@@ -2385,6 +2387,12 @@ pub struct ProcessFieldsSAR {
     fd_nyquist: u32,
     sample_count: u32,
     initialized: bool,
+    /// Dump box bounds (native `DefineStartStopCoord`).
+    bounds: Option<([f64; 3], [f64; 3])>,
+    /// Snapped dump region (native `CalcMeshPos` on the dual mesh).
+    indices: Option<[Vec<usize>; 3]>,
+    /// Full-grid line counts backing `cell_data`.
+    full_lines: Option<[usize; 3]>,
 }
 
 impl ProcessFieldsSAR {
@@ -2400,19 +2408,33 @@ impl ProcessFieldsSAR {
             fd_interval: 0,
             process_interval: 1,
             legacy_fmt: false,
+            mesh_type: MeshType::Cartesian,
+            grid_delta: 1.0,
             cell_data: SarCellData::default(),
             dims: None,
             disc_lines: None,
             acc_re: Vec::new(),
             acc_im: Vec::new(),
-            j_acc_re: Vec::new(),
-            j_acc_im: Vec::new(),
             dump_mode: 2,
             sar_method: "Simple".to_string(),
             fd_nyquist: 0,
             sample_count: 0,
             initialized: false,
+            bounds: None,
+            indices: None,
+            full_lines: None,
         }
+    }
+
+    /// Restrict the SAR dump to a box (metres), native `DefineStartStopCoord`.
+    pub fn set_bounds(&mut self, start: [f64; 3], stop: [f64; 3]) {
+        let mut low = [0.0f64; 3];
+        let mut high = [0.0f64; 3];
+        for axis in 0..3 {
+            low[axis] = start[axis].min(stop[axis]);
+            high[axis] = start[axis].max(stop[axis]);
+        }
+        self.bounds = Some((low, high));
     }
 
     pub fn set_cell_data(&mut self, cell_data: SarCellData) {
@@ -2516,20 +2538,61 @@ impl ProcessFieldsSAR {
     /// Interpolated electric field of the current step (native `CalcField`).
     /// `dump_type` selects E (0) or J = kappa * E (2).
     fn sampled_field(&self, interface: &EngineInterface<'_>, dump_type: i32) -> FieldArray {
-        let dims = interface.meta.num_lines;
-        let indices = [
-            (0..dims[0]).collect::<Vec<_>>(),
-            (0..dims[1]).collect::<Vec<_>>(),
-            (0..dims[2]).collect::<Vec<_>>(),
-        ];
-        extract_physical_field(
-            interface.volt,
-            &indices,
-            interface.meta,
-            false,
-            self.dump_mode,
-            dump_type,
-        )
+        // native `ProcessFieldsSAR::InitProcess` forces CELL interpolation:
+        // the four primary edges around the cell centre are averaged, while the
+        // dual mesh only drives the dump coordinates and the region snapping
+        let indices = self
+            .indices
+            .as_ref()
+            .expect("the dump region is built before sampling");
+        extract_physical_field(interface.volt, indices, interface.meta, false, 2, dump_type)
+    }
+
+    /// Native cell widths: `GetDiscDelta(n, pos) * gridDelta` (the array the
+    /// native `ProcessFieldsSAR::DumpFDData` writes to `/CellWidth` and feeds
+    /// to `SAR_Calculation::SetCellWidth`). On a cylindrical mesh the
+    /// azimuthal delta is an angle, which the native code still scales by the
+    /// grid delta; the averaging cubes depend on that convention.
+    fn sar_cell_widths(&self, dims: [usize; 3]) -> [Vec<f64>; 3] {
+        let mut widths = self.cell_widths(dims);
+        if self.mesh_type == MeshType::Cylindrical {
+            for value in &mut widths[1] {
+                *value *= self.grid_delta;
+            }
+        }
+        widths
+    }
+
+    /// Slice the full-grid cell data onto the snapped dump region (native
+    /// computes the volumes and material lookups on the snapped `posLines`).
+    fn region_cell_data(&self, indices: &[Vec<usize>; 3]) -> SarCellData {
+        let Some(full) = self.full_lines else {
+            return self.cell_data.clone();
+        };
+        let dims = [indices[0].len(), indices[1].len(), indices[2].len()];
+        let cells = dims[0] * dims[1] * dims[2];
+        let mut out = SarCellData {
+            volume: vec![0.0; cells],
+            density: vec![0.0; cells],
+            conductivity: vec![0.0; cells],
+        };
+        for (ii, &i) in indices[0].iter().enumerate() {
+            for (jj, &j) in indices[1].iter().enumerate() {
+                for (kk, &k) in indices[2].iter().enumerate() {
+                    let src = (i * full[1] + j) * full[2] + k;
+                    let dst = (ii * dims[1] + jj) * dims[2] + kk;
+                    out.volume[dst] = self.cell_data.volume.get(src).copied().unwrap_or(0.0);
+                    out.density[dst] = self.cell_data.density.get(src).copied().unwrap_or(0.0);
+                    out.conductivity[dst] = self
+                        .cell_data
+                        .conductivity
+                        .get(src)
+                        .copied()
+                        .unwrap_or(0.0);
+                }
+            }
+        }
+        out
     }
 
     fn update_interval(&mut self, dt: f64) {
@@ -2554,10 +2617,6 @@ impl ProcessFieldsSAR {
             self.dims = Some(dims);
             self.acc_re = vec![vec![0.0f32; cells]; self.frequencies.len()];
             self.acc_im = vec![vec![0.0f32; cells]; self.frequencies.len()];
-            if self.is_result_dump() {
-                self.j_acc_re = vec![vec![0.0f32; cells]; self.frequencies.len()];
-                self.j_acc_im = vec![vec![0.0f32; cells]; self.frequencies.len()];
-            }
             self.sample_count = 0;
         }
     }
@@ -2629,21 +2688,39 @@ impl ProcessFieldsSAR {
             file.write_bool_attribute("/", "legacy_fmt", true)?;
         }
         let lines = self.disc_lines.clone().unwrap_or_default();
-        for (axis, name) in ["x", "y", "z"].iter().enumerate() {
+        // native `ProcessFieldsFD::InitProcess` writes the mesh through
+        // `WriteRectMesh(numLines, discLines, meshType, gridDelta)`: a
+        // cylindrical mesh names the axes rho/alpha/z, keeps the azimuth in
+        // radians and records the grid delta as `mesh_scaling`
+        let names: [&str; 3] = if self.mesh_type == MeshType::Cylindrical {
+            ["rho", "alpha", "z"]
+        } else {
+            ["x", "y", "z"]
+        };
+        let mesh_type = mesh_type_code(self.mesh_type);
+        for (axis, name) in names.iter().enumerate() {
             file.write_f64_dataset("/Mesh", name, &lines[axis])?;
         }
-        file.write_i32_attribute("/Mesh", "mesh_type", 0)?;
-        // native `WriteRectMesh(numLines, cellWidth, ..., "/CellWidth")` writes
-        // one width per mesh line
-        let widths = self.cell_widths(dims);
-        for axis in 0..3 {
-            file.write_f64_dataset("/CellWidth", ["x", "y", "z"][axis], &widths[axis])?;
+        file.write_i32_attribute("/Mesh", "mesh_type", mesh_type)?;
+        file.write_f64_attribute("/Mesh", "mesh_scaling", self.grid_delta)?;
+        // native `WriteRectMesh(numLines, cellWidth, meshType, 1, "/CellWidth")`
+        // writes one width per mesh line from the same array the SAR averaging
+        // consumes
+        let widths = self.sar_cell_widths(dims);
+        for (axis, name) in names.iter().enumerate() {
+            file.write_f64_dataset("/CellWidth", name, &widths[axis])?;
         }
+        file.write_i32_attribute("/CellWidth", "mesh_type", mesh_type)?;
+        file.write_f64_attribute("/CellWidth", "mesh_scaling", 1.0)?;
         let cells = dims[0] * dims[1] * dims[2];
+        let cell_data = match &self.indices {
+            Some(indices) => self.region_cell_data(indices),
+            None => self.cell_data.clone(),
+        };
         for (name, values) in [
-            ("Conductivity", &self.cell_data.conductivity),
-            ("Density", &self.cell_data.density),
-            ("Volume", &self.cell_data.volume),
+            ("Conductivity", &cell_data.conductivity),
+            ("Density", &cell_data.density),
+            ("Volume", &cell_data.volume),
         ] {
             if values.len() != cells {
                 return Err(Hdf5Error::InvalidShape {
@@ -2681,16 +2758,11 @@ impl ProcessFieldsSAR {
         let Some(dims) = self.dims else {
             return Ok(());
         };
-        if self.j_acc_re.len() != self.frequencies.len() {
-            return Err("the J-field DFT was not accumulated".to_string());
-        }
         let lines = self.disc_lines.clone().unwrap_or_default();
-        let widths = self.cell_widths(dims);
+        let widths = self.sar_cell_widths(dims);
         let mut e_fields = Vec::with_capacity(self.frequencies.len());
-        let mut j_fields = Vec::with_capacity(self.frequencies.len());
         for index in 0..self.frequencies.len() {
             let mut e_field = crate::nf2ff::ComplexField::new(dims);
-            let mut j_field = crate::nf2ff::ComplexField::new(dims);
             for component in 0..3 {
                 for i in 0..dims[0] {
                     for j in 0..dims[1] {
@@ -2707,38 +2779,31 @@ impl ProcessFieldsSAR {
                                     im: f64::from(self.acc_im[index][offset]),
                                 },
                             );
-                            j_field.set(
-                                component,
-                                i,
-                                j,
-                                k,
-                                ComplexPoint {
-                                    re: f64::from(self.j_acc_re[index][offset]),
-                                    im: f64::from(self.j_acc_im[index][offset]),
-                                },
-                            );
                         }
                     }
                 }
             }
             e_fields.push(e_field);
-            j_fields.push(j_field);
         }
         let mut runner = crate::sar_hdf5::SarRunner::new();
         if !runner.set_averaging_method(&self.sar_method) {
             return Err(format!("unknown SAR averaging method '{}'", self.sar_method));
         }
         runner.averaging_mass = self.averaging_mass();
+        let cell_data = match &self.indices {
+            Some(indices) => self.region_cell_data(indices),
+            None => self.cell_data.clone(),
+        };
         runner
             .calc_from_fields(
                 &lines,
                 widths,
-                self.cell_data.volume.clone(),
-                self.cell_data.density.clone(),
-                None,
+                cell_data.volume.clone(),
+                cell_data.density.clone(),
+                Some(cell_data.conductivity.clone()),
                 &self.frequencies,
                 &e_fields,
-                Some(&j_fields),
+                None,
                 &format!("{}.h5", self.name),
             )
             .map(|_| ())
@@ -2754,6 +2819,10 @@ impl ProcessFieldsSAR {
 impl Processing for ProcessFieldsSAR {
     fn get_name(&self) -> String {
         self.name.clone()
+    }
+
+    fn set_mesh_type(&mut self, mesh_type: MeshType) {
+        self.mesh_type = mesh_type;
     }
 
     fn set_name(&mut self, val: &str) {
@@ -2797,11 +2866,32 @@ impl Processing for ProcessFieldsSAR {
         if !num_ts.is_multiple_of(interval) {
             return 0;
         }
-        let dims = interface.meta.num_lines;
-        self.ensure_accumulators(dims);
-        if self.disc_lines.is_none() {
-            self.disc_lines = Some(interface.meta.disc_lines.clone());
+        self.grid_delta = interface.meta.grid_delta;
+        self.mesh_type = match interface.meta.mesh_type {
+            crate::operator::MeshType::Cylindrical { .. } => MeshType::Cylindrical,
+            crate::operator::MeshType::Cartesian => MeshType::Cartesian,
+        };
+        if self.indices.is_none() {
+            // native `ProcessFieldsSAR::InitProcess`: CELL interpolation on the
+            // dual mesh is forced and `ProcessFieldsFD::CalcMeshPos` snaps the
+            // dump box without any sub-sampling
+            let indices = [
+                compute_dump_indices(interface.meta, 0, self.bounds, true, &[1; 3], &[0.0; 3]),
+                compute_dump_indices(interface.meta, 1, self.bounds, true, &[1; 3], &[0.0; 3]),
+                compute_dump_indices(interface.meta, 2, self.bounds, true, &[1; 3], &[0.0; 3]),
+            ];
+            self.full_lines = Some(interface.meta.num_lines);
+            self.disc_lines = Some([0, 1, 2].map(|axis| {
+                indices[axis]
+                    .iter()
+                    .map(|&index| interface.meta.dual_line(axis, index))
+                    .collect()
+            }));
+            self.indices = Some(indices);
         }
+        let indices = self.indices.as_ref().expect("region built above");
+        let dims = [indices[0].len(), indices[1].len(), indices[2].len()];
+        self.ensure_accumulators(dims);
         let time = num_ts as f64 * interface.meta.dt;
         let scale = 2.0 * interface.meta.dt * interval as f64;
         let reduced = self.sampled_field(interface, 0);
@@ -2814,20 +2904,6 @@ impl Processing for ProcessFieldsSAR {
             &mut self.acc_re,
             &mut self.acc_im,
         );
-        // The result dumps need the current density at the same positions
-        // (native `CalcField` with `J_FIELD_DUMP` + `AddEFieldAndJField`).
-        if self.is_result_dump() {
-            let current = self.sampled_field(interface, 2);
-            Self::accumulate(
-                &self.frequencies,
-                &current,
-                dims,
-                time,
-                scale,
-                &mut self.j_acc_re,
-                &mut self.j_acc_im,
-            );
-        }
         self.sample_count += 1;
         self.get_next_interval(num_ts)
     }
@@ -2866,12 +2942,6 @@ impl Processing for ProcessFieldsSAR {
             values.fill(0.0);
         }
         for values in &mut self.acc_im {
-            values.fill(0.0);
-        }
-        for values in &mut self.j_acc_re {
-            values.fill(0.0);
-        }
-        for values in &mut self.j_acc_im {
             values.fill(0.0);
         }
         self.sample_count = 0;

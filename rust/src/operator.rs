@@ -713,6 +713,26 @@ impl Operator {
         let disc_lines = self.base.disc_lines.clone();
         let counts = self.base.num_lines;
 
+        // native `Operator_Cylinder::GetYeeCoords`: on a closed azimuth every
+        // sampled coordinate wraps back into `[alpha0, alpha0 + 2*pi)`, so the
+        // seam and padding cells resolve the material inside the ring instead
+        // of falling back to the background
+        let closed_mesh = matches!(mesh_type, MeshType::Cylindrical { closed_alpha: true });
+        let wrap_alpha = |coordinate: &mut [f64; 3]| {
+            if !closed_mesh {
+                return;
+            }
+            let alpha0 = disc_lines[1].as_ref().and_then(|l| l.first()).copied();
+            let Some(alpha0) = alpha0 else {
+                return;
+            };
+            if coordinate[1] >= alpha0 + std::f64::consts::TAU {
+                coordinate[1] -= std::f64::consts::TAU;
+            } else if coordinate[1] < alpha0 {
+                coordinate[1] += std::f64::consts::TAU;
+            }
+        };
+
         let mut material_grid = vec![background; 3 * ncells];
         for n in 0..3usize {
             let n_p = (n + 1) % 3;
@@ -746,6 +766,8 @@ impl Operator {
                             pos,
                             false,
                         );
+                        let mut edge_coordinate = edge_coordinate;
+                        wrap_alpha(&mut edge_coordinate);
                         let is_pec = sample(edge_coordinate)
                             .map(|material| material.is_pec)
                             .unwrap_or(false);
@@ -784,8 +806,13 @@ impl Operator {
                                 } else {
                                     -delta_pp_m * 0.25
                                 };
+                            wrap_alpha(&mut coordinate);
+                            // native `AverageMatQuarterCell` weights the
+                            // quarter cells by `GetNodeArea(ny, loc, true)`;
+                            // the rho-face `edge_area` branch would apply the
+                            // primary rho factor and vanish on the rho = 0 axis
                             let area = MeshMetric::new(&disc_lines, counts, 1.0, mesh_type)
-                                .edge_area(n, loc, true);
+                                .node_area(n, loc, true);
                             if area <= 0.0 {
                                 continue;
                             }
@@ -831,6 +858,7 @@ impl Operator {
                                 + if lower { -delta_m * 0.25 } else { delta * 0.25 };
                             coordinate[n_p] = base_coordinate[n_p] + delta_p * 0.5;
                             coordinate[n_pp] = base_coordinate[n_pp] + delta_pp * 0.5;
+                            wrap_alpha(&mut coordinate);
                             let material = sample(coordinate)
                                 .filter(|material| !material.is_pec)
                                 .unwrap_or(AnisoMaterial {
@@ -5647,6 +5675,34 @@ mod coordinate_system_tests {
         assert!(op.is_cylindrical());
         assert!(!op.closed_alpha());
         assert_eq!(op.base.num_lines[1], 4);
+    }
+
+    /// Native `Operator::CalcTimestep_Var1` runs on the material-resolved
+    /// EC values, so a dielectric mesh takes a `sqrt(eps_r)` larger step than
+    /// the vacuum estimate. The native solver reports 8.12933e-12 s for this
+    /// exact mesh (eps_r = 80, 16 sectors, rho = 0 axis).
+    #[test]
+    fn cylindrical_r0_timestep_includes_the_dielectric() {
+        let xml = r#"<ContinuousStructure CoordSystem="1"><RectilinearGrid DeltaUnit="0.001" CoordSystem="1"><XLines Qty="11">0,2,4,6,8,10,12,14,16,18,20</XLines><YLines Qty="17">-3.141592653589793,-2.748893571891069,-2.356194490192345,-1.9634954084936207,-1.5707963267948966,-1.1780972450961724,-0.7853981633974483,-0.39269908169872414,0,0.39269908169872414,0.7853981633974483,1.1780972450961724,1.5707963267948966,1.9634954084936207,2.356194490192345,2.748893571891069,3.141592653589793</YLines><ZLines Qty="11">0,2,4,6,8,10,12,14,16,18,20</ZLines></RectilinearGrid><BackgroundMaterial Epsilon="1" Mue="1" Kappa="0" Sigma="0"/><Properties><Material ID="0" Name="muscle" Isotropy="1"><Primitives><Box Priority="0"><P1 X="0" Y="-3.141592653589793" Z="0"/><P2 X="20" Y="3.141592653589793" Z="20"/></Box></Primitives><Property Epsilon="80,1,1" Mue="1,1,1" Kappa="1,0,0" Sigma="0,0,0" Density="1000"/><Weight Epsilon="1,1,1" Mue="1,1,1" Kappa="1,1,1" Sigma="1,1,1" Density="1"/></Material></Properties></ContinuousStructure>"#;
+        let mut op = Operator::new();
+        op.load_csx(xml).expect("the lossy cylindrical CSX must load");
+        assert!(op.r0_included);
+        let dt = op.calc_timestep();
+        // the material must be resolved into the cell grid: the z-face
+        // capacitance is eps_r * eps0 * annulus / dz with the dual rho bounds
+        // 1 mm .. 3 mm around rho line 1
+        let eps = op.get_ec_c(2, 1, 4, 4);
+        let expected_c = 80.0 * crate::constants::EPS0
+            * (0.5 * (std::f64::consts::FRAC_PI_8) * ((3.0e-3f64).powi(2) - (1.0e-3_f64).powi(2)))
+                / 2.0e-3;
+        assert!(
+            (eps - expected_c).abs() / expected_c < 1e-9,
+            "ec_c = {eps} vs the eps_r = 80 value {expected_c}"
+        );
+        assert!(
+            (dt - 8.12933e-12).abs() / 8.12933e-12 < 0.01,
+            "dt {dt} differs from the native 8.12933e-12"
+        );
     }
 
     #[test]
