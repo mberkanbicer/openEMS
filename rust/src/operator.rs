@@ -2112,10 +2112,11 @@ impl Operator {
                 };
                 let coordinate_system = property.coordinate_input_type();
                 for (primitive_index, primitive) in property.primitives().iter().enumerate() {
-                    // Native `prim->ToCurve()` also matches wires, which derive
-                    // from `CSPrimCurve`.
-                    let Some(curve) = primitive.curve_shape().or_else(|| primitive.wire_shape())
-                    else {
+                    // Native `prim->ToCurve()` (`CSXCAD/src/CSPrimitives.h:163`)
+                    // matches only a primitive whose CSXCAD type is `CURVE`; a
+                    // `WIRE` keeps `Type == WIRE` (`CSPrimWire.cpp:30`) and is
+                    // covered by the containment path above instead.
+                    let Some(curve) = primitive.curve_shape() else {
                         continue;
                     };
                     // Native `CSPrimCurve::GetPoint(i, p, m_MeshType)`: the
@@ -6340,5 +6341,67 @@ mod coordinate_system_tests {
                 "edge {position:?} must not carry the wire source"
             );
         }
+    }
+
+    /// Only a `Curve` is walked as a path. Native `CSPrimitives::ToCurve()`
+    /// (`CSXCAD/src/CSPrimitives.h:163`) tests `Type == CURVE`, and a `Wire`
+    /// sets `Type == WIRE` (`CSPrimitives.cpp:30`), so a
+    /// `<Wire WireRadius="…">` excitation is *not* excited along its axis: it
+    /// only reaches the field through the containment test, which a thin,
+    /// off-grid wire never satisfies. The native solver reports
+    /// `Voltage excitations: 0` and an identically zero probe for this case.
+    #[test]
+    fn wire_excitation_is_not_walked_as_a_curve() {
+        fn excitation_xml(primitive: &str) -> String {
+            let values: Vec<String> = (0..7).map(|index| index.to_string()).collect();
+            let joined = values.join(",");
+            format!(
+                r#"<ContinuousStructure CoordSystem="0">
+                    <RectilinearGrid DeltaUnit="0.001">
+                        <XLines>{joined}</XLines>
+                        <YLines>{joined}</YLines>
+                        <ZLines>{joined}</ZLines>
+                    </RectilinearGrid>
+                    <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                    <Properties>
+                        <Excitation Name="ex" Type="0" Excite="1,1,1">
+                            <Primitives>
+                                {primitive}
+                            </Primitives>
+                        </Excitation>
+                    </Properties>
+                </ContinuousStructure>"#
+            )
+        }
+        let vertices = r#"<Vertex X="2.1" Y="2.1" Z="2.1"/><Vertex X="5.1" Y="5.1" Z="5.1"/>"#;
+        let signal = crate::excitation::Excitation::gauss(4.5e9, 4.5e9);
+
+        // The same two vertices as a `Wire`: no edge is excited.
+        let mut op = Operator::new();
+        op.load_csx(&excitation_xml(&format!(
+            r#"<Wire Priority="0" WireRadius="0.0001">{vertices}</Wire>"#
+        )))
+        .expect("the wire excitation CSX should load");
+        op.base.d_t = 1.0e-12;
+        let extension = op.build_excitation_extension(&signal);
+        assert!(
+            extension.voltage_excitations.is_empty(),
+            "a wire must not be walked like a curve: {:?}",
+            extension
+                .voltage_excitations
+                .iter()
+                .map(|excitation| (excitation.component, excitation.pos))
+                .collect::<Vec<_>>()
+        );
+
+        // As a `Curve` the very same segment is a path and is excited.
+        let mut op = Operator::new();
+        op.load_csx(&excitation_xml(&format!(
+            r#"<Curve Priority="0">{vertices}</Curve>"#
+        )))
+        .expect("the curve excitation CSX should load");
+        op.base.d_t = 1.0e-12;
+        let extension = op.build_excitation_extension(&signal);
+        assert!(!extension.voltage_excitations.is_empty());
     }
 }
