@@ -100,8 +100,22 @@ impl Engine {
         self.num_threads = threads.max(1) as usize;
     }
 
-    fn worker_count(&self, max_workers: usize) -> usize {
-        self.num_threads.max(1).min(max_workers.max(1))
+    /// Cells per worker below which an update stays on the calling thread.
+    ///
+    /// The update kernels start and join the worker set per time step, so for a
+    /// small grid that cost exceeds the arithmetic: the 9152-cell cavity case
+    /// measured 12.4 s threaded against 2.6 s serial, while the 2.1M-cell Coax
+    /// case profits from the threads (25 s against 54 s serial). 16384 cells
+    /// per worker keeps both regimes on their faster path.
+    const MIN_CELLS_PER_WORKER: usize = 16_384;
+
+    fn worker_count(&self, max_workers: usize, cells: usize) -> usize {
+        let workers = self.num_threads.max(1).min(max_workers.max(1));
+        if cells / workers < Self::MIN_CELLS_PER_WORKER {
+            1
+        } else {
+            workers
+        }
     }
 
     /// Add a physics extension to the engine.
@@ -162,7 +176,7 @@ impl Engine {
         let ny = self.num_lines[1];
         let nz = self.num_lines[2];
 
-        let workers = self.worker_count(nx);
+        let workers = self.worker_count(nx, nx * ny * nz);
         if workers > 1 {
             let volt_ptr = SendPtr(self.volt_ptr.as_mut_ptr());
             let curr_ptr = SendPtr(self.curr_ptr.as_ptr() as *mut FDTD_FLOAT);
@@ -314,7 +328,10 @@ impl Engine {
         let nz = self.num_lines[2];
         let cells_x = nx.saturating_sub(1);
 
-        let workers = self.worker_count(cells_x);
+        let workers = self.worker_count(
+            cells_x,
+            cells_x * ny.saturating_sub(1) * nz.saturating_sub(1),
+        );
         if workers > 1 {
             let curr_ptr = SendPtr(self.curr_ptr.as_mut_ptr());
             let volt_ptr = SendPtr(self.volt_ptr.as_ptr() as *mut FDTD_FLOAT);
@@ -355,22 +372,19 @@ impl Engine {
                                         let hx = curr_ptr.add(base);
                                         let ii0 = *ii_ptr.add(base);
                                         let iv0 = *iv_ptr.add(base);
-                                        let curl_e =
-                                            v2_ijk - v2_ijp1k - v1_ijk + v1_ijkp1;
+                                        let curl_e = v2_ijk - v2_ijp1k - v1_ijk + v1_ijkp1;
                                         *hx = *hx * ii0 + iv0 * curl_e;
 
                                         let hy = curr_ptr.add(cs[0] + base);
                                         let ii1 = *ii_ptr.add(cs[0] + base);
                                         let iv1 = *iv_ptr.add(cs[0] + base);
-                                        let curl_e =
-                                            v0_ijk - v0_ijkp1 - v2_ijk + v2_ip1jk;
+                                        let curl_e = v0_ijk - v0_ijkp1 - v2_ijk + v2_ip1jk;
                                         *hy = *hy * ii1 + iv1 * curl_e;
 
                                         let hz = curr_ptr.add(2 * cs[0] + base);
                                         let ii2 = *ii_ptr.add(2 * cs[0] + base);
                                         let iv2 = *iv_ptr.add(2 * cs[0] + base);
-                                        let curl_e =
-                                            v1_ijk - v1_ip1jk - v0_ijk + v0_ijp1k;
+                                        let curl_e = v1_ijk - v1_ip1jk - v0_ijk + v0_ijp1k;
                                         *hz = *hz * ii2 + iv2 * curl_e;
                                     }
                                 }
