@@ -374,8 +374,7 @@ impl Processing for ProcessIntegral {
                         for (frequency, accumulator) in
                             self.fd_samples.iter().zip(accumulators.iter_mut())
                         {
-                            let argument =
-                                -2.0 * std::f64::consts::PI * frequency * time;
+                            let argument = -2.0 * std::f64::consts::PI * frequency * time;
                             accumulator.re += value * self.weight * scale * argument.cos();
                             accumulator.im += value * self.weight * scale * argument.sin();
                         }
@@ -485,7 +484,11 @@ mod tests {
             .collect();
         assert!((first[0] - dt).abs() < 1e-18);
         let expected = 2.0 * (2.0 * std::f64::consts::PI * frequency * dt).sin();
-        assert!((first[1] - expected).abs() < 1e-12, "{} vs {expected}", first[1]);
+        assert!(
+            (first[1] - expected).abs() < 1e-12,
+            "{} vs {expected}",
+            first[1]
+        );
 
         // Frequency-domain accumulator compared with an independent sum.
         let interval = integral.fd_interval() as f64;
@@ -761,16 +764,18 @@ mod port_integral_tests {
     /// headers for `combinedtests/Coax` (5 mm grid starting at -252.5 mm).
     #[test]
     fn snapping_reproduces_the_native_coax_indices() {
-        let x: Vec<f64> = (0..101).map(|index| (-252.5 + 5.0 * index as f64) * 1e-3).collect();
+        let x: Vec<f64> = (0..101)
+            .map(|index| (-252.5 + 5.0 * index as f64) * 1e-3)
+            .collect();
         let z: Vec<f64> = (0..201).map(|index| (5.0 * index as f64) * 1e-3).collect();
         let meta = EngineMeta {
             num_lines: [101, 101, 201],
             disc_lines: [x.clone(), x, z],
             dt: 9.629166e-12,
-                materials: None,
+            materials: None,
             mesh_type: crate::operator::MeshType::Cartesian,
             grid_delta: 1.0,
-            };
+        };
         // native voltage probe: (0.0975,-0.0025,0.5) -> [70,50,100] and
         // (0.2275,-0.0025,0.5) -> [96,50,100]
         assert_eq!(
@@ -1052,10 +1057,7 @@ impl ModeMatchIntegral {
         }
         let n_p = (normal + 1) % 3;
         let n_pp = (normal + 2) % 3;
-        let num = [
-            stop[n_p] - start[n_p] + 1,
-            stop[n_pp] - start[n_pp] + 1,
-        ];
+        let num = [stop[n_p] - start[n_p] + 1, stop[n_pp] - start[n_pp] + 1];
 
         // Parse the two transverse templates.
         let mut parsers = [fparser::Parser::new(), fparser::Parser::new()];
@@ -1069,10 +1071,7 @@ impl ModeMatchIntegral {
             }
         }
 
-        let mut mode = [
-            vec![0.0; num[0] * num[1]],
-            vec![0.0; num[0] * num[1]],
-        ];
+        let mut mode = [vec![0.0; num[0] * num[1]], vec![0.0; num[0] * num[1]]];
         let mut norm = 0.0f64;
         for pos_p in 0..num[0] {
             for pos_pp in 0..num[1] {
@@ -1227,8 +1226,6 @@ fn node_area(meta: &EngineMeta, normal: usize, pos: [usize; 3], dual: bool) -> f
     node_width(meta, n_p, pos, dual) * node_width(meta, n_pp, pos, dual)
 }
 
-
-
 #[cfg(test)]
 mod mode_match_tests {
     use super::*;
@@ -1275,8 +1272,7 @@ mod mode_match_tests {
                 pos[n_p] = surface.start[n_p] + pos_p;
                 pos[n_pp] = surface.start[n_pp] + pos_pp;
                 let index = pos_p * surface.num[1] + pos_pp;
-                *volt.get_mut(n_p, pos[0], pos[1], pos[2]) =
-                    (3.0 * surface.mode[0][index]) as f32;
+                *volt.get_mut(n_p, pos[0], pos[1], pos[2]) = (3.0 * surface.mode[0][index]) as f32;
             }
         }
         let interface = EngineInterface {
@@ -1285,19 +1281,20 @@ mod mode_match_tests {
             curr: &FieldArray::new("curr", [5, 5, 5]),
         };
         let results = integral.calc(0, &interface);
-        assert!((results[0] - 3.0).abs() < 1.0e-6, "amplitude {}", results[0]);
         assert!(
-            (results[1] - 1.0).abs() < 1.0e-6,
-            "purity {}",
-            results[1]
+            (results[0] - 3.0).abs() < 1.0e-6,
+            "amplitude {}",
+            results[0]
         );
+        assert!((results[1] - 1.0).abs() < 1.0e-6, "purity {}", results[1]);
     }
 
     #[test]
     fn a_box_without_a_flat_surface_is_disabled() {
         let mut meta = meta();
         meta.num_lines = [5, 5, 5];
-        let mut integral = ModeMatchIntegral::new([1.0e-3, 1.0e-3, 1.0e-3], [3.0e-3, 3.0e-3, 3.0e-3]);
+        let mut integral =
+            ModeMatchIntegral::new([1.0e-3, 1.0e-3, 1.0e-3], [3.0e-3, 3.0e-3, 3.0e-3]);
         integral.set_weight_function(0, "1");
         let empty = FieldArray::new("volt", [5, 5, 5]);
         let interface = EngineInterface {
