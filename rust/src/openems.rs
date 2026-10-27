@@ -1176,12 +1176,7 @@ impl OpenEMS {
                         processing.set_process_interval(interval);
                         processing.set_fd_nyquist(nyquist);
                         // native: FD dumps default to the plain Nyquist rate
-                        let fd_over = if dump.oversampling() >= 0 {
-                            dump.oversampling().max(1) as u32
-                        } else {
-                            1
-                        };
-                        processing.set_fd_oversampling(fd_over);
+                        processing.set_fd_oversampling(Self::dump_oversampling(property));
                         if cylindrical {
                             processing.set_mesh_type(mesh_type);
                         }
@@ -1234,12 +1229,7 @@ impl OpenEMS {
                         processing.set_legacy_format(self.legacy_hdf5_dumps);
                         processing.set_process_interval(interval);
                         processing.set_fd_nyquist(nyquist);
-                        let fd_over = if dump.oversampling() >= 0 {
-                            dump.oversampling().max(1) as u32
-                        } else {
-                            1
-                        };
-                        processing.set_fd_oversampling(fd_over);
+                        processing.set_fd_oversampling(Self::dump_oversampling(property));
                         for frequency in dump.fd_samples() {
                             processing.add_frequency(*frequency);
                         }
@@ -1284,12 +1274,7 @@ impl OpenEMS {
                         processing.set_legacy_format(self.legacy_hdf5_dumps);
                         processing.set_process_interval(interval);
                         processing.set_fd_nyquist(nyquist);
-                        let fd_over = if dump.oversampling() >= 0 {
-                            dump.oversampling().max(1) as u32
-                        } else {
-                            1
-                        };
-                        processing.set_fd_oversampling(fd_over);
+                        processing.set_fd_oversampling(Self::dump_oversampling(property));
                         for frequency in dump.fd_samples() {
                             processing.add_frequency(*frequency);
                         }
@@ -1317,6 +1302,18 @@ impl OpenEMS {
         if created > 0 && self.verbose_level > 0 {
             println!("[openEMS] {} field dump(s) configured", created);
         }
+    }
+
+    /// Native `CSPropProbeBox::GetOverSampling` of a dump box: a dump box
+    /// inherits the probe's oversampling override, `1` (plain Nyquist) when it
+    /// is unset.
+    fn dump_oversampling(property: &csxcad_core::model::Property) -> u32 {
+        property
+            .probe()
+            .map(|probe| probe.oversampling())
+            .filter(|value| *value >= 0)
+            .map(|value| value.max(1) as u32)
+            .unwrap_or(1)
     }
 
     /// Per-cell volume, mass density and conductivity for the SAR dumps.
