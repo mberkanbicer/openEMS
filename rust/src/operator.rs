@@ -9,7 +9,8 @@ use crate::extensions::{
     EngineExtLorentzMaterial, EngineExtLumpedRLC, EngineExtMurABC, EngineExtSteadyState,
     EngineExtTFSF, EngineExtUPML, LumpedRLCCoeffs,
 };
-use crate::operator_base::OperatorBase;
+use crate::operator_base::{GridPath, OperatorBase};
+use csxcad_core::grid::transform_coordinates;
 use csxcad_core::material::{ConductingSheetProperties, ExcitationProperties, MaterialField};
 use csxcad_core::model::{Primitive, PropertyType};
 use std::collections::HashMap;
@@ -1528,6 +1529,221 @@ impl Operator {
         (dimension, ui_start, ui_stop, start_in, stop_in)
     }
 
+    /// Snap a start/stop coordinate pair along a line onto the mesh.
+    ///
+    /// Mirrors native `Operator::SnapLine2Mesh` (`FDTD/operator.cpp:361-389`)
+    /// with `dualMesh` and `fullMesh` as parameters. `None` is the native
+    /// `-1` return: both endpoints of at least one axis lie on the same side
+    /// outside the mesh, i.e. the line cannot be snapped at all. The native
+    /// positive return value only reports which endpoints were clamped and is
+    /// not used by `FindPath`, so it is not modelled.
+    pub fn snap_line_to_mesh_native(
+        &self,
+        start: [f64; 3],
+        stop: [f64; 3],
+        dual: bool,
+        full_mesh: bool,
+    ) -> Option<([u32; 3], [u32; 3])> {
+        let (ui_start, _) = self.snap_to_mesh_native(start, dual, full_mesh);
+        let (ui_stop, _) = self.snap_to_mesh_native(stop, dual, full_mesh);
+
+        let counts = self.base.num_lines;
+        for axis in 0..3 {
+            let n = counts[axis] as usize;
+            if n == 0 {
+                return None;
+            }
+            // Native `GetNumberOfLines(n, true)` (operator.cpp:372-373): the
+            // base operator ignores the flag and returns `numLines[n]`.
+            let lower = disc_line_value(&self.base.disc_lines[axis], n, 0, false);
+            let upper = disc_line_value(&self.base.disc_lines[axis], n, n - 1, false);
+            if start[axis] < lower && stop[axis] < lower {
+                return None;
+            }
+            if start[axis] > upper && stop[axis] > upper {
+                return None;
+            }
+        }
+
+        Some((ui_start, ui_stop))
+    }
+
+    /// Distance of `p` to the line `start`-`stop` and the relative foot
+    /// position along it.
+    ///
+    /// Mirrors native `Point_Line_Distance` (`CSXCAD/src/CSPrimitives.cpp:36-52`)
+    /// for the operator mesh: for a cylindrical mesh all three points are
+    /// converted to Cartesian coordinates first (`TransformCoordSystem`,
+    /// `CSXCAD/src/ParameterCoord.cpp:22-62`), so the distance and the foot
+    /// parameter are the genuine cylindrical-mesh metric rather than the naive
+    /// `(rho, alpha, z)` box metric.
+    pub fn point_line_distance(&self, p: [f64; 3], start: [f64; 3], stop: [f64; 3]) -> (f64, f64) {
+        let to_cartesian = |c: [f64; 3]| {
+            if self.is_cylindrical() {
+                let [rho, alpha, z] = c;
+                [rho * alpha.cos(), rho * alpha.sin(), z]
+            } else {
+                c
+            }
+        };
+        let p = to_cartesian(p);
+        let start = to_cartesian(start);
+        let stop = to_cartesian(stop);
+
+        let dir = [stop[0] - start[0], stop[1] - start[1], stop[2] - start[2]];
+        // Native `pow(dir[n],2)` — the same correctly rounded square.
+        let length_squared = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+        let mut foot =
+            (p[0] - start[0]) * dir[0] + (p[1] - start[1]) * dir[1] + (p[2] - start[2]) * dir[2];
+        foot /= length_squared;
+
+        let foot_point = [
+            start[0] + foot * dir[0],
+            start[1] + foot * dir[1],
+            start[2] + foot * dir[2],
+        ];
+        let delta = [
+            p[0] - foot_point[0],
+            p[1] - foot_point[1],
+            p[2] - foot_point[2],
+        ];
+        let dist = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+        (foot, dist)
+    }
+
+    /// Path of mesh edges from `start` to `stop`.
+    ///
+    /// Mirrors native `Operator::FindPath` (`FDTD/operator.cpp:391-497`):
+    /// `SnapLine2Mesh` with the main mesh (`dualMesh=false`, `fullMesh=true`),
+    /// then a greedy walk over the six neighbouring nodes that only accepts a
+    /// foot parameter strictly larger than the current one (`foot > currFoot`)
+    /// and, among those, the first node with the smallest distance
+    /// (`dist < minDist`, checked in the native order: axis 0 lower, axis 0
+    /// upper, axis 1 lower, ...). The walk stops once no neighbour moves the
+    /// foot past `stopFoot`, and the remaining axis-aligned edges to the
+    /// snapped stop index are appended afterwards.
+    ///
+    /// An unsnappable line or a walk that leaves the domain yields the empty
+    /// path, exactly like the native early returns (`operator.cpp:397-398` and
+    /// `465-468`).
+    pub fn find_path(&self, start: [f64; 3], stop: [f64; 3]) -> GridPath {
+        let empty = || GridPath {
+            pos_path: [Vec::new(), Vec::new(), Vec::new()],
+            dir: Vec::new(),
+        };
+
+        // operator.cpp:396-398
+        let Some((ui_start, ui_stop)) = self.snap_line_to_mesh_native(start, stop, false, true)
+        else {
+            return empty();
+        };
+
+        let counts = self.base.num_lines;
+        let metric = self.metric();
+        // Native indexes `discLines[n][pos]` directly (operator.cpp:403-404);
+        // `MeshMetric::line` with `dual = false` is the same value.
+        let line = |axis: usize, pos: u32| metric.line(axis, pos as usize, false);
+
+        let mut curr_pos = ui_start;
+        let mesh_start = [
+            line(0, ui_start[0]),
+            line(1, ui_start[1]),
+            line(2, ui_start[2]),
+        ];
+        let mesh_stop = [
+            line(0, ui_stop[0]),
+            line(1, ui_stop[1]),
+            line(2, ui_stop[2]),
+        ];
+
+        let (start_foot, _) = self.point_line_distance(mesh_start, start, stop);
+        let (stop_foot, _) = self.point_line_distance(mesh_stop, start, stop);
+        let mut curr_foot = start_foot;
+        let mut min_foot = start_foot;
+        let mut up_dir = false;
+        let mut min_dir = 0usize;
+        let mut path = empty();
+
+        // operator.cpp:416-474
+        while min_foot < stop_foot {
+            let mut min_dist = 1e300f64;
+            for n in 0..3 {
+                // The probe point is rebuilt from `currPos` for every axis, so
+                // the lower/upper probes never leak into each other (native
+                // operator.cpp:421-423).
+                let mut p = [
+                    line(0, curr_pos[0]),
+                    line(1, curr_pos[1]),
+                    line(2, curr_pos[2]),
+                ];
+                if curr_pos[n] >= 1 {
+                    p[n] = line(n, curr_pos[n] - 1);
+                    let (foot, dist) = self.point_line_distance(p, start, stop);
+                    if foot > curr_foot && dist < min_dist {
+                        min_foot = foot;
+                        min_dist = dist;
+                        min_dir = n;
+                        up_dir = false;
+                    }
+                }
+                if (curr_pos[n] + 1) < counts[n] {
+                    p[n] = line(n, curr_pos[n] + 1);
+                    let (foot, dist) = self.point_line_distance(p, start, stop);
+                    if foot > curr_foot && dist < min_dist {
+                        min_foot = foot;
+                        min_dist = dist;
+                        min_dir = n;
+                        up_dir = true;
+                    }
+                }
+            }
+
+            let mut min_pos = curr_pos;
+            if up_dir {
+                curr_pos[min_dir] += 1;
+            } else {
+                // Native decrements an unsigned index here; when no neighbour
+                // qualified the sign flag is stale, so the wrap and the domain
+                // check below reproduce the native error return.
+                curr_pos[min_dir] = curr_pos[min_dir].wrapping_sub(1);
+                min_pos[min_dir] = min_pos[min_dir].wrapping_sub(1);
+            }
+            for n in 0..3 {
+                if curr_pos[n] >= counts[n] {
+                    // operator.cpp:462-468
+                    eprintln!(
+                        "FindPath: Error, path went out of simulation domain, skipping path!"
+                    );
+                    return empty();
+                }
+            }
+            path.pos_path[0].push(min_pos[0]);
+            path.pos_path[1].push(min_pos[1]);
+            path.pos_path[2].push(min_pos[2]);
+            curr_foot = min_foot;
+            path.dir.push(min_dir as u16);
+        }
+
+        // operator.cpp:476-494: close the missing edges between the last walk
+        // position and the snapped stop index.
+        for n in 0..3 {
+            if curr_pos[n] > ui_stop[n] {
+                curr_pos[n] -= 1;
+                path.pos_path[0].push(curr_pos[0]);
+                path.pos_path[1].push(curr_pos[1]);
+                path.pos_path[2].push(curr_pos[2]);
+                path.dir.push(n as u16);
+            } else if curr_pos[n] < ui_stop[n] {
+                path.pos_path[0].push(curr_pos[0]);
+                path.pos_path[1].push(curr_pos[1]);
+                path.pos_path[2].push(curr_pos[2]);
+                path.dir.push(n as u16);
+            }
+        }
+
+        path
+    }
+
     fn get_ec_c(&self, n: i32, i: usize, j: usize, k: usize) -> f64 {
         let dir = n.rem_euclid(3) as usize;
         let pos = [i, j, k];
@@ -1856,6 +2072,163 @@ impl Operator {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        // Special treatment for primitives of type curve (treated as wires):
+        // `FDTD/extensions/operator_ext_excitation.cpp:235-288`. A curve is a
+        // one-dimensional object, so the containment test above never selects
+        // an excitation edge; instead every segment between two consecutive
+        // curve points is walked with `FindPath` and each edge of the path is
+        // excited in its own axis direction.
+        let mut used_curves: Vec<(usize, usize)> = Vec::new();
+        {
+            let Some(structure) = self.structure.as_ref() else {
+                return extension;
+            };
+            let params = structure.parameters();
+            let shared = Arc::new(signal.clone());
+            let metric = MeshMetric::new(
+                &self.base.disc_lines,
+                counts,
+                self.base.grid_delta,
+                self.mesh_type,
+            );
+            // Native `m_Op->m_MeshType`: the coordinate system the curve points
+            // are resolved into before `FindPath` (operator_ext_excitation.cpp:251).
+            let mesh_system = if self.is_cylindrical() {
+                csxcad_core::grid::CoordinateSystem::Cylindrical
+            } else {
+                csxcad_core::grid::CoordinateSystem::Cartesian
+            };
+
+            for index in 0..structure.property_count() {
+                let Some(property) = structure.property_by_index(index) else {
+                    continue;
+                };
+                let Some(excitation) = property.excitation() else {
+                    continue;
+                };
+                let coordinate_system = property.coordinate_input_type();
+                for (primitive_index, primitive) in property.primitives().iter().enumerate() {
+                    // Native `prim->ToCurve()` also matches wires, which derive
+                    // from `CSPrimCurve`.
+                    let Some(curve) = primitive.curve_shape().or_else(|| primitive.wire_shape())
+                    else {
+                        continue;
+                    };
+                    // Native `CSPrimCurve::GetPoint(i, p, m_MeshType)`: the
+                    // stored points live in the primitive coordinate system
+                    // (`m_PrimCoordSystem`, falling back to the mesh type) and
+                    // are reported in the operator mesh type, with the forward
+                    // primitive transform applied (`CSPrimitives::TransformCoords`).
+                    let point_system = if primitive.coordinate_system()
+                        == csxcad_core::grid::CoordinateSystem::Undefined
+                    {
+                        primitive.mesh_type()
+                    } else {
+                        primitive.coordinate_system()
+                    };
+                    let mut points = Vec::with_capacity(curve.point_count());
+                    for point_index in 0..curve.point_count() {
+                        let Ok(Some(mut point)) = curve.point(point_index, Some(params)) else {
+                            continue;
+                        };
+                        point = transform_coordinates(point, point_system, mesh_system);
+                        if let Some(transform) = primitive.transform() {
+                            point = transform_coordinates(
+                                point,
+                                mesh_system,
+                                csxcad_core::grid::CoordinateSystem::Cartesian,
+                            );
+                            point = transform.transform(point);
+                            point = transform_coordinates(
+                                point,
+                                csxcad_core::grid::CoordinateSystem::Cartesian,
+                                mesh_system,
+                            );
+                        }
+                        points.push(point);
+                    }
+
+                    let mut curve_used = false;
+                    for segment in 1..points.len() {
+                        let path = self.find_path(points[segment - 1], points[segment]);
+                        if !path.dir.is_empty() {
+                            curve_used = true;
+                        }
+                        for step in 0..path.dir.len() {
+                            let n = path.dir[step] as usize;
+                            let pos = [
+                                path.pos_path[0][step] as usize,
+                                path.pos_path[1][step] as usize,
+                                path.pos_path[2][step] as usize,
+                            ];
+                            // Native `GetYeeCoords(n, pos, volt_coord, false)`.
+                            let vertex =
+                                yee_coordinates(&self.base.disc_lines, counts, n, pos, false);
+                            // Note: native applies no `GetEnabled()` check and
+                            // no current-excitation handling in this curve
+                            // branch, so a disabled curve excitation still
+                            // excites and `Type="2"/"3"` curves stay silent.
+                            if excitation.active_direction(n) != Some(true)
+                                || pos[n] >= counts[n] as usize - 1
+                            {
+                                continue;
+                            }
+                            let excitation_type = excitation.excitation_type();
+                            if !matches!(excitation_type, 0 | 1) {
+                                continue;
+                            }
+                            // Native `GetWeightedExcitation(n, volt_coord)`:
+                            // weight and amplitude, then the non-dual edge
+                            // length (operator_ext_excitation.cpp:267).
+                            let weight = excitation
+                                .weighted_excitation_weight(
+                                    n,
+                                    Some(params),
+                                    vertex,
+                                    coordinate_system,
+                                )
+                                .unwrap_or(1.0);
+                            let base_amp = excitation
+                                .excitation(n, Some(params))
+                                .ok()
+                                .flatten()
+                                .unwrap_or(0.0)
+                                * weight;
+                            let amp = (base_amp * metric.edge_length(n, pos, false)) as FDTD_FLOAT;
+                            if amp != 0.0 {
+                                let delay = (excitation.delay(Some(params)).unwrap_or(0.0) / dt)
+                                    .max(0.0) as u32;
+                                extension.add_voltage_excitation(
+                                    n,
+                                    pos,
+                                    delay,
+                                    amp,
+                                    shared.clone(),
+                                );
+                            }
+                            if excitation_type == 1 {
+                                hard_voltage.push([n, pos[0], pos[1], pos[2]]);
+                            }
+                        }
+                    }
+                    if curve_used {
+                        // Native `prim->SetPrimitiveUsed(true)`.
+                        used_curves.push((index, primitive_index));
+                    }
+                }
+            }
+        }
+        if let Some(structure) = self.structure.as_mut() {
+            for (property_index, primitive_index) in used_curves {
+                if let Some(primitive) = structure
+                    .property_by_index_mut(property_index)
+                    .and_then(|property| property.primitive_mut(primitive_index))
+                {
+                    primitive.set_used(true);
                 }
             }
         }
@@ -5697,5 +6070,275 @@ mod coordinate_system_tests {
             dt_shifted > dt,
             "Rennings_2 {dt_shifted} vs Rennings_1 {dt}"
         );
+    }
+
+    // ----- native `Operator::FindPath` (curve / wire paths) -----
+
+    /// Build a uniform Cartesian mesh with `lines` unit-spaced lines per axis.
+    fn find_path_mesh(delta_unit: f64, lines: usize) -> Operator {
+        let values: Vec<String> = (0..lines).map(|index| index.to_string()).collect();
+        let joined = values.join(",");
+        let xml = format!(
+            r#"<ContinuousStructure CoordSystem="0">
+                <RectilinearGrid DeltaUnit="{delta_unit}">
+                    <XLines>{joined}</XLines>
+                    <YLines>{joined}</YLines>
+                    <ZLines>{joined}</ZLines>
+                </RectilinearGrid>
+                <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                <Properties/>
+            </ContinuousStructure>"#
+        );
+        let mut op = Operator::new();
+        op.load_csx(&xml).expect("uniform CSX should load");
+        op
+    }
+
+    fn path_edges(path: &GridPath) -> Vec<(usize, [u32; 3])> {
+        (0..path.dir.len())
+            .map(|step| {
+                (
+                    path.dir[step] as usize,
+                    [
+                        path.pos_path[0][step],
+                        path.pos_path[1][step],
+                        path.pos_path[2][step],
+                    ],
+                )
+            })
+            .collect()
+    }
+
+    /// A straight diagonal from node (2,2,2) to node (4,4,4) on a unit mesh.
+    ///
+    /// The expected staircase is derived by hand from `FDTD/operator.cpp:391-497`:
+    /// the line direction is (2,2,2), so at every node the three forward
+    /// neighbours have the identical foot parameter and the identical distance
+    /// to the line. `dist < minDist` (operator.cpp:428/440) is a strict
+    /// comparison and the axes are probed in the order x-lower, x-upper,
+    /// y-lower, y-upper, z-lower, z-upper, so the tie is always resolved
+    /// towards the lowest axis index, except where a step lands exactly on the
+    /// line (distance 0 beats the 0.8165 of the other two):
+    ///
+    /// | node after the step | edge taken | foot |
+    /// | --- | --- | --- |
+    /// | (3,2,2) | x at (2,2,2) | 1/6 |
+    /// | (3,3,2) | y at (3,2,2) | 1/3 |
+    /// | (3,3,3) | z at (3,3,2) | 1/2 |
+    /// | (4,3,3) | x at (3,3,3) | 2/3 |
+    /// | (4,4,3) | y at (4,3,3) | 5/6 |
+    /// | (4,4,4) | z at (4,4,3) | 1 |
+    ///
+    /// The walk ends exactly on the snapped stop node, so the closure loop adds
+    /// nothing.
+    #[test]
+    fn find_path_diagonal_ties_resolve_towards_the_lowest_axis() {
+        let op = find_path_mesh(1e-3, 11);
+        let path = op.find_path([2.0, 2.0, 2.0], [4.0, 4.0, 4.0]);
+        assert_eq!(
+            path_edges(&path),
+            vec![
+                (0, [2, 2, 2]),
+                (1, [3, 2, 2]),
+                (2, [3, 3, 2]),
+                (0, [3, 3, 3]),
+                (1, [4, 3, 3]),
+                (2, [4, 4, 3]),
+            ]
+        );
+    }
+
+    /// An axis-aligned segment on the same mesh: one edge per mesh interval, all
+    /// of them in the line direction and never a detour.
+    #[test]
+    fn find_path_follows_an_axis_aligned_segment() {
+        let op = find_path_mesh(1e-3, 11);
+        let path = op.find_path([2.0, 5.0, 5.0], [5.0, 5.0, 5.0]);
+        assert_eq!(
+            path_edges(&path),
+            vec![(0, [2, 5, 5]), (0, [3, 5, 5]), (0, [4, 5, 5])]
+        );
+    }
+
+    /// A line that lies completely outside the mesh on one axis is rejected by
+    /// `SnapLine2Mesh` (`operator.cpp:370-373`): the native `-1` return becomes
+    /// the empty path that `FindPath` returns at `operator.cpp:397-398`.
+    #[test]
+    fn find_path_outside_the_domain_is_empty() {
+        let op = find_path_mesh(1e-3, 5);
+        for (start, stop) in [
+            ([-2.0, 1.0, 1.0], [-0.5, 3.0, 1.0]),
+            ([1.0, 9.0, 1.0], [3.0, 12.0, 1.0]),
+        ] {
+            let path = op.find_path(start, stop);
+            assert!(path.dir.is_empty(), "{start:?} -> {stop:?} must not snap");
+            assert!(path.pos_path.iter().all(Vec::is_empty));
+        }
+    }
+
+    /// A curve segment on a cylindrical `(rho, alpha, z)` mesh.
+    ///
+    /// The mesh has unit rho steps, alpha lines at 0, 30, 60 and 90 degrees, and
+    /// the segment runs at constant rho = 4 from 0 to 90 degrees. The native
+    /// metric is the *Cartesian* distance to the chord from (4,0) to (0,4)
+    /// (`Point_Line_Distance` transforms to Cartesian, CSPrimitives.cpp:36-52),
+    /// so the hand-derived walk (foot in parentheses) is
+    ///
+    /// | node after the step | edge taken | foot |
+    /// | --- | --- | --- |
+    /// | (3,0,3) | rho 3->4 at alpha 0 | 0.125 |
+    /// | (3,1,3) | alpha 0->30 at rho 3 | 0.3627 |
+    /// | (3,2,3) | alpha 30->60 at rho 3 | 0.6373 |
+    /// | (3,3,3) | alpha 60->90 at rho 3 | 0.875 |
+    /// | (4,3,3) | rho 3->4 at alpha 90 | 1 |
+    ///
+    /// The first step goes *inwards*: (3,0) is 0.7071 away from the chord while
+    /// (4,30 deg) is 1.0353 away. A naive `(rho, alpha, z)` metric would instead
+    /// walk three alpha edges at rho = 4, so this case pins the Cartesian
+    /// transform inside the distance metric.
+    #[test]
+    fn find_path_on_a_cylindrical_mesh_uses_the_cartesian_metric() {
+        let mut op = Operator::new();
+        op.load_csx(&cylindrical_mesh(
+            "0,1,2,3,4,5,6",
+            "0,0.5235987755982988,1.0471975511965976,1.5707963267948966",
+        ))
+        .expect("cylindrical mesh");
+        let path = op.find_path([4.0, 0.0, 3.0], [4.0, std::f64::consts::FRAC_PI_2, 3.0]);
+        assert_eq!(
+            path_edges(&path),
+            vec![
+                (0, [3, 0, 3]),
+                (1, [3, 0, 3]),
+                (1, [3, 1, 3]),
+                (1, [3, 2, 3]),
+                (0, [3, 3, 3]),
+            ]
+        );
+
+        // The cylindrical metric itself: the midpoint (4, 45 deg) is
+        // (2*sqrt(2), 2*sqrt(2)) in Cartesian, so its distance to the chord
+        // (4,0)-(0,4) is 4 - 2*sqrt(2) = 1.1716; the naive (rho, alpha) metric
+        // would give pi/4 = 0.7854 instead.
+        let (foot, dist) = op.point_line_distance(
+            [4.0, std::f64::consts::FRAC_PI_4, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.0, std::f64::consts::FRAC_PI_2, 0.0],
+        );
+        assert!((foot - 0.5).abs() < 1e-12, "foot {foot}");
+        let cartesian_dist = 4.0 - 2.0 * 2.0f64.sqrt();
+        assert!(
+            (dist - cartesian_dist).abs() < 1e-12,
+            "dist {dist} is not the Cartesian chord distance {cartesian_dist}"
+        );
+        assert!(
+            (dist - std::f64::consts::FRAC_PI_4).abs() > 0.3,
+            "dist {dist} must not be the naive (rho, alpha) distance"
+        );
+    }
+
+    /// An `<Excitation>` property whose primitive is a `<Curve>` excites the
+    /// edges of the snapped path.
+    ///
+    /// Mirrors `FDTD/extensions/operator_ext_excitation.cpp:235-288`: the curve
+    /// (2,2,2) -> (4,2,2) walks two x edges, each with the native amplitude
+    /// `weight * excitation * GetEdgeLength` = `1 * 1 * 1 mm`. The signal starts
+    /// at zero (`build_gauss` fills from index 1), so after two time steps the
+    /// only non-zero electric field is the source on those two edges.
+    #[test]
+    fn curve_excitation_maps_onto_the_wire_path() {
+        let values: Vec<String> = (0..7).map(|index| index.to_string()).collect();
+        let joined = values.join(",");
+        let xml = format!(
+            r#"<ContinuousStructure CoordSystem="0">
+                <RectilinearGrid DeltaUnit="0.001">
+                    <XLines>{joined}</XLines>
+                    <YLines>{joined}</YLines>
+                    <ZLines>{joined}</ZLines>
+                </RectilinearGrid>
+                <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                <Properties>
+                    <Excitation Name="wire" Type="0" Excite="1,1,1">
+                        <Primitives>
+                            <Curve Priority="0">
+                                <Vertex X="2" Y="2" Z="2"/>
+                                <Vertex X="4" Y="2" Z="2"/>
+                            </Curve>
+                        </Primitives>
+                    </Excitation>
+                </Properties>
+            </ContinuousStructure>"#
+        );
+        let mut op = Operator::new();
+        op.load_csx(&xml).expect("curve excitation CSX should load");
+        op.base.m_bc = [crate::BC_PEC; 6];
+        let dt = op.calc_timestep();
+        op.calc_ec_operator();
+        op.apply_electric_bc();
+        op.apply_magnetic_bc();
+
+        let mut signal = crate::excitation::Excitation::gauss(1.0e9, 1.0e9);
+        signal
+            .build(dt, 100)
+            .expect("the gaussian signal must build");
+        let extension = op.build_excitation_extension(&signal);
+        assert_eq!(
+            extension.voltage_excitations.len(),
+            2,
+            "the two mesh edges of the wire must be excited"
+        );
+        let mut edges: Vec<(usize, [usize; 3], f32)> = extension
+            .voltage_excitations
+            .iter()
+            .map(|excitation| (excitation.component, excitation.pos, excitation.amp))
+            .collect();
+        edges.sort_by_key(|edge| edge.1);
+        assert_eq!(edges[0].0, 0);
+        assert_eq!(edges[0].1, [2, 2, 2]);
+        assert_eq!(edges[1].0, 0);
+        assert_eq!(edges[1].1, [3, 2, 2]);
+        for edge in &edges {
+            assert!(
+                (edge.2 - 1.0e-3f32).abs() < 1.0e-9,
+                "edge {:?} amplitude {} is not the 1 mm edge length",
+                edge.1,
+                edge.2
+            );
+        }
+
+        // The curve primitive is marked as used (native `SetPrimitiveUsed`).
+        let used = op
+            .structure
+            .as_ref()
+            .and_then(|structure| structure.property_by_index(0))
+            .and_then(|property| property.primitive(0))
+            .map(|primitive| primitive.is_used());
+        assert_eq!(used, Some(true));
+
+        let amp = edges[0].2;
+        let expected = amp * signal.voltage(1);
+        assert!(expected != 0.0, "the second signal sample must be non-zero");
+        let mut engine = crate::engine::Engine::new(Box::new(op));
+        engine.add_extension(Box::new(extension));
+        engine.iterate_ts(2);
+        for position in [[2, 2, 2], [3, 2, 2]] {
+            assert_eq!(
+                *engine
+                    .volt_ptr
+                    .get(0, position[0], position[1], position[2]),
+                expected,
+                "edge {position:?} must carry the wire source"
+            );
+        }
+        // Everything off the wire is still untouched after two steps.
+        for position in [[4, 2, 2], [2, 3, 2], [2, 2, 3], [0, 0, 0], [6, 6, 6]] {
+            assert_eq!(
+                *engine
+                    .volt_ptr
+                    .get(0, position[0], position[1], position[2]),
+                0.0,
+                "edge {position:?} must not carry the wire source"
+            );
+        }
     }
 }
