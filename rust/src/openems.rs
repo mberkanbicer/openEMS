@@ -19,6 +19,30 @@ use crate::processing_integral::{
 };
 use std::sync::Arc;
 
+/// Native end-criteria cadence (`openems.cpp:1461-1467`, `:1511-1526`).
+///
+/// `exact` (`--exact-endcriteria`) evaluates every excitation Nyquist period;
+/// the default evaluates every four seconds of wall clock, measured from the
+/// previous checkpoint (the first checkpoint is four seconds into the run).
+const WALL_CLOCK_CHECK_INTERVAL: f64 = 4.0;
+
+fn end_criteria_due(
+    exact: bool,
+    ts: u32,
+    nyquist: u32,
+    now_seconds: f64,
+    last_checkpoint: &mut f64,
+) -> bool {
+    if exact {
+        nyquist > 0 && ts.is_multiple_of(nyquist)
+    } else if now_seconds - *last_checkpoint > WALL_CLOCK_CHECK_INTERVAL {
+        *last_checkpoint = now_seconds;
+        true
+    } else {
+        false
+    }
+}
+
 /// Boundary condition types (mirroring C++).
 pub const BC_PEC: i32 = 0;
 pub const BC_PMC: i32 = 1;
@@ -143,9 +167,10 @@ impl OpenEMS {
 
     /// Set the end criteria.
     pub fn set_end_criteria(&mut self, val: f64) {
-        // Native keeps the default for a non-positive criteria
-        // (`openems.cpp` maps `endCriteria == 0` to 1e-6).
-        if val > 0.0 {
+        // Native maps only `endCriteria == 0` to the 1e-6 default; a negative
+        // value is kept and disables the criterion (`change > endCrit` always
+        // holds).
+        if val != 0.0 {
             self.end_crit = val;
         }
     }
@@ -1728,19 +1753,43 @@ fn build_sar_cell_data(
             pa.process_fields(0, &interface);
         }
 
+        // Native end-criteria cadence (`openems.cpp:1456-1467`, `:1511-1526`):
+        // the default evaluates the rough energy every four seconds of wall
+        // clock; `--exact-endcriteria` evaluates every excitation Nyquist
+        // period. `maxE` is seeded at the maximum-excitation timestep even in
+        // the default mode, where that sample does not update `change`.
+        let exact = self.exact_end_criteria;
+        let nyquist = self
+            .excitation
+            .as_ref()
+            .map(|signal| signal.nyquist_num())
+            .unwrap_or(0);
+        let max_excite_ts = self
+            .excitation
+            .as_ref()
+            .map(|signal| signal.max_timestep() as u32);
+        if exact {
+            println!(
+                "Exact-endcriteria: evaluating the end criteria every {} timestep(s) (this excitation's Nyquist rate)",
+                nyquist.max(1)
+            );
+        }
+
         let mut ts = 0u32;
         let mut change: f64 = 1.0;
         let mut max_energy: f64 = 0.0;
-        let f_max = self
-            .excitation
-            .as_ref()
-            .map(|signal| signal.f_max)
-            .unwrap_or(0.0);
-        let end_interval = if self.exact_end_criteria && f_max > 0.0 && dt > 0.0 {
-            ((1.0 / f_max / 2.0 / dt).floor() as u32).max(1)
-        } else {
-            100
-        };
+        let started = std::time::Instant::now();
+        // `prevTime = startTime` in native: the first checkpoint is ~4 s in.
+        let mut last_checkpoint = 0.0f64;
+        let mut max_excite_sampled = false;
+        if max_excite_ts == Some(0) {
+            max_energy = self
+                .fdtd_eng
+                .as_ref()
+                .map(|engine| engine.fast_energy())
+                .unwrap_or(0.0);
+            max_excite_sampled = true;
+        }
 
         while ts < ts_limit && change > end_crit && !self.check_abort_cond() {
             // Execute one timestep (voltage + current updates with extensions).
@@ -1758,21 +1807,38 @@ fn build_sar_cell_data(
                 pa.process_fields(ts, &interface);
             }
 
-            // Check steady-state end criteria.
             // Steady-state end criterion: the extension metric when a periodic
             // signal provides one, otherwise the native energy fallback
-            // (`currE / maxE`) evaluated on the progress cadence.
+            // (`currE / maxE`).
             match self.fdtd_eng.as_ref().unwrap().get_steady_state_diff() {
                 Some(diff) => change = diff as f64,
                 None => {
-                    if end_interval > 0 && ts.is_multiple_of(end_interval) {
+                    let seed = !max_excite_sampled && max_excite_ts == Some(ts);
+                    let due = end_criteria_due(
+                        exact,
+                        ts,
+                        nyquist,
+                        if exact {
+                            0.0
+                        } else {
+                            started.elapsed().as_secs_f64()
+                        },
+                        &mut last_checkpoint,
+                    );
+                    if seed || due {
                         let energy = self.fdtd_eng.as_ref().unwrap().fast_energy();
                         if energy > max_energy {
                             max_energy = energy;
                         }
-                        if max_energy > 0.0 {
+                        // default mode: only the wall-clock checkpoint updates
+                        // `change`; exact mode also updates it at the seed
+                        let update_change = if exact { true } else { due };
+                        if update_change && max_energy > 0.0 {
                             change = energy / max_energy;
                         }
+                    }
+                    if seed {
+                        max_excite_sampled = true;
                     }
                 }
             }
@@ -2386,6 +2452,56 @@ mod steady_state_wiring_tests {
             steps < 4_000,
             "steady-state criterion did not stop the run ({steps} steps)"
         );
+    }
+
+    #[test]
+    fn a_fast_default_run_reaches_the_timestep_limit() {
+        // Native evaluates the energy criterion only after four seconds of
+        // wall clock, so a small fast run must reach NrTS. The old hard-coded
+        // 100-step cadence stopped such runs early (RM-146).
+        let mut sim = OpenEMS::new();
+        sim.set_csx_xml(mesh_xml());
+        sim.set_gauss_excite(6.0e9, 6.0e9);
+        for face in 0..6 {
+            sim.set_bc_type(face, BC_PML);
+            sim.set_pml_size(face, 4);
+        }
+        sim.set_number_of_time_steps(30);
+        sim.set_end_criteria(1.0e-12);
+        assert!(sim.setup_fdtd());
+        assert!(sim.run_fdtd());
+        assert_eq!(
+            sim.fdtd_eng.as_ref().unwrap().get_number_of_timesteps(),
+            30,
+            "a sub-four-second run must not be stopped by the default cadence"
+        );
+    }
+
+    #[test]
+    fn the_end_criteria_cadence_matches_native() {
+        // exact mode: every excitation Nyquist period
+        let mut last = 0.0;
+        assert!(end_criteria_due(true, 21, 21, 0.0, &mut last));
+        assert!(end_criteria_due(true, 42, 21, 0.0, &mut last));
+        assert!(!end_criteria_due(true, 43, 21, 0.0, &mut last));
+        // Dirac/Step excitations have a Nyquist of one, i.e. every step
+        assert!(end_criteria_due(true, 7, 1, 0.0, &mut last));
+        // default mode: the first check is four seconds into the run, then
+        // every four seconds of wall clock
+        let mut last = 0.0;
+        assert!(!end_criteria_due(false, 100, 21, 3.9, &mut last));
+        assert!(end_criteria_due(false, 100, 21, 4.1, &mut last));
+        assert!(!end_criteria_due(false, 200, 21, 7.0, &mut last));
+        assert!(end_criteria_due(false, 300, 21, 8.5, &mut last));
+        // the constant, not the loop, owns the interval
+        assert_eq!(WALL_CLOCK_CHECK_INTERVAL, 4.0);
+    }
+
+    #[test]
+    fn a_negative_end_criteria_disables_the_criterion() {
+        let mut sim = OpenEMS::new();
+        sim.set_end_criteria(-1.0);
+        assert_eq!(sim.end_crit, -1.0, "native keeps negative criteria");
     }
 
     #[test]

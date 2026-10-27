@@ -2,9 +2,35 @@
 //! Mirrors `FDTD/engine.h/cpp` in the C++ codebase.
 
 use crate::array_nijk::FieldArray;
-use crate::constants::FDTD_FLOAT;
+use crate::constants::{EPS0, FDTD_FLOAT, MU0};
 use crate::extensions::EngineExtension;
 use crate::operator_base::OperatorBase;
+
+/// Native `Engine_Interface_FDTD::CalcFastEnergy`: the rough field energy
+/// `eps0*sum(E^2) + mue0*sum(H^2)` over the interior cells, accumulated in
+/// the native order (per cell: E0,E1,E2 then H0,H1,H2).
+///
+/// `counts` are the *non-full* line counts (`GetNumberOfLines(n, false)`):
+/// like native, a closed cylindrical azimuth contributes `num_lines - 2`.
+pub fn calc_fast_energy(volt: &FieldArray, curr: &FieldArray, counts: [usize; 3]) -> f64 {
+    let mut e_energy = 0.0f64;
+    let mut h_energy = 0.0f64;
+    for i in 0..counts[0].saturating_sub(1) {
+        for j in 0..counts[1].saturating_sub(1) {
+            for k in 0..counts[2].saturating_sub(1) {
+                for component in 0..3 {
+                    let value = *volt.get(component, i, j, k) as f64;
+                    e_energy += value * value;
+                }
+                for component in 0..3 {
+                    let value = *curr.get(component, i, j, k) as f64;
+                    h_energy += value * value;
+                }
+            }
+        }
+    }
+    EPS0 * e_energy + MU0 * h_energy
+}
 
 /// A raw field pointer that may be handed to a worker thread.
 ///
@@ -36,6 +62,8 @@ pub struct Engine {
     pub volt_ptr: FieldArray,
     pub curr_ptr: FieldArray,
     pub num_lines: [usize; 3],
+    /// Line counts used by the native energy estimate (non-full counts).
+    pub energy_counts: [usize; 3],
     pub num_ts: u32,
     pub extensions: Vec<Box<dyn EngineExtension>>,
     /// Number of worker threads used by the update kernels (1 = serial).
@@ -50,11 +78,17 @@ impl Engine {
             op.get_number_of_lines(1, true) as usize,
             op.get_number_of_lines(2, true) as usize,
         ];
+        let energy_counts = [
+            op.get_number_of_lines(0, false) as usize,
+            op.get_number_of_lines(1, false) as usize,
+            op.get_number_of_lines(2, false) as usize,
+        ];
         Self {
             op,
             volt_ptr: FieldArray::new("volt", [num_lines[0], num_lines[1], num_lines[2]]),
             curr_ptr: FieldArray::new("curr", [num_lines[0], num_lines[1], num_lines[2]]),
             num_lines,
+            energy_counts,
             num_ts: 0,
             extensions: Vec::new(),
             num_threads: 1,
@@ -99,22 +133,9 @@ impl Engine {
         None
     }
 
-    /// Sum of the squared voltage and current components over the interior
-    /// cells, mirroring `Engine_Interface_FDTD::CalcFastEnergy`.
+    /// Rough field energy, mirroring `Engine_Interface_FDTD::CalcFastEnergy`.
     pub fn fast_energy(&self) -> f64 {
-        let mut energy = 0.0;
-        for n in 0..3 {
-            for i in 0..self.num_lines[0].saturating_sub(1) {
-                for j in 0..self.num_lines[1].saturating_sub(1) {
-                    for k in 0..self.num_lines[2].saturating_sub(1) {
-                        let v = *self.volt_ptr.get(n, i, j, k) as f64;
-                        let c = *self.curr_ptr.get(n, i, j, k) as f64;
-                        energy += v * v + c * c;
-                    }
-                }
-            }
-        }
-        energy
+        calc_fast_energy(&self.volt_ptr, &self.curr_ptr, self.energy_counts)
     }
 
     /// Execute pre-voltage extension updates (highest priority last).
@@ -464,5 +485,31 @@ mod tests {
         let op = Box::new(crate::operator::Operator::new());
         let eng = Engine::new(op);
         assert_eq!(eng.get_number_of_timesteps(), 0);
+    }
+
+    #[test]
+    fn fast_energy_matches_the_native_formula() {
+        let counts = [4usize, 3, 5];
+        let mut volt = FieldArray::new("volt", counts);
+        let mut curr = FieldArray::new("curr", counts);
+        for i in 0..counts[0] {
+            for j in 0..counts[1] {
+                for k in 0..counts[2] {
+                    for component in 0..3 {
+                        *volt.get_mut(component, i, j, k) = (2 + component) as FDTD_FLOAT;
+                        *curr.get_mut(component, i, j, k) = (5 + component) as FDTD_FLOAT;
+                    }
+                }
+            }
+        }
+        let cells = (counts[0] - 1) * (counts[1] - 1) * (counts[2] - 1);
+        let e_sum = (4 + 9 + 16) as f64 * cells as f64;
+        let h_sum = (25 + 36 + 49) as f64 * cells as f64;
+        let expected = EPS0 * e_sum + MU0 * h_sum;
+        let energy = calc_fast_energy(&volt, &curr, counts);
+        assert!(
+            (energy - expected).abs() / expected < 1e-12,
+            "energy {energy} vs native {expected}"
+        );
     }
 }

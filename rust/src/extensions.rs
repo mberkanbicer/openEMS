@@ -2233,25 +2233,12 @@ impl EngineExtSteadyState {
         true
     }
 
-    /// Sum of the squared voltage and current components over the interior
-    /// cells, mirroring `Engine_Interface_FDTD::CalcFastEnergy`.
+    /// Rough field energy, mirroring `Engine_Interface_FDTD::CalcFastEnergy`.
     fn fast_energy(&self, volt: &FieldArray, curr: &FieldArray) -> f64 {
         if self.num_lines.iter().any(|&lines| lines == 0) {
             return 0.0;
         }
-        let mut energy = 0.0;
-        for n in 0..3 {
-            for i in 0..self.num_lines[0].saturating_sub(1) {
-                for j in 0..self.num_lines[1].saturating_sub(1) {
-                    for k in 0..self.num_lines[2].saturating_sub(1) {
-                        let v = *volt.get(n, i, j, k) as f64;
-                        let c = *curr.get(n, i, j, k) as f64;
-                        energy += v * v + c * c;
-                    }
-                }
-            }
-        }
-        energy
+        crate::engine::calc_fast_energy(volt, curr, self.num_lines)
     }
 
     /// Get the last computed max difference (steady-state convergence metric).

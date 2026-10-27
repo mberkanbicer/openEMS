@@ -132,7 +132,8 @@ pub fn parse_fdtd_options(xml: &str) -> FdtdOptions {
             }
             "endcriteria" => {
                 if let Ok(parsed) = value.trim().parse::<f64>() {
-                    if parsed > 0.0 {
+                    // native maps 0 to the default and lets negatives through
+                    if parsed != 0.0 {
                         options.end_criteria = Some(parsed);
                     }
                 }

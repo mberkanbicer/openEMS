@@ -3519,12 +3519,18 @@ impl Operator {
             counts[1] as usize,
             counts[2] as usize,
         ];
+        let energy_lines = [
+            self.get_number_of_lines(0, false) as usize,
+            self.get_number_of_lines(1, false) as usize,
+            self.get_number_of_lines(2, false) as usize,
+        ];
         let center = [
             num_lines[0] / 2,
             num_lines[1] / 2,
             num_lines[2] / 2,
         ];
-        let mut extension = EngineExtSteadyState::with_num_lines(period_ts as usize, num_lines);
+        let mut extension =
+            EngineExtSteadyState::with_num_lines(period_ts as usize, energy_lines);
         for component in 0..3 {
             extension.add_e_probe(center, component);
         }
@@ -4027,8 +4033,22 @@ impl OperatorBase for Operator {
         self.base.get_number_of_nyquist_timesteps()
     }
 
-    fn get_number_of_lines(&self, ny: i32, _full: bool) -> u32 {
-        self.base.num_lines[ny as usize]
+    fn get_number_of_lines(&self, ny: i32, full: bool) -> u32 {
+        let axis = ny as usize;
+        // native `Operator_Cylinder::GetNumberOfLines`: a closed azimuth hides
+        // the duplicated seam lines from post-processing and the energy estimate
+        if !full
+            && axis == 1
+            && matches!(
+                self.mesh_type,
+                MeshType::Cylindrical {
+                    closed_alpha: true
+                }
+            )
+        {
+            return self.base.num_lines[1].saturating_sub(2);
+        }
+        self.base.num_lines[axis]
     }
 
     fn get_grid_delta(&self) -> f64 {
@@ -5703,6 +5723,26 @@ mod coordinate_system_tests {
             (dt - 8.12933e-12).abs() / 8.12933e-12 < 0.01,
             "dt {dt} differs from the native 8.12933e-12"
         );
+    }
+
+    #[test]
+    fn closed_cylindrical_post_processing_hides_the_seam_lines() {
+        let mut op = Operator::new();
+        op.load_csx(&cylindrical_mesh(
+            "0,1,2,3,4",
+            "0,1.5707963267948966,3.141592653589793,4.71238898038469,6.283185307179586",
+        ))
+        .expect("closed cylindrical mesh");
+        let full = op.get_number_of_lines(1, true);
+        let post = op.get_number_of_lines(1, false);
+        assert_eq!(post, full - 2, "the seam plane is duplicated");
+        // the other axes are unaffected
+        for axis in [0, 2] {
+            assert_eq!(
+                op.get_number_of_lines(axis, false),
+                op.get_number_of_lines(axis, true)
+            );
+        }
     }
 
     #[test]

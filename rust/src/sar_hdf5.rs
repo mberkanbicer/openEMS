@@ -101,6 +101,7 @@ impl SarRunner {
                 calculation.max_background_ratio = 0.1;
                 calculation.unused_relative_volume_limit = 1.05;
                 calculation.ignore_face_valid = false;
+                calculation.mark_partial_as_used = false;
             }
             AveragingMethod::IeeeC95_3 => {
                 calculation.mass_tolerance = 0.05;
@@ -108,6 +109,7 @@ impl SarRunner {
                 calculation.max_background_ratio = 1.0;
                 calculation.unused_relative_volume_limit = 1.0;
                 calculation.ignore_face_valid = false;
+                calculation.mark_partial_as_used = true;
             }
             AveragingMethod::Simple => {
                 calculation.mass_tolerance = 0.05;
@@ -115,6 +117,7 @@ impl SarRunner {
                 calculation.max_background_ratio = 1.0;
                 calculation.unused_relative_volume_limit = 1.0;
                 calculation.ignore_face_valid = true;
+                calculation.mark_partial_as_used = true;
             }
         }
     }
@@ -422,7 +425,7 @@ impl SarRunner {
         file.write_i32_attribute(
             "/FieldData/FD",
             "used_cubes",
-            (calculation.valid_cells + calculation.unused_cells) as i32,
+            calculation.used_cells as i32,
         )?;
         file.write_i32_attribute(
             "/FieldData/FD",

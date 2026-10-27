@@ -59,10 +59,16 @@ pub struct SarCalculation {
     pub unused_relative_volume_limit: f64,
     /// Accept cubes whose faces do not all touch material.
     pub ignore_face_valid: bool,
+    /// Mark cells covered only partially by a cube as used (native
+    /// `m_markPartialAsUsed`; IEEE 62704 requires `false`).
+    pub mark_partial_as_used: bool,
     /// Iteration limit of the mass search.
     pub max_iterations: usize,
     /// Number of valid centres in the last averaged run.
     pub valid_cells: usize,
+    /// Cells marked used by a neighbouring cube without a valid cube of their
+    /// own (native `used_cubes = count(used) - valid`).
+    pub used_cells: usize,
     /// Number of cells assigned by the step-2 fallback.
     pub unused_cells: usize,
     /// Background (air) cells with zero density.
@@ -96,12 +102,15 @@ impl SarCalculation {
             max_sar: Vec::new(),
             max_index: Vec::new(),
             averaging_mass: 0.0,
+            // native `SarCalculation` starts in the SIMPLE preset
             mass_tolerance: 0.05,
-            max_background_ratio: 0.5,
-            unused_relative_volume_limit: 1.01,
-            ignore_face_valid: false,
+            max_background_ratio: 1.0,
+            unused_relative_volume_limit: 1.0,
+            ignore_face_valid: true,
+            mark_partial_as_used: true,
             max_iterations: 100,
             valid_cells: 0,
+            used_cells: 0,
             unused_cells: 0,
             air_cells: 0,
             cube_type: Vec::new(),
@@ -170,10 +179,15 @@ impl SarCalculation {
                         let value = e_field.get(component, i, j, k);
                         magnitude += value.re * value.re + value.im * value.im;
                     }
-                    let local = 0.5 * sigma * magnitude;
+                    let cell_density = self.cell_density[index];
+                    let local = if cell_density > 0.0 {
+                        0.5 * sigma * magnitude
+                    } else {
+                        // native: `l_pow *= 0.5*(cell_dens[loc]>0)`
+                        0.0
+                    };
                     density[index] = local;
                     power += local * self.cell_volume[index];
-                    let cell_density = self.cell_density[index];
                     if cell_density > 0.0 {
                         max_local = max_local.max(local / cell_density);
                     }
@@ -206,10 +220,14 @@ impl SarCalculation {
                         let j_value = j_field.get(component, i, j, k).magnitude();
                         magnitude += e * j_value;
                     }
-                    let local = 0.5 * magnitude;
+                    let cell_density = self.cell_density[index];
+                    let local = if cell_density > 0.0 {
+                        0.5 * magnitude
+                    } else {
+                        0.0
+                    };
                     density[index] = local;
                     power += local * self.cell_volume[index];
-                    let cell_density = self.cell_density[index];
                     if cell_density > 0.0 {
                         max_local = max_local.max(local / cell_density);
                     }
@@ -225,6 +243,7 @@ impl SarCalculation {
     /// Compute the local or averaged SAR for every frequency.
     pub fn calc_sar(&mut self) {
         self.valid_cells = 0;
+        self.used_cells = 0;
         self.unused_cells = 0;
         self.air_cells = 0;
         let cells = self.cell_volume.len();
@@ -279,8 +298,11 @@ impl SarCalculation {
                     let index = self.index(pos);
                     let density = self.cell_density[index];
                     if density <= 0.0 {
+                        // native counts the air voxels in step 1
+                        self.air_cells += 1;
                         continue;
                     }
+                    // native: pow(m/rho, 1/3)/2 is the full edge
                     let guess = (self.averaging_mass / density).cbrt() / 2.0;
                     let (status, cube) =
                         self.find_fitting_cubical_mass(pos, guess, None, self.ignore_face_valid);
@@ -295,9 +317,8 @@ impl SarCalculation {
                     self.cube_mass[index] = cube.mass;
                     self.cube_volume[index] = cube.volume;
                     for (frequency, value) in values.iter().enumerate() {
-                        if *value > sar[frequency][index] {
-                            sar[frequency][index] = *value;
-                        }
+                        // native overwrites the centre value with its own cube
+                        sar[frequency][index] = *value;
                         if *value > self.max_sar[frequency] {
                             self.max_sar[frequency] = *value;
                             self.max_index[frequency] = pos;
@@ -320,7 +341,6 @@ impl SarCalculation {
                     }
                     self.unused_cells += 1;
                     let guess = (self.averaging_mass / density).cbrt() / 2.0;
-                    let mut best = vec![0.0f64; self.frequencies.len()];
                     let mut min_volume = f64::MAX;
                     let mut candidates = Vec::new();
                     for face in 0..6 {
@@ -332,37 +352,22 @@ impl SarCalculation {
                             candidates.push((face, cube, values));
                         }
                     }
-                    let mut chosen: Option<(usize, AveragingCube)> = None;
                     for (face, cube, values) in candidates {
                         if cube.volume > self.unused_relative_volume_limit * min_volume {
                             continue;
                         }
+                        // native: the face/frequency that raises the value wins
+                        // the cube statistics
                         for (frequency, value) in values.iter().enumerate() {
-                            if *value > best[frequency] {
-                                best[frequency] = *value;
-                            }
-                        }
-                        if chosen
-                            .as_ref()
-                            .map(|(_, current)| cube.volume <= current.volume)
-                            .unwrap_or(true)
-                        {
-                            chosen = Some((face, cube));
-                        }
-                    }
-                    if let Some((face, cube)) = &chosen {
-                        if self.cube_type[index] == 0 {
-                            self.cube_type[index] = (*face as u8) + 1;
-                            self.cube_mass[index] = cube.mass;
-                            self.cube_volume[index] = cube.volume;
-                        }
-                    }
-                    for (frequency, value) in best.iter().enumerate() {
-                        if *value > sar[frequency][index] {
-                            sar[frequency][index] = *value;
-                            if *value > self.max_sar[frequency] {
-                                self.max_sar[frequency] = *value;
-                                self.max_index[frequency] = pos;
+                            if *value > sar[frequency][index] {
+                                sar[frequency][index] = *value;
+                                if *value > self.max_sar[frequency] {
+                                    self.max_sar[frequency] = *value;
+                                    self.max_index[frequency] = pos;
+                                }
+                                self.cube_type[index] = face as u8 + 1;
+                                self.cube_mass[index] = cube.mass;
+                                self.cube_volume[index] = cube.volume;
                             }
                         }
                     }
@@ -370,6 +375,11 @@ impl SarCalculation {
             }
         }
 
+        self.used_cells = used
+            .iter()
+            .zip(valid.iter())
+            .filter(|(used, valid)| **used && !**valid)
+            .count();
         self.sar = sar;
     }
 
@@ -387,6 +397,26 @@ impl SarCalculation {
                     let index = self.index([i, j, k]);
                     if valid[index] || self.cell_density[index] <= 0.0 {
                         continue;
+                    }
+                    if !self.mark_partial_as_used {
+                        // native: partially covered boundary cells are not marked
+                        let position = [i, j, k];
+                        let mut partial = false;
+                        for axis in 0..3 {
+                            if position[axis] == cube.start[axis]
+                                && cube.partial_start[axis] != 1.0
+                            {
+                                partial = true;
+                            }
+                            if position[axis] == cube.stop[axis]
+                                && cube.partial_stop[axis] != 1.0
+                            {
+                                partial = true;
+                            }
+                        }
+                        if partial {
+                            continue;
+                        }
                     }
                     used[index] = true;
                     if self.cube_type[index] == 0 {
@@ -471,6 +501,8 @@ impl SarCalculation {
         &self.frequencies
     }
 
+    /// Native `FindFittingCubicalMass`: `box_size` is the full cube edge; the
+    /// mass walk in `get_cubical_mass` takes the half edge.
     fn find_fitting_cubical_mass(
         &self,
         pos: [usize; 3],
@@ -494,7 +526,7 @@ impl SarCalculation {
             background_ratio: 0.0,
         };
         for iteration in 0..self.max_iterations {
-            let face_valid = self.get_cubical_mass(pos, box_size, disabled_face, &mut cube);
+            let face_valid = self.get_cubical_mass(pos, box_size / 2.0, disabled_face, &mut cube);
             let mass_valid = (cube.mass - target).abs() <= tolerance;
             if !face_valid && cube.mass < target * (1.0 - self.mass_tolerance) && !ignore_face_valid
             {
@@ -826,6 +858,81 @@ mod tests {
             expected
         );
         assert!(calc.valid_cells > 0);
+    }
+
+    #[test]
+    fn the_cube_search_uses_the_native_full_edge_convention() {
+        // 2 mm cells at 1000 kg/m^3: 1 g is a 10 mm cube, i.e. five cells per
+        // axis. Native `FindFittingCubicalMass` receives the full edge
+        // `(m/rho)^(1/3)/2` and walks the half edge.
+        let mut calc = uniform_block(9, 2.0e-3, 1000.0);
+        calc.averaging_mass = 1.0e-3;
+        let guess = (calc.averaging_mass / 1000.0f64).cbrt() / 2.0;
+        let (status, cube) = calc.find_fitting_cubical_mass([4, 4, 4], guess, None, true);
+        assert_eq!(status, CubeStatus::Valid);
+        assert_eq!(cube.start, [2, 2, 2]);
+        assert_eq!(cube.stop, [6, 6, 6]);
+        assert_eq!(cube.partial_start, [1.0; 3]);
+        assert_eq!(cube.partial_stop, [1.0; 3]);
+        assert!((cube.mass - 1.0e-3).abs() / 1.0e-3 < 1.0e-9, "mass {}", cube.mass);
+        assert!((cube.volume - 1.0e-6).abs() / 1.0e-6 < 1.0e-9);
+    }
+
+    #[test]
+    fn air_cells_have_no_power_density() {
+        let mut calc = uniform_block(4, 1.0e-3, 1000.0);
+        let mut density = vec![0.0; 5 * 5 * 5];
+        let material = calc.index([2, 2, 2]);
+        density[material] = 1000.0;
+        calc.set_cell_density(density);
+        let mut e = ComplexField::new([5, 5, 5]);
+        for i in 0..5 {
+            for j in 0..5 {
+                for k in 0..5 {
+                    e.set(0, i, j, k, ComplexPoint { re: 3.0, im: 4.0 });
+                }
+            }
+        }
+        calc.add_e_field_and_conductivity(1.0e9, &e, &vec![2.0; 5 * 5 * 5]);
+        let air = calc.index([0, 0, 0]);
+        assert_eq!(calc.power_density[0][air], 0.0);
+        // only the material cell dissipates power
+        let expected = 0.5 * 2.0 * 25.0 * 1.0e-9;
+        assert!((calc.power(0) - expected).abs() / expected < 1.0e-12);
+        assert_eq!(calc.local_sar(0).unwrap()[air], 0.0);
+    }
+
+    #[test]
+    fn the_cube_counters_partition_the_grid() {
+        let mut calc = uniform_block(9, 1.0e-3, 1000.0);
+        let mut density = vec![1000.0; 10 * 10 * 10];
+        for i in 0..10 {
+            for j in 0..10 {
+                for k in 0..10 {
+                    if i == 0 || j == 0 || k == 0 || i == 9 || j == 9 || k == 9 {
+                        density[calc.index([i, j, k])] = 0.0;
+                    }
+                }
+            }
+        }
+        calc.set_cell_density(density);
+        calc.averaging_mass = 8.0 * 1.0e-9 * 1000.0;
+        let mut e = ComplexField::new([10, 10, 10]);
+        e.set(0, 5, 5, 5, ComplexPoint { re: 1.0, im: 0.0 });
+        calc.add_e_field_and_conductivity(1.0e9, &e, &vec![1.0; 10 * 10 * 10]);
+        calc.calc_sar();
+        assert_eq!(calc.air_cells, 10 * 10 * 10 - 8 * 8 * 8);
+        assert_eq!(
+            calc.valid_cells + calc.used_cells + calc.unused_cells + calc.air_cells,
+            10 * 10 * 10,
+            "valid {} used {} unused {} air {}",
+            calc.valid_cells,
+            calc.used_cells,
+            calc.unused_cells,
+            calc.air_cells
+        );
+        // native `used_cubes = count(used) - valid`
+        assert!(calc.used_cells <= 8 * 8 * 8 - calc.valid_cells);
     }
 
     #[test]
