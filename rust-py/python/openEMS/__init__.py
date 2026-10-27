@@ -8,8 +8,9 @@ Import path mirrors the native package:
     from openEMS.utilities import HDF5Dump
     from openEMS.nf2ff import nf2ff_results
 
-The solver class is the PyO3 wrapper from `openems_py`; the other modules are
-the native pure-Python modules and run unchanged against the Rust dump format.
+The solver class is the PyO3 wrapper from `openEMS._openems`; the other modules
+are the native pure-Python modules and run unchanged against the Rust dump
+format.
 """
 
 from __future__ import absolute_import

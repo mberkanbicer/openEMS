@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "openems-py"
+name = "openEMS"
 version = "0.1.0"
 description = "Python bindings for the openEMS FDTD solver"
 requires-python = ">=3.8"
