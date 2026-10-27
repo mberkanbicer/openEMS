@@ -173,8 +173,7 @@ impl EngineExtension for EngineExtExcitation {
             };
             let val = exc.signal.voltage(index);
             let cur = *volt.get(exc.component, exc.pos[0], exc.pos[1], exc.pos[2]);
-            *volt.get_mut(exc.component, exc.pos[0], exc.pos[1], exc.pos[2]) =
-                cur + exc.amp * val;
+            *volt.get_mut(exc.component, exc.pos[0], exc.pos[1], exc.pos[2]) = cur + exc.amp * val;
         }
     }
 
@@ -186,8 +185,7 @@ impl EngineExtension for EngineExtExcitation {
             };
             let val = exc.signal.current(index);
             let cur = *curr.get(exc.component, exc.pos[0], exc.pos[1], exc.pos[2]);
-            *curr.get_mut(exc.component, exc.pos[0], exc.pos[1], exc.pos[2]) =
-                cur + exc.amp * val;
+            *curr.get_mut(exc.component, exc.pos[0], exc.pos[1], exc.pos[2]) = cur + exc.amp * val;
         }
         self.current_ts += 1;
     }
@@ -411,9 +409,7 @@ mod mur_abc_tests {
     #[test]
     fn test_mur_three_phase_update_matches_native_sequence() {
         let mut ext = EngineExtMurABC::new();
-        ext.add_face(
-            0, 0, false, 0, 1, 3, 3, vec![0.5; 9], vec![0.25; 9],
-        );
+        ext.add_face(0, 0, false, 0, 1, 3, 3, vec![0.5; 9], vec![0.25; 9]);
         let mut volt = FieldArray::new("volt", [4, 3, 3]);
         let curr = FieldArray::new("curr", [4, 3, 3]);
 
@@ -441,7 +437,6 @@ mod mur_abc_tests {
         assert_eq!(*volt.get(2, 0, 1, 1), 5.0);
     }
 }
-
 
 // ============================================================================
 // UPML (Uniaxial Perfectly Matched Layer) extension
@@ -809,11 +804,7 @@ impl EngineExtTFSF {
         delta: FDTD_FLOAT,
         sample: impl Fn(usize) -> FDTD_FLOAT,
     ) -> FDTD_FLOAT {
-        let first = self
-            .delay_lookup
-            .get(delay as usize)
-            .copied()
-            .unwrap_or(0);
+        let first = self.delay_lookup.get(delay as usize).copied().unwrap_or(0);
         let second = self
             .delay_lookup
             .get(delay as usize + 1)
@@ -870,10 +861,9 @@ impl EngineExtension for EngineExtTFSF {
                             let amplitude = self.volt_amp[n][face][component][ui_pos];
                             let delay = self.volt_delay[n][face][component][ui_pos];
                             let delta = self.volt_delay_delta[n][face][component][ui_pos];
-                            let correction =
-                                self.add_sample(amplitude, delay, delta, |index| {
-                                    self.signal.current(index)
-                                });
+                            let correction = self.add_sample(amplitude, delay, delta, |index| {
+                                self.signal.current(index)
+                            });
                             let current = *volt.get(edge, pos[0], pos[1], pos[2]);
                             *volt.get_mut(edge, pos[0], pos[1], pos[2]) = current + correction;
                         }
@@ -917,10 +907,9 @@ impl EngineExtension for EngineExtTFSF {
                             let amplitude = self.curr_amp[n][face][component][ui_pos];
                             let delay = self.curr_delay[n][face][component][ui_pos];
                             let delta = self.curr_delay_delta[n][face][component][ui_pos];
-                            let correction =
-                                self.add_sample(amplitude, delay, delta, |index| {
-                                    self.signal.voltage(index)
-                                });
+                            let correction = self.add_sample(amplitude, delay, delta, |index| {
+                                self.signal.voltage(index)
+                            });
                             let current = *curr.get(edge, pos[0], pos[1], pos[2]);
                             *curr.get_mut(edge, pos[0], pos[1], pos[2]) = current + correction;
                         }
@@ -1283,7 +1272,6 @@ pub struct EngineExtLorentzMaterial {
     pub curr_ade_on: Vec<bool>,
 }
 
-
 impl EngineExtLorentzMaterial {
     /// Create a new Lorentz extension with the given number of orders and positions.
     pub fn new(num_orders: usize, num_positions: usize) -> Self {
@@ -1466,14 +1454,7 @@ mod lorentz_tests {
         let mut ext = EngineExtLorentzMaterial::new(1, 1);
         ext.set_position(0, [5, 5, 5]);
         ext.set_order_coefficients(
-            0,
-            0,
-            &[0.5; 3],
-            &[0.3; 3],
-            &[0.1; 3],
-            &[0.6; 3],
-            &[0.4; 3],
-            &[0.2; 3],
+            0, 0, &[0.5; 3], &[0.3; 3], &[0.1; 3], &[0.6; 3], &[0.4; 3], &[0.2; 3],
         );
         ext.set_order_active(0, true, true);
         assert_eq!(ext.positions[0], [5, 5, 5]);
@@ -1490,14 +1471,7 @@ mod lorentz_tests {
         let mut ext = EngineExtLorentzMaterial::new(1, 1);
         ext.set_position(0, [1, 1, 1]);
         ext.set_order_coefficients(
-            0,
-            0,
-            &[0.5; 3],
-            &[0.3; 3],
-            &[0.1; 3],
-            &[0.6; 3],
-            &[0.4; 3],
-            &[0.2; 3],
+            0, 0, &[0.5; 3], &[0.3; 3], &[0.1; 3], &[0.6; 3], &[0.4; 3], &[0.2; 3],
         );
         ext.set_order_active(0, true, true);
 
@@ -1517,14 +1491,7 @@ mod lorentz_tests {
         let mut ext = EngineExtLorentzMaterial::new(1, 1);
         ext.set_position(0, [1, 1, 1]);
         ext.set_order_coefficients(
-            0,
-            0,
-            &[0.5; 3],
-            &[0.3; 3],
-            &[0.1; 3],
-            &[0.6; 3],
-            &[0.4; 3],
-            &[0.2; 3],
+            0, 0, &[0.5; 3], &[0.3; 3], &[0.1; 3], &[0.6; 3], &[0.4; 3], &[0.2; 3],
         );
         ext.set_order_active(0, true, true);
 
@@ -1544,14 +1511,7 @@ mod lorentz_tests {
         let mut ext = EngineExtLorentzMaterial::new(1, 1);
         ext.set_position(0, [1, 1, 1]);
         ext.set_order_coefficients(
-            0,
-            0,
-            &[0.5; 3],
-            &[0.3; 3],
-            &[0.1; 3],
-            &[0.6; 3],
-            &[0.4; 3],
-            &[0.2; 3],
+            0, 0, &[0.5; 3], &[0.3; 3], &[0.1; 3], &[0.6; 3], &[0.4; 3], &[0.2; 3],
         );
         ext.set_order_active(0, true, true);
         ext.volt_ade[0][0][0] = 5.4_f32;
@@ -1570,14 +1530,7 @@ mod lorentz_tests {
         let mut ext = EngineExtLorentzMaterial::new(1, 1);
         ext.set_position(0, [1, 1, 1]);
         ext.set_order_coefficients(
-            0,
-            0,
-            &[0.5; 3],
-            &[0.3; 3],
-            &[0.1; 3],
-            &[0.6; 3],
-            &[0.4; 3],
-            &[0.2; 3],
+            0, 0, &[0.5; 3], &[0.3; 3], &[0.1; 3], &[0.6; 3], &[0.4; 3], &[0.2; 3],
         );
         ext.set_order_active(0, true, true);
         ext.curr_ade[0][0][0] = 5.4_f32;
@@ -1964,8 +1917,7 @@ impl EngineExtension for EngineExtLumpedRLC {
         }
         for pos_idx in 0..self.num_positions {
             let coefficient = &self.coeffs[pos_idx];
-            self.v_il[pos_idx] +=
-                coefficient.i2v * coefficient.ilv * self.v_vdn[pos_idx][1];
+            self.v_il[pos_idx] += coefficient.i2v * coefficient.ilv * self.v_vdn[pos_idx][1];
         }
     }
 
@@ -2055,8 +2007,7 @@ mod tests_lumped_rlc {
             capacitance,
         };
         let series = crate::lumped_rlc::series_coefficients(dt, &element);
-        let update =
-            crate::lumped_rlc::series_update_coefficients(dt, grid_capacitance, &series);
+        let update = crate::lumped_rlc::series_update_coefficients(dt, grid_capacitance, &series);
 
         let mut ext = EngineExtLumpedRLC::new(1);
         ext.set_position(
@@ -2115,15 +2066,11 @@ mod tests_lumped_rlc {
                 (current.0 * voltage.0 + current.1 * voltage.1) / denominator,
                 (current.1 * voltage.0 - current.0 * voltage.1) / denominator,
             );
-            let impedance = (
-                resistance,
-                omega * inductance - 1.0 / (omega * capacitance),
-            );
+            let impedance = (resistance, omega * inductance - 1.0 / (omega * capacitance));
             let norm = impedance.0 * impedance.0 + impedance.1 * impedance.1;
             let analytic = (impedance.0 / norm, -impedance.1 / norm);
-            let error = ((admittance.0 - analytic.0).powi(2)
-                + (admittance.1 - analytic.1).powi(2))
-            .sqrt()
+            let error = ((admittance.0 - analytic.0).powi(2) + (admittance.1 - analytic.1).powi(2))
+                .sqrt()
                 / (analytic.0 * analytic.0 + analytic.1 * analytic.1).sqrt();
             assert!(
                 error < 2.0e-3,
@@ -2296,7 +2243,8 @@ impl EngineExtension for EngineExtSteadyState {
                 let current_energy = self.fast_energy(volt, curr);
                 if self.last_total_energy > 0.0 {
                     self.last_max_diff = ((current_energy - self.last_total_energy).abs()
-                        / self.last_total_energy) as FDTD_FLOAT;
+                        / self.last_total_energy)
+                        as FDTD_FLOAT;
                     no_valid = false;
                 }
                 self.last_total_energy = current_energy;
@@ -2695,7 +2643,9 @@ mod excitation_period_tests {
         signal.build(1.0e-12, 10_000).unwrap();
         assert_eq!(EngineExtExcitation::sample_index(&signal, 9, 10), None);
         assert_eq!(EngineExtExcitation::sample_index(&signal, 10, 10), Some(0));
-        assert_eq!(EngineExtExcitation::sample_index(&signal, 1_013, 10), Some(3));
+        assert_eq!(
+            EngineExtExcitation::sample_index(&signal, 1_013, 10),
+            Some(3)
+        );
     }
-
 }

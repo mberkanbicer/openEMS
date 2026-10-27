@@ -10,8 +10,8 @@
 
 use crate::excitation::Excitation;
 use crate::extensions::{
-    EngineExtension, ENG_EXT_PRIO_DEFAULT, ENG_EXT_PRIO_EXCITATION,
-    ENG_EXT_PRIO_STEADYSTATE, ENG_EXT_PRIO_UPML,
+    EngineExtension, ENG_EXT_PRIO_DEFAULT, ENG_EXT_PRIO_EXCITATION, ENG_EXT_PRIO_STEADYSTATE,
+    ENG_EXT_PRIO_UPML,
 };
 use crate::operator::Operator;
 use std::sync::Arc;
@@ -34,10 +34,7 @@ pub trait OperatorExtension {
     /// Returning an empty vector is allowed (for example a Mur extension with
     /// no active faces). Errors abort the setup instead of silently dropping
     /// physics.
-    fn build(
-        &mut self,
-        operator: &mut Operator,
-    ) -> Result<Vec<Box<dyn EngineExtension>>, String>;
+    fn build(&mut self, operator: &mut Operator) -> Result<Vec<Box<dyn EngineExtension>>, String>;
 }
 
 /// Ordered collection of operator extensions.
@@ -74,7 +71,8 @@ impl OperatorExtensionRegistry {
     /// Stable sort by ascending priority; equal priorities keep registration
     /// order.
     pub fn sort(&mut self) {
-        self.extensions.sort_by_key(|extension| extension.priority());
+        self.extensions
+            .sort_by_key(|extension| extension.priority());
     }
 
     /// Sort, then build every active extension in order.
@@ -117,10 +115,7 @@ impl OperatorExtension for MurOperatorExtension {
         ENG_EXT_PRIO_DEFAULT
     }
 
-    fn build(
-        &mut self,
-        operator: &mut Operator,
-    ) -> Result<Vec<Box<dyn EngineExtension>>, String> {
+    fn build(&mut self, operator: &mut Operator) -> Result<Vec<Box<dyn EngineExtension>>, String> {
         let extension = operator.build_mur_extension(self.phase_velocity);
         if extension.faces.is_empty() {
             Ok(Vec::new())
@@ -148,10 +143,7 @@ impl OperatorExtension for UpmlOperatorExtension {
         self.pml_size.iter().any(|&size| size > 0)
     }
 
-    fn build(
-        &mut self,
-        operator: &mut Operator,
-    ) -> Result<Vec<Box<dyn EngineExtension>>, String> {
+    fn build(&mut self, operator: &mut Operator) -> Result<Vec<Box<dyn EngineExtension>>, String> {
         let regions = operator.build_upml_extensions(self.pml_size)?;
         Ok(regions
             .into_iter()
@@ -179,10 +171,7 @@ impl OperatorExtension for SteadyStateOperatorExtension {
         self.period_ts > 0
     }
 
-    fn build(
-        &mut self,
-        operator: &mut Operator,
-    ) -> Result<Vec<Box<dyn EngineExtension>>, String> {
+    fn build(&mut self, operator: &mut Operator) -> Result<Vec<Box<dyn EngineExtension>>, String> {
         Ok(operator
             .build_steady_state_extension(self.period_ts)
             .into_iter()
@@ -205,10 +194,7 @@ impl OperatorExtension for ExcitationOperatorExtension {
         ENG_EXT_PRIO_EXCITATION
     }
 
-    fn build(
-        &mut self,
-        operator: &mut Operator,
-    ) -> Result<Vec<Box<dyn EngineExtension>>, String> {
+    fn build(&mut self, operator: &mut Operator) -> Result<Vec<Box<dyn EngineExtension>>, String> {
         let extension = operator.build_excitation_extension(self.signal.as_ref());
         if extension.voltage_excitations.is_empty() && extension.current_excitations.is_empty() {
             Ok(Vec::new())
@@ -412,10 +398,7 @@ impl OperatorExtension for ConductingSheetOperatorExtension {
         ENG_EXT_PRIO_DEFAULT
     }
 
-    fn build(
-        &mut self,
-        operator: &mut Operator,
-    ) -> Result<Vec<Box<dyn EngineExtension>>, String> {
+    fn build(&mut self, operator: &mut Operator) -> Result<Vec<Box<dyn EngineExtension>>, String> {
         Ok(operator
             .build_conducting_sheet_extension(self.f_max, self.boundary_size)?
             .into_iter()
@@ -439,10 +422,7 @@ impl OperatorExtension for LumpedRLCOperatorExtension {
         crate::extensions::ENG_EXT_PRIO_LUMPED_RLC
     }
 
-    fn build(
-        &mut self,
-        operator: &mut Operator,
-    ) -> Result<Vec<Box<dyn EngineExtension>>, String> {
+    fn build(&mut self, operator: &mut Operator) -> Result<Vec<Box<dyn EngineExtension>>, String> {
         Ok(operator
             .build_lumped_rlc_extension(self.f_max)?
             .into_iter()
@@ -465,10 +445,7 @@ impl OperatorExtension for TfsfOperatorExtension {
         crate::extensions::ENG_EXT_PRIO_TFSF
     }
 
-    fn build(
-        &mut self,
-        operator: &mut Operator,
-    ) -> Result<Vec<Box<dyn EngineExtension>>, String> {
+    fn build(&mut self, operator: &mut Operator) -> Result<Vec<Box<dyn EngineExtension>>, String> {
         Ok(operator
             .build_tfsf_extension(self.signal.as_ref())?
             .into_iter()
@@ -489,10 +466,7 @@ impl OperatorExtension for DebyeOperatorExtension {
         crate::extensions::ENG_EXT_PRIO_DISPERSIVE_DEBYE
     }
 
-    fn build(
-        &mut self,
-        operator: &mut Operator,
-    ) -> Result<Vec<Box<dyn EngineExtension>>, String> {
+    fn build(&mut self, operator: &mut Operator) -> Result<Vec<Box<dyn EngineExtension>>, String> {
         Ok(operator
             .build_debye_extension()?
             .into_iter()
@@ -513,10 +487,7 @@ impl OperatorExtension for LorentzOperatorExtension {
         crate::extensions::ENG_EXT_PRIO_DISPERSIVE_LORENTZ
     }
 
-    fn build(
-        &mut self,
-        operator: &mut Operator,
-    ) -> Result<Vec<Box<dyn EngineExtension>>, String> {
+    fn build(&mut self, operator: &mut Operator) -> Result<Vec<Box<dyn EngineExtension>>, String> {
         Ok(operator
             .build_lorentz_extension()?
             .into_iter()

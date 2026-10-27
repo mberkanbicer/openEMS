@@ -229,11 +229,7 @@ impl Nf2ffRunner {
                 let h_field = read_complex_field(&h_dump, fd_index, e_mesh.num_lines)?;
                 let calculator = &mut self.calculators[index];
                 calculator.add_plane(
-                    [
-                        &e_mesh.lines[0],
-                        &e_mesh.lines[1],
-                        &e_mesh.lines[2],
-                    ],
+                    [&e_mesh.lines[0], &e_mesh.lines[1], &e_mesh.lines[2]],
                     e_mesh.num_lines,
                     &e_field,
                     &h_field,
@@ -292,10 +288,7 @@ impl Nf2ffRunner {
             file.write_bool_attribute("/", "legacy_fmt", true)?;
         }
 
-        for (name, values) in [
-            ("E_theta", true),
-            ("E_phi", false),
-        ] {
+        for (name, values) in [("E_theta", true), ("E_phi", false)] {
             let group = format!("/nf2ff/{name}/FD");
             file.create_group(&group)?;
             for (frequency_index, calculator) in self.calculators.iter().enumerate() {
@@ -441,12 +434,11 @@ fn read_frequencies(file: &Hdf5File) -> Result<Vec<f64>, Nf2ffError> {
 ///
 /// Legacy Octave/MATLAB dumps store `(n, k, j, i)` (`NZYX`); everything else
 /// is `(n, i, j, k)`.
-fn read_field_nxyz(
-    file: &Hdf5File,
-    path: &str,
-) -> Result<([usize; 3], Vec<f32>), Nf2ffError> {
+fn read_field_nxyz(file: &Hdf5File, path: &str) -> Result<([usize; 3], Vec<f32>), Nf2ffError> {
     let (stored, values) = file.read_f32_dataset(path)?;
-    let order = file.read_string_attribute(path, "d_order").unwrap_or_default();
+    let order = file
+        .read_string_attribute(path, "d_order")
+        .unwrap_or_default();
     if stored.len() == 4 && stored[0] == 3 {
         if order.to_ascii_uppercase().starts_with("NZYX") {
             let dims = [stored[3], stored[2], stored[1]];
@@ -546,7 +538,11 @@ fn read_time_domain(file: &Hdf5File) -> Result<TimeDomainData, Nf2ffError> {
         time.push(sample_time);
         samples.push(values);
     }
-    Ok(TimeDomainData { time, samples, dims })
+    Ok(TimeDomainData {
+        time,
+        samples,
+        dims,
+    })
 }
 
 fn discrete_fourier_transform(

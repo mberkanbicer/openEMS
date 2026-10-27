@@ -7,8 +7,7 @@ use crate::excitation::Excitation;
 use crate::extensions::{
     ConductingSheetCoeffs, EngineExtConductingSheet, EngineExtDebyeMaterial, EngineExtExcitation,
     EngineExtLorentzMaterial, EngineExtLumpedRLC, EngineExtMurABC, EngineExtSteadyState,
-    EngineExtTFSF, EngineExtUPML,
-    LumpedRLCCoeffs,
+    EngineExtTFSF, EngineExtUPML, LumpedRLCCoeffs,
 };
 use crate::operator_base::OperatorBase;
 use csxcad_core::material::{ConductingSheetProperties, ExcitationProperties, MaterialField};
@@ -107,12 +106,7 @@ impl<'a> MeshMetric<'a> {
     /// segment between `r1` and `r2`.
     pub fn node_area(&self, n: usize, pos: [usize; 3], dual: bool) -> f64 {
         if n == 2 && self.is_cylindrical() {
-            let da = disc_delta_value(
-                &self.lines[1],
-                self.counts[1] as usize,
-                pos[1],
-                dual,
-            );
+            let da = disc_delta_value(&self.lines[1], self.counts[1] as usize, pos[1], dual);
             let (r1, r2) = if dual {
                 let r1 = self.line(0, pos[0], false) * self.grid_delta;
                 (r1, r1 + self.base_length(0, pos, false))
@@ -375,12 +369,7 @@ impl Operator {
 
     /// True for a full `2*pi` azimuthal mesh with a duplicated seam plane.
     pub fn closed_alpha(&self) -> bool {
-        matches!(
-            self.mesh_type,
-            MeshType::Cylindrical {
-                closed_alpha: true
-            }
-        )
+        matches!(self.mesh_type, MeshType::Cylindrical { closed_alpha: true })
     }
 
     /// Index into the flat per-component EC arrays.
@@ -395,7 +384,11 @@ impl Operator {
     /// Mirrors C++ `Init_EC`.
     pub fn init_data_storage(&mut self, num_lines: [usize; 3]) {
         let extent = [num_lines[0], num_lines[1], num_lines[2]];
-        self.base.num_lines = [num_lines[0] as u32, num_lines[1] as u32, num_lines[2] as u32];
+        self.base.num_lines = [
+            num_lines[0] as u32,
+            num_lines[1] as u32,
+            num_lines[2] as u32,
+        ];
         self.vv_ptr = Some(FieldArray::new("vv", extent));
         self.vi_ptr = Some(FieldArray::new("vi", extent));
         self.ii_ptr = Some(FieldArray::new("ii", extent));
@@ -521,15 +514,13 @@ impl Operator {
         if structure.coordinate_system() == csxcad_core::grid::CoordinateSystem::Cylindrical {
             if grid_lines[0].first().copied().unwrap_or(0.0) < 0.0 {
                 return Err(
-                    "cylindrical mesh: negative rho coordinates are not allowed".to_string(),
+                    "cylindrical mesh: negative rho coordinates are not allowed".to_string()
                 );
             }
             let first = grid_lines[1].first().copied().unwrap_or(0.0);
             let span = grid_lines[1].last().copied().unwrap_or(0.0) - first;
             if span > 2.0 * std::f64::consts::PI + 1e-6 {
-                return Err(
-                    "cylindrical mesh: the alpha range must not exceed 2*pi".to_string(),
-                );
+                return Err("cylindrical mesh: the alpha range must not exceed 2*pi".to_string());
             }
             let closed_alpha = (span - 2.0 * std::f64::consts::PI).abs() < 1e-6;
             if closed_alpha {
@@ -747,25 +738,16 @@ impl Operator {
                             disc_lines[2].as_ref().map(|l| l[k]).unwrap_or(0.0),
                         ];
                         let delta = raw_disc_delta(&disc_lines, counts, n, pos[n] as i64);
-                        let delta_p =
-                            raw_disc_delta(&disc_lines, counts, n_p, pos[n_p] as i64);
-                        let delta_pp =
-                            raw_disc_delta(&disc_lines, counts, n_pp, pos[n_pp] as i64);
-                        let delta_m =
-                            raw_disc_delta(&disc_lines, counts, n, pos[n] as i64 - 1);
+                        let delta_p = raw_disc_delta(&disc_lines, counts, n_p, pos[n_p] as i64);
+                        let delta_pp = raw_disc_delta(&disc_lines, counts, n_pp, pos[n_pp] as i64);
+                        let delta_m = raw_disc_delta(&disc_lines, counts, n, pos[n] as i64 - 1);
                         let delta_p_m =
                             raw_disc_delta(&disc_lines, counts, n_p, pos[n_p] as i64 - 1);
                         let delta_pp_m =
                             raw_disc_delta(&disc_lines, counts, n_pp, pos[n_pp] as i64 - 1);
 
                         // PEC: single Yee-edge coordinate (native `CalcPEC`).
-                        let edge_coordinate = yee_coordinates(
-                            &disc_lines,
-                            counts,
-                            n,
-                            pos,
-                            false,
-                        );
+                        let edge_coordinate = yee_coordinates(&disc_lines, counts, n, pos, false);
                         let mut edge_coordinate = edge_coordinate;
                         wrap_alpha(&mut edge_coordinate);
                         let is_pec = sample(edge_coordinate)
@@ -965,24 +947,24 @@ impl Operator {
                 for j in 0..ny {
                     for k in 0..nz {
                         // Determine effective material for this cell.
-                        let (eps_r, mue_r, kappa, sigma, is_pec) =
-                            if let Some(grid) = material_grid {
-                                let nx_lines = counts[0] as usize;
-                                let ny_lines = counts[1] as usize;
-                                let nz_lines = counts[2] as usize;
-                                let index = n * nx_lines * ny_lines * nz_lines
-                                    + i * ny_lines * nz_lines
-                                    + j * nz_lines
-                                    + k;
-                                if index < grid.len() {
-                                    let m = grid[index];
-                                    (m.eps_r, m.mue_r, m.kappa, m.sigma, m.is_pec)
-                                } else {
-                                    (bg_eps_r, bg_mue_r, bg_kappa, bg_sigma, false)
-                                }
+                        let (eps_r, mue_r, kappa, sigma, is_pec) = if let Some(grid) = material_grid
+                        {
+                            let nx_lines = counts[0] as usize;
+                            let ny_lines = counts[1] as usize;
+                            let nz_lines = counts[2] as usize;
+                            let index = n * nx_lines * ny_lines * nz_lines
+                                + i * ny_lines * nz_lines
+                                + j * nz_lines
+                                + k;
+                            if index < grid.len() {
+                                let m = grid[index];
+                                (m.eps_r, m.mue_r, m.kappa, m.sigma, m.is_pec)
                             } else {
                                 (bg_eps_r, bg_mue_r, bg_kappa, bg_sigma, false)
-                            };
+                            }
+                        } else {
+                            (bg_eps_r, bg_mue_r, bg_kappa, bg_sigma, false)
+                        };
 
                         // Per-direction edge geometry from the real mesh.
                         let pos = [i, j, k];
@@ -1043,7 +1025,6 @@ impl Operator {
                             *ii.get_mut(n, i, j, k) = 0.0;
                             *iv.get_mut(n, i, j, k) = 0.0;
                         }
-
                     }
                 }
             }
@@ -1105,9 +1086,7 @@ impl Operator {
         // Native `Operator_Cylinder::CalcTimestep`: a mesh that includes the
         // rho = 0 singularity forces the conservative `Rennings_1` step.
         let r0_singular = self.is_cylindrical()
-            && self
-                .base
-                .disc_lines[0]
+            && self.base.disc_lines[0]
                 .as_ref()
                 .and_then(|lines| lines.first())
                 .copied()
@@ -1214,28 +1193,20 @@ impl Operator {
                             l_at(self, n_pp, pos_pm),
                             c_at(self, n, shift_node(pos_pm, n_p, 1, counts)),
                         );
-                        terms[5] = inverse_product(
-                            l_at(self, n_pp, pos_pm),
-                            c_at(self, n, pos_pm),
-                        );
+                        terms[5] = inverse_product(l_at(self, n_pp, pos_pm), c_at(self, n, pos_pm));
                         terms[6] = inverse_product(
                             l_at(self, n_p, pos_pp_mm),
                             c_at(self, n, shift_node(pos_pp_mm, n_pp, 1, counts)),
                         );
-                        terms[7] = inverse_product(
-                            l_at(self, n_p, pos_pp_mm),
-                            c_at(self, n, pos_pp_mm),
-                        );
+                        terms[7] =
+                            inverse_product(l_at(self, n_p, pos_pp_mm), c_at(self, n, pos_pp_mm));
                         let Some(wqp) = sum_terms(&terms) else {
                             continue;
                         };
 
                         let wt_1 = [
                             inverse_product(l_at(self, n_pp, pos), c_at(self, n_p, pos)),
-                            inverse_product(
-                                l_at(self, n_pp, pos_pm),
-                                c_at(self, n_p, pos),
-                            ),
+                            inverse_product(l_at(self, n_pp, pos_pm), c_at(self, n_p, pos)),
                             inverse_product(l_at(self, n_p, pos), c_at(self, n_pp, pos)),
                             inverse_product(
                                 l_at(self, n_p, shift_node(pos, n_pp, -1, counts)),
@@ -1249,10 +1220,7 @@ impl Operator {
                         let shifted_n = shift_node(pos, n, 1, counts);
                         let wt_2 = [
                             inverse_product(l_at(self, n_pp, pos), c_at(self, n_p, shifted_n)),
-                            inverse_product(
-                                l_at(self, n_pp, pos_pm),
-                                c_at(self, n_p, shifted_n),
-                            ),
+                            inverse_product(l_at(self, n_pp, pos_pm), c_at(self, n_p, shifted_n)),
                             inverse_product(l_at(self, n_p, pos), c_at(self, n_pp, shifted_n)),
                             inverse_product(
                                 l_at(self, n_p, shift_node(pos, n_pp, -1, counts)),
@@ -1495,13 +1463,7 @@ impl Operator {
         dual: bool,
         full_mesh: bool,
         snap_method: i32,
-    ) -> (
-        i32,
-        [u32; 3],
-        [u32; 3],
-        [bool; 3],
-        [bool; 3],
-    ) {
+    ) -> (i32, [u32; 3], [u32; 3], [bool; 3], [bool; 3]) {
         let mut lower = [0.0f64; 3];
         let mut upper = [0.0f64; 3];
         for axis in 0..3 {
@@ -1514,13 +1476,7 @@ impl Operator {
             if (lower[axis] < minimum && upper[axis] < minimum)
                 || (lower[axis] > maximum && upper[axis] > maximum)
             {
-                return (
-                    -2,
-                    [0; 3],
-                    [0; 3],
-                    [false; 3],
-                    [false; 3],
-                );
+                return (-2, [0; 3], [0; 3], [false; 3], [false; 3]);
             }
         }
         let (mut ui_start, start_in) = self.snap_to_mesh_native(lower, dual, full_mesh);
@@ -1541,19 +1497,13 @@ impl Operator {
                     let n = counts[axis] as usize;
                     if ui_stop[axis] > ui_start[axis] {
                         let line = |pos: u32| {
-                            disc_line_value(
-                                &self.base.disc_lines[axis],
-                                n,
-                                pos as usize,
-                                dual,
-                            )
+                            disc_line_value(&self.base.disc_lines[axis], n, pos as usize, dual)
                         };
                         if snap_method == 1 {
                             if line(ui_start[axis]) > lower[axis] && ui_start[axis] > 0 {
                                 ui_start[axis] -= 1;
                             }
-                            if line(ui_stop[axis]) < upper[axis]
-                                && (ui_stop[axis] as usize) < n - 1
+                            if line(ui_stop[axis]) < upper[axis] && (ui_stop[axis] as usize) < n - 1
                             {
                                 ui_stop[axis] += 1;
                             }
@@ -1821,7 +1771,9 @@ impl Operator {
                                 let mut winner_priority = i32::MIN;
                                 let mut winner_coordinate_system =
                                     csxcad_core::grid::CoordinateSystem::Cartesian;
-                                for (priority, excitation, primitive, coordinate_system) in &candidates {
+                                for (priority, excitation, primitive, coordinate_system) in
+                                    &candidates
+                                {
                                     if winner.is_some() && *priority <= winner_priority {
                                         continue;
                                     }
@@ -1999,8 +1951,14 @@ impl Operator {
         // directions carry a sheet and along which tangential direction.
         let mut tan_dir: HashMap<[usize; 3], [i8; 3]> = HashMap::new();
         let mut active: Vec<[usize; 3]> = Vec::new();
-        let mut vv = self.vv_ptr.as_mut().ok_or("vv coefficients not allocated")?;
-        let mut vi = self.vi_ptr.as_mut().ok_or("vi coefficients not allocated")?;
+        let mut vv = self
+            .vv_ptr
+            .as_mut()
+            .ok_or("vv coefficients not allocated")?;
+        let mut vi = self
+            .vi_ptr
+            .as_mut()
+            .ok_or("vi coefficients not allocated")?;
 
         for i in 0..nx {
             for j in 0..ny {
@@ -2009,9 +1967,7 @@ impl Operator {
                     let disabled = (0..3).any(|axis| {
                         pos[axis] <= boundary_size[2 * axis] as usize
                             || pos[axis]
-                                >= counts[axis] as usize
-                                    - boundary_size[2 * axis + 1] as usize
-                                    - 1
+                                >= counts[axis] as usize - boundary_size[2 * axis + 1] as usize - 1
                     });
                     let mut local = [-1i8; 3];
                     let mut any = false;
@@ -2024,23 +1980,13 @@ impl Operator {
                             .properties
                             .conductivity(Some(params))
                             .unwrap_or(0.0);
-                        let thickness = candidate
-                            .properties
-                            .thickness(Some(params))
-                            .unwrap_or(0.0);
+                        let thickness = candidate.properties.thickness(Some(params)).unwrap_or(0.0);
                         let bounds = candidate
                             .primitive
                             .bounding_box(Some(params), false)
                             .unwrap_or([0.0; 6]);
-                        let dimension = candidate
-                            .primitive
-                            .dimension(Some(params))
-                            .unwrap_or(0);
-                        if disabled
-                            || dimension != 2
-                            || sigma <= 0.0
-                            || thickness <= 0.0
-                        {
+                        let dimension = candidate.primitive.dimension(Some(params)).unwrap_or(0);
+                        if disabled || dimension != 2 || sigma <= 0.0 || thickness <= 0.0 {
                             // Native fallback: this edge becomes PEC.
                             *vv.get_mut(n, i, j, k) = 0.0;
                             *vi.get_mut(n, i, j, k) = 0.0;
@@ -2096,10 +2042,7 @@ impl Operator {
                     .properties
                     .conductivity(Some(params))
                     .unwrap_or(0.0);
-                let thickness = candidate
-                    .properties
-                    .thickness(Some(params))
-                    .unwrap_or(0.0);
+                let thickness = candidate.properties.thickness(Some(params)).unwrap_or(0.0);
                 let metric = MeshMetric::new(&disc_lines, counts, grid_delta, self.mesh_type);
                 let edge_length = metric.edge_length(n, pos, false);
                 let node_width = metric.edge_length(t_dir, pos, true);
@@ -2116,10 +2059,7 @@ impl Operator {
                 let mut neighbour = pos;
                 if neighbour[t_dir] > 0 {
                     neighbour[t_dir] -= 1;
-                    let previous = tan_dir
-                        .get(&neighbour)
-                        .map(|map| map[t_dir])
-                        .unwrap_or(-1);
+                    let previous = tan_dir.get(&neighbour).map(|map| map[t_dir]).unwrap_or(-1);
                     if previous < 0 {
                         factor = 2.0;
                     }
@@ -2156,9 +2096,7 @@ impl Operator {
     /// capacitance, the relaxation time the series resistance, and the Lorentz
     /// pole frequency the resonant element. Cells active at different orders
     /// share one position list; per-order coefficients are zero where inactive.
-    pub fn build_lorentz_extension(
-        &mut self,
-    ) -> Result<Option<EngineExtLorentzMaterial>, String> {
+    pub fn build_lorentz_extension(&mut self) -> Result<Option<EngineExtLorentzMaterial>, String> {
         let Some(structure) = self.structure.as_ref() else {
             return Ok(None);
         };
@@ -2285,13 +2223,8 @@ impl Operator {
                         for n in 0..3 {
                             // ----- electric side -----
                             let vi = self.vi_at(n, pos);
-                            let coordinate = yee_coordinates(
-                                &self.base.disc_lines,
-                                counts,
-                                n,
-                                pos,
-                                false,
-                            );
+                            let coordinate =
+                                yee_coordinates(&self.base.disc_lines, counts, n, pos, false);
                             let index = Self::ec_index(n, i, j, k, counts);
                             if vi != 0.0 {
                                 if let Some(candidate) = material_at(coordinate) {
@@ -2333,12 +2266,11 @@ impl Operator {
                                         c_l = 1.0 / (w_lor * w_lor * l_d);
                                     }
                                     if l_d > 0.0 {
-                                        coefficients.v_int[n] =
-                                            ((2.0 * l_d - dt * r_d) / (2.0 * l_d + dt * r_d))
-                                                as FDTD_FLOAT;
+                                        coefficients.v_int[n] = ((2.0 * l_d - dt * r_d)
+                                            / (2.0 * l_d + dt * r_d))
+                                            as FDTD_FLOAT;
                                         coefficients.v_ext[n] =
-                                            (dt / (l_d + dt * r_d / 2.0) * vi as f64)
-                                                as FDTD_FLOAT;
+                                            (dt / (l_d + dt * r_d / 2.0) * vi as f64) as FDTD_FLOAT;
                                     }
                                     if c_l > 0.0 {
                                         coefficients.v_lor[n] =
@@ -2349,13 +2281,8 @@ impl Operator {
 
                             // ----- magnetic side -----
                             let iv = self.iv_at(n, pos);
-                            let coordinate = yee_coordinates(
-                                &self.base.disc_lines,
-                                counts,
-                                n,
-                                pos,
-                                true,
-                            );
+                            let coordinate =
+                                yee_coordinates(&self.base.disc_lines, counts, n, pos, true);
                             if iv != 0.0 {
                                 if let Some(candidate) = material_at(coordinate) {
                                     let w_plasma = parameter(
@@ -2396,12 +2323,11 @@ impl Operator {
                                         l_l = 1.0 / (w_lor * w_lor * c_d);
                                     }
                                     if c_d > 0.0 {
-                                        coefficients.i_int[n] =
-                                            ((2.0 * c_d - dt * g_d) / (2.0 * c_d + dt * g_d))
-                                                as FDTD_FLOAT;
+                                        coefficients.i_int[n] = ((2.0 * c_d - dt * g_d)
+                                            / (2.0 * c_d + dt * g_d))
+                                            as FDTD_FLOAT;
                                         coefficients.i_ext[n] =
-                                            (dt / (c_d + dt * g_d / 2.0) * iv as f64)
-                                                as FDTD_FLOAT;
+                                            (dt / (c_d + dt * g_d / 2.0) * iv as f64) as FDTD_FLOAT;
                                     }
                                     if l_l > 0.0 {
                                         coefficients.i_lor[n] =
@@ -2465,9 +2391,7 @@ impl Operator {
     /// count comes from the properties, each edge samples the highest-priority
     /// containing material, and a pole whose relaxation time is shorter than
     /// three timesteps is skipped (the trapezoidal update is not stable).
-    pub fn build_debye_extension(
-        &mut self,
-    ) -> Result<Option<EngineExtDebyeMaterial>, String> {
+    pub fn build_debye_extension(&mut self) -> Result<Option<EngineExtDebyeMaterial>, String> {
         let Some(structure) = self.structure.as_ref() else {
             return Ok(None);
         };
@@ -2548,23 +2472,24 @@ impl Operator {
                 for k in 0..counts[2] as usize {
                     let pos = [i, j, k];
                     let mut any = false;
-                    let mut cell_relax: [Vec<f64>; 3] =
-                        [vec![0.0; pole_count], vec![0.0; pole_count], vec![0.0; pole_count]];
-                    let mut cell_drive: [Vec<f64>; 3] =
-                        [vec![0.0; pole_count], vec![0.0; pole_count], vec![0.0; pole_count]];
+                    let mut cell_relax: [Vec<f64>; 3] = [
+                        vec![0.0; pole_count],
+                        vec![0.0; pole_count],
+                        vec![0.0; pole_count],
+                    ];
+                    let mut cell_drive: [Vec<f64>; 3] = [
+                        vec![0.0; pole_count],
+                        vec![0.0; pole_count],
+                        vec![0.0; pole_count],
+                    ];
                     let mut cell_solve = [1.0f64; 3];
                     for n in 0..3 {
                         let vi = self.vi_at(n, pos);
                         if vi == 0.0 {
                             continue;
                         }
-                        let coordinate = yee_coordinates(
-                            &self.base.disc_lines,
-                            counts,
-                            n,
-                            pos,
-                            false,
-                        );
+                        let coordinate =
+                            yee_coordinates(&self.base.disc_lines, counts, n, pos, false);
                         let Some(candidate) = debye_at(coordinate) else {
                             continue;
                         };
@@ -2644,10 +2569,14 @@ impl Operator {
         for index in 0..positions.len() {
             extension.set_position(index, positions[index]);
             for n in 0..3 {
-                let relax_f32: Vec<FDTD_FLOAT> =
-                    relax[index][n].iter().map(|&value| value as FDTD_FLOAT).collect();
-                let drive_f32: Vec<FDTD_FLOAT> =
-                    drive[index][n].iter().map(|&value| value as FDTD_FLOAT).collect();
+                let relax_f32: Vec<FDTD_FLOAT> = relax[index][n]
+                    .iter()
+                    .map(|&value| value as FDTD_FLOAT)
+                    .collect();
+                let drive_f32: Vec<FDTD_FLOAT> = drive[index][n]
+                    .iter()
+                    .map(|&value| value as FDTD_FLOAT)
+                    .collect();
                 extension.set_position_component(
                     index,
                     n,
@@ -2712,9 +2641,8 @@ impl Operator {
         // Otherwise solve the dispersion relation with Newton's method.
         let k0 = std::f64::consts::TAU * frequency / c0;
         let mut k = k0;
-        let rhs = (std::f64::consts::TAU * frequency * self.base.d_t / 2.0).sin()
-            / c0
-            / self.base.d_t;
+        let rhs =
+            (std::f64::consts::TAU * frequency * self.base.d_t / 2.0).sin() / c0 / self.base.d_t;
         let rhs = rhs * rhs;
         let mut old_phase_velocity = 0.0f64;
         let mut phase_velocity = c0;
@@ -2742,9 +2670,7 @@ impl Operator {
             }
             phase_velocity = std::f64::consts::TAU * frequency / k;
             if iterations > 99 {
-                eprintln!(
-                    "[openEMS] CalcNumericPhaseVelocity: Newton iteration did not converge"
-                );
+                eprintln!("[openEMS] CalcNumericPhaseVelocity: Newton iteration did not converge");
                 break;
             }
         }
@@ -2816,10 +2742,9 @@ impl Operator {
             return Ok(None);
         };
 
-        let norm = (prop_dir[0] * prop_dir[0]
-            + prop_dir[1] * prop_dir[1]
-            + prop_dir[2] * prop_dir[2])
-            .sqrt();
+        let norm =
+            (prop_dir[0] * prop_dir[0] + prop_dir[1] * prop_dir[1] + prop_dir[2] * prop_dir[2])
+                .sqrt();
         if norm == 0.0 {
             eprintln!("[openEMS] TFSF: plane wave propagation direction is zero; disabled");
             return Ok(None);
@@ -2957,17 +2882,15 @@ impl Operator {
                             false,
                         );
                         let distance = (0..3)
-                            .map(|axis| {
-                                ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs()
-                            })
+                            .map(|axis| ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs())
                             .sum::<f64>();
                         let delay = distance * unit / phase_velocity / dt;
                         max_delay = max_delay.max(delay as u32);
                         extension.curr_delay[n][0][1][ui_pos] = delay.floor() as u32;
                         extension.curr_delay_delta[n][0][1][ui_pos] =
                             (delay - delay.floor()) as FDTD_FLOAT;
-                        extension.curr_amp[n][0][1][ui_pos] = (e_amp[n_p]
-                            * self.metric().edge_length(n_p, pos, false)) as FDTD_FLOAT;
+                        extension.curr_amp[n][0][1][ui_pos] =
+                            (e_amp[n_p] * self.metric().edge_length(n_p, pos, false)) as FDTD_FLOAT;
 
                         let coordinate = yee_coordinates(
                             &self.base.disc_lines,
@@ -2977,9 +2900,7 @@ impl Operator {
                             false,
                         );
                         let distance = (0..3)
-                            .map(|axis| {
-                                ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs()
-                            })
+                            .map(|axis| ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs())
                             .sum::<f64>();
                         let delay = distance * unit / phase_velocity / dt;
                         max_delay = max_delay.max(delay as u32);
@@ -2987,7 +2908,8 @@ impl Operator {
                         extension.curr_delay_delta[n][0][0][ui_pos] =
                             (delay - delay.floor()) as FDTD_FLOAT;
                         extension.curr_amp[n][0][0][ui_pos] = (e_amp[n_pp]
-                            * self.metric().edge_length(n_pp, pos, false)) as FDTD_FLOAT;
+                            * self.metric().edge_length(n_pp, pos, false))
+                            as FDTD_FLOAT;
 
                         if pos[n] > 0 {
                             pos[n] -= 1;
@@ -3008,17 +2930,15 @@ impl Operator {
                             false,
                         );
                         let distance = (0..3)
-                            .map(|axis| {
-                                ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs()
-                            })
+                            .map(|axis| ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs())
                             .sum::<f64>();
                         let delay = distance * unit / phase_velocity / dt;
                         max_delay = max_delay.max(delay as u32);
                         extension.curr_delay[n][1][1][ui_pos] = delay.floor() as u32;
                         extension.curr_delay_delta[n][1][1][ui_pos] =
                             (delay - delay.floor()) as FDTD_FLOAT;
-                        extension.curr_amp[n][1][1][ui_pos] = (e_amp[n_p]
-                            * self.metric().edge_length(n_p, pos, false)) as FDTD_FLOAT;
+                        extension.curr_amp[n][1][1][ui_pos] =
+                            (e_amp[n_p] * self.metric().edge_length(n_p, pos, false)) as FDTD_FLOAT;
 
                         let coordinate = yee_coordinates(
                             &self.base.disc_lines,
@@ -3028,9 +2948,7 @@ impl Operator {
                             false,
                         );
                         let distance = (0..3)
-                            .map(|axis| {
-                                ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs()
-                            })
+                            .map(|axis| ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs())
                             .sum::<f64>();
                         let delay = distance * unit / phase_velocity / dt;
                         max_delay = max_delay.max(delay as u32);
@@ -3038,7 +2956,8 @@ impl Operator {
                         extension.curr_delay_delta[n][1][0][ui_pos] =
                             (delay - delay.floor()) as FDTD_FLOAT;
                         extension.curr_amp[n][1][0][ui_pos] = (e_amp[n_pp]
-                            * self.metric().edge_length(n_pp, pos, false)) as FDTD_FLOAT;
+                            * self.metric().edge_length(n_pp, pos, false))
+                            as FDTD_FLOAT;
 
                         let iv_p = self.iv_at(n_p, pos);
                         let iv_pp = self.iv_at(n_pp, pos);
@@ -3080,17 +2999,15 @@ impl Operator {
                             true,
                         );
                         let distance = (0..3)
-                            .map(|axis| {
-                                ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs()
-                            })
+                            .map(|axis| ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs())
                             .sum::<f64>();
                         let delay = distance * unit / phase_velocity / dt + 1.0;
                         max_delay = max_delay.max(delay as u32);
                         extension.volt_delay[n][0][1][ui_pos] = delay.floor() as u32;
                         extension.volt_delay_delta[n][0][1][ui_pos] =
                             (delay - delay.floor()) as FDTD_FLOAT;
-                        extension.volt_amp[n][0][1][ui_pos] = (h_amp[n_p]
-                            * self.metric().edge_length(n_p, pos, true)) as FDTD_FLOAT;
+                        extension.volt_amp[n][0][1][ui_pos] =
+                            (h_amp[n_p] * self.metric().edge_length(n_p, pos, true)) as FDTD_FLOAT;
 
                         let coordinate = yee_coordinates(
                             &self.base.disc_lines,
@@ -3100,9 +3017,7 @@ impl Operator {
                             true,
                         );
                         let distance = (0..3)
-                            .map(|axis| {
-                                ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs()
-                            })
+                            .map(|axis| ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs())
                             .sum::<f64>();
                         let delay = distance * unit / phase_velocity / dt + 1.0;
                         max_delay = max_delay.max(delay as u32);
@@ -3110,7 +3025,8 @@ impl Operator {
                         extension.volt_delay_delta[n][0][0][ui_pos] =
                             (delay - delay.floor()) as FDTD_FLOAT;
                         extension.volt_amp[n][0][0][ui_pos] = (h_amp[n_pp]
-                            * self.metric().edge_length(n_pp, pos, true)) as FDTD_FLOAT;
+                            * self.metric().edge_length(n_pp, pos, true))
+                            as FDTD_FLOAT;
 
                         pos[n] += 1;
                         let vi_p = self.vi_at(n_p, pos);
@@ -3129,17 +3045,15 @@ impl Operator {
                             true,
                         );
                         let distance = (0..3)
-                            .map(|axis| {
-                                ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs()
-                            })
+                            .map(|axis| ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs())
                             .sum::<f64>();
                         let delay = distance * unit / phase_velocity / dt + 1.0;
                         max_delay = max_delay.max(delay as u32);
                         extension.volt_delay[n][1][1][ui_pos] = delay.floor() as u32;
                         extension.volt_delay_delta[n][1][1][ui_pos] =
                             (delay - delay.floor()) as FDTD_FLOAT;
-                        extension.volt_amp[n][1][1][ui_pos] = (h_amp[n_p]
-                            * self.metric().edge_length(n_p, pos, true)) as FDTD_FLOAT;
+                        extension.volt_amp[n][1][1][ui_pos] =
+                            (h_amp[n_p] * self.metric().edge_length(n_p, pos, true)) as FDTD_FLOAT;
 
                         let coordinate = yee_coordinates(
                             &self.base.disc_lines,
@@ -3149,9 +3063,7 @@ impl Operator {
                             true,
                         );
                         let distance = (0..3)
-                            .map(|axis| {
-                                ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs()
-                            })
+                            .map(|axis| ((coordinate[axis] - origin[axis]) * prop_dir[axis]).abs())
                             .sum::<f64>();
                         let delay = distance * unit / phase_velocity / dt + 1.0;
                         max_delay = max_delay.max(delay as u32);
@@ -3159,7 +3071,8 @@ impl Operator {
                         extension.volt_delay_delta[n][1][0][ui_pos] =
                             (delay - delay.floor()) as FDTD_FLOAT;
                         extension.volt_amp[n][1][0][ui_pos] = (h_amp[n_pp]
-                            * self.metric().edge_length(n_pp, pos, true)) as FDTD_FLOAT;
+                            * self.metric().edge_length(n_pp, pos, true))
+                            as FDTD_FLOAT;
 
                         let vi_p = self.vi_at(n_p, pos);
                         let vi_pp = self.vi_at(n_pp, pos);
@@ -3301,7 +3214,10 @@ impl Operator {
 
             let mut boxes = Vec::new();
             for primitive in property.primitives() {
-                if matches!(primitive.shape(), csxcad_core::model::PrimitiveShape::Box(_)) {
+                if matches!(
+                    primitive.shape(),
+                    csxcad_core::model::PrimitiveShape::Box(_)
+                ) {
                     boxes.push((primitive.priority(), primitive.clone()));
                 } else {
                     eprintln!(
@@ -3362,9 +3278,7 @@ impl Operator {
                     continue;
                 }
                 if ui_start[dir] == ui_stop[dir] {
-                    eprintln!(
-                        "[openEMS] Warning: lumped RLC has zero snapped length; skipped"
-                    );
+                    eprintln!("[openEMS] Warning: lumped RLC has zero snapped length; skipped");
                     continue;
                 }
 
@@ -3393,7 +3307,8 @@ impl Operator {
                         pos[dir_p1] = first as usize;
                         for second in ui_start[dir_p2]..=ui_stop[dir_p2] {
                             pos[dir_p2] = second as usize;
-                            let index = Self::ec_index(dir, pos[0], pos[1], pos[2], self.base.num_lines);
+                            let index =
+                                Self::ec_index(dir, pos[0], pos[1], pos[2], self.base.num_lines);
                             if index >= self.ec_c.len() {
                                 continue;
                             }
@@ -3436,12 +3351,11 @@ impl Operator {
                                     );
                                     self.ec_c[index] = capacitance as FDTD_FLOAT;
                                     let series = series.expect("series coefficients built above");
-                                    let update =
-                                        crate::lumped_rlc::series_update_coefficients(
-                                            dt,
-                                            capacitance,
-                                            &series,
-                                        );
+                                    let update = crate::lumped_rlc::series_update_coefficients(
+                                        dt,
+                                        capacitance,
+                                        &series,
+                                    );
                                     coeffs.vv2 = update.vv2 as FDTD_FLOAT;
                                     coeffs.vj1 = update.vj1 as FDTD_FLOAT;
                                     coeffs.vj2 = update.vj2 as FDTD_FLOAT;
@@ -3471,18 +3385,12 @@ impl Operator {
                                     if cap_pos[transverse] < ui_stop[transverse] as usize {
                                         if let Some(vv) = self.vv_ptr.as_mut() {
                                             *vv.get_mut(
-                                                transverse,
-                                                cap_pos[0],
-                                                cap_pos[1],
-                                                cap_pos[2],
+                                                transverse, cap_pos[0], cap_pos[1], cap_pos[2],
                                             ) = 0.0;
                                         }
                                         if let Some(vi) = self.vi_ptr.as_mut() {
                                             *vi.get_mut(
-                                                transverse,
-                                                cap_pos[0],
-                                                cap_pos[1],
-                                                cap_pos[2],
+                                                transverse, cap_pos[0], cap_pos[1], cap_pos[2],
                                             ) = 0.0;
                                         }
                                     }
@@ -3514,23 +3422,14 @@ impl Operator {
             return None;
         }
         let counts = self.base.num_lines;
-        let num_lines = [
-            counts[0] as usize,
-            counts[1] as usize,
-            counts[2] as usize,
-        ];
+        let num_lines = [counts[0] as usize, counts[1] as usize, counts[2] as usize];
         let energy_lines = [
             self.get_number_of_lines(0, false) as usize,
             self.get_number_of_lines(1, false) as usize,
             self.get_number_of_lines(2, false) as usize,
         ];
-        let center = [
-            num_lines[0] / 2,
-            num_lines[1] / 2,
-            num_lines[2] / 2,
-        ];
-        let mut extension =
-            EngineExtSteadyState::with_num_lines(period_ts as usize, energy_lines);
+        let center = [num_lines[0] / 2, num_lines[1] / 2, num_lines[2] / 2];
+        let mut extension = EngineExtSteadyState::with_num_lines(period_ts as usize, energy_lines);
         for component in 0..3 {
             extension.add_e_probe(center, component);
         }
@@ -3614,10 +3513,22 @@ impl Operator {
             self.base.m_bg_kappa,
         );
 
-        let vv = self.vv_ptr.as_mut().ok_or("vv coefficients not allocated")?;
-        let vi = self.vi_ptr.as_mut().ok_or("vi coefficients not allocated")?;
-        let ii = self.ii_ptr.as_mut().ok_or("ii coefficients not allocated")?;
-        let iv = self.iv_ptr.as_mut().ok_or("iv coefficients not allocated")?;
+        let vv = self
+            .vv_ptr
+            .as_mut()
+            .ok_or("vv coefficients not allocated")?;
+        let vi = self
+            .vi_ptr
+            .as_mut()
+            .ok_or("vi coefficients not allocated")?;
+        let ii = self
+            .ii_ptr
+            .as_mut()
+            .ok_or("ii coefficients not allocated")?;
+        let iv = self
+            .iv_ptr
+            .as_mut()
+            .ok_or("iv coefficients not allocated")?;
 
         let mut extensions = Vec::new();
         let debug_upml = std::env::var_os("OPENEMS_DEBUG_UPML").is_some();
@@ -3644,20 +3555,9 @@ impl Operator {
                     for l2 in 0..local[2] {
                         let pos = [start[0] + l0, start[1] + l1, start[2] + l2];
                         for n in 0..3usize {
-                            let (eps_r, mue_r, kappa) = material_full_value(
-                                material_grid,
-                                counts,
-                                background,
-                                n,
-                                pos,
-                            );
-                            let (kappa_v, kappa_i) = upml_grading_kappa(
-                                &metric,
-                                bc,
-                                sizes,
-                                n,
-                                pos,
-                            );
+                            let (eps_r, mue_r, kappa) =
+                                material_full_value(material_grid, counts, background, n, pos);
+                            let (kappa_v, kappa_i) = upml_grading_kappa(&metric, bc, sizes, n, pos);
                             let n_p = (n + 1) % 3;
                             let n_pp = (n + 2) % 3;
                             let edge_len = metric.edge_length(n, pos, false);
@@ -3676,8 +3576,8 @@ impl Operator {
                                 enabled_cells += 1;
                                 let denom = 2.0 * EPS0 + kappa_v[n_p] * dt;
                                 let vv_new = ((2.0 * EPS0 - kappa_v[n_p] * dt) / denom) as f32;
-                                let vi_new = ((2.0 * EPS0 * dt) / denom * edge_len / edge_area)
-                                    as f32;
+                                let vi_new =
+                                    ((2.0 * EPS0 * dt) / denom * edge_len / edge_area) as f32;
                                 *vv.get_mut(n, pos[0], pos[1], pos[2]) = vv_new;
                                 *vi.get_mut(n, pos[0], pos[1], pos[2]) = vi_new;
                                 let denom_pp = 2.0 * EPS0 + kappa_v[n_pp] * dt;
@@ -3685,11 +3585,9 @@ impl Operator {
                                 *extension.vv[n].get_mut(0, l0, l1, l2) =
                                     ((2.0 * EPS0 - kappa_v[n_pp] * dt) / denom_pp) as f32;
                                 *extension.vvfn[n].get_mut(0, l0, l1, l2) =
-                                    ((2.0 * EPS0 + kappa_v[n] * dt) / denom_pp / eps_scale)
-                                        as f32;
+                                    ((2.0 * EPS0 + kappa_v[n] * dt) / denom_pp / eps_scale) as f32;
                                 *extension.vvfo[n].get_mut(0, l0, l1, l2) =
-                                    ((2.0 * EPS0 - kappa_v[n] * dt) / denom_pp / eps_scale)
-                                        as f32;
+                                    ((2.0 * EPS0 - kappa_v[n] * dt) / denom_pp / eps_scale) as f32;
                             } else {
                                 disabled_cells += 1;
                                 *extension.vv[n].get_mut(0, l0, l1, l2) = main_vv;
@@ -3701,14 +3599,11 @@ impl Operator {
                             let main_ii = *ii.get(n, pos[0], pos[1], pos[2]);
                             let main_iv = *iv.get(n, pos[0], pos[1], pos[2]);
                             let kappa_i_sum = kappa_i[0] + kappa_i[1] + kappa_i[2];
-                            if kappa_i_sum != 0.0
-                                && main_ii + main_iv != 0.0
-                                && dual_area > 0.0
-                            {
+                            if kappa_i_sum != 0.0 && main_ii + main_iv != 0.0 && dual_area > 0.0 {
                                 let denom = 2.0 * EPS0 + kappa_i[n_p] * dt;
                                 let ii_new = ((2.0 * EPS0 - kappa_i[n_p] * dt) / denom) as f32;
-                                let iv_new = ((2.0 * EPS0 * dt) / denom * dual_len / dual_area)
-                                    as f32;
+                                let iv_new =
+                                    ((2.0 * EPS0 * dt) / denom * dual_len / dual_area) as f32;
                                 *ii.get_mut(n, pos[0], pos[1], pos[2]) = ii_new;
                                 *iv.get_mut(n, pos[0], pos[1], pos[2]) = iv_new;
                                 let denom_pp = 2.0 * EPS0 + kappa_i[n_pp] * dt;
@@ -3716,11 +3611,9 @@ impl Operator {
                                 *extension.ii[n].get_mut(0, l0, l1, l2) =
                                     ((2.0 * EPS0 - kappa_i[n_pp] * dt) / denom_pp) as f32;
                                 *extension.iifn[n].get_mut(0, l0, l1, l2) =
-                                    ((2.0 * EPS0 + kappa_i[n] * dt) / denom_pp / mue_scale)
-                                        as f32;
+                                    ((2.0 * EPS0 + kappa_i[n] * dt) / denom_pp / mue_scale) as f32;
                                 *extension.iifo[n].get_mut(0, l0, l1, l2) =
-                                    ((2.0 * EPS0 - kappa_i[n] * dt) / denom_pp / mue_scale)
-                                        as f32;
+                                    ((2.0 * EPS0 - kappa_i[n] * dt) / denom_pp / mue_scale) as f32;
                             } else {
                                 *extension.ii[n].get_mut(0, l0, l1, l2) = main_ii;
                                 *ii.get_mut(n, pos[0], pos[1], pos[2]) = 0.0;
@@ -3741,7 +3634,6 @@ impl Operator {
         Ok(extensions)
     }
 }
-
 
 /// Material (eps_r, mue_r, kappa) for a component at a mesh position.
 fn material_full_value(
@@ -3934,12 +3826,7 @@ fn weighted_term(terms: &[Option<f64>; 4]) -> Option<f64> {
 
 /// Raw (non-dual) mesh delta for a node index, matching native
 /// `Operator::GetRawDiscDelta`: the spacing after `index`, mirrored at the ends.
-fn raw_disc_delta(
-    lines: &[Option<Vec<f64>>; 3],
-    counts: [u32; 3],
-    axis: usize,
-    index: i64,
-) -> f64 {
+fn raw_disc_delta(lines: &[Option<Vec<f64>>; 3], counts: [u32; 3], axis: usize, index: i64) -> f64 {
     let Some(values) = lines.get(axis).and_then(|entry| entry.as_ref()) else {
         return 0.0;
     };
@@ -3990,8 +3877,6 @@ fn edge_length_value(
     disc_delta_value(&lines[n], counts[n] as usize, pos[n], dual) * grid_delta
 }
 
-
-
 impl Default for Operator {
     fn default() -> Self {
         Self::new()
@@ -4039,12 +3924,7 @@ impl OperatorBase for Operator {
         // the duplicated seam lines from post-processing and the energy estimate
         if !full
             && axis == 1
-            && matches!(
-                self.mesh_type,
-                MeshType::Cylindrical {
-                    closed_alpha: true
-                }
-            )
+            && matches!(self.mesh_type, MeshType::Cylindrical { closed_alpha: true })
         {
             return self.base.num_lines[1].saturating_sub(2);
         }
@@ -4241,11 +4121,7 @@ impl OperatorBase for Operator {
         0.0
     }
 
-    fn get_cell_center_material_avg_coord_uint(
-        &self,
-        pos: [u32; 3],
-        coord: &mut [f64; 3],
-    ) -> bool {
+    fn get_cell_center_material_avg_coord_uint(&self, pos: [u32; 3], coord: &mut [f64; 3]) -> bool {
         let grid_delta = self.base.grid_delta;
         if grid_delta <= 0.0 {
             return false;
@@ -4256,11 +4132,7 @@ impl OperatorBase for Operator {
         true
     }
 
-    fn get_cell_center_material_avg_coord_int(
-        &self,
-        pos: [i32; 3],
-        coord: &mut [f64; 3],
-    ) -> bool {
+    fn get_cell_center_material_avg_coord_int(&self, pos: [i32; 3], coord: &mut [f64; 3]) -> bool {
         let grid_delta = self.base.grid_delta;
         if grid_delta <= 0.0 {
             return false;
@@ -4614,13 +4486,25 @@ mod tests {
         // E-y edge at node (5,5,5): transverse x samples at 4.75 and 5.25,
         // so exactly two of the four quarter cells are in eps=4.
         let index = 1 * (op.base.num_lines[0] as usize) * ny * nz + 5 * ny * nz + 5 * nz + 5;
-        assert!((grid[index].eps_r - 2.5).abs() < 1e-12, "eps={}", grid[index].eps_r);
+        assert!(
+            (grid[index].eps_r - 2.5).abs() < 1e-12,
+            "eps={}",
+            grid[index].eps_r
+        );
         // Far inside the half space all four quarter cells are eps=4.
         let inside = 1 * (op.base.num_lines[0] as usize) * ny * nz + 7 * ny * nz + 5 * nz + 5;
-        assert!((grid[inside].eps_r - 4.0).abs() < 1e-12, "eps={}", grid[inside].eps_r);
+        assert!(
+            (grid[inside].eps_r - 4.0).abs() < 1e-12,
+            "eps={}",
+            grid[inside].eps_r
+        );
         // Far outside stays at the background.
         let outside = 1 * (op.base.num_lines[0] as usize) * ny * nz + 2 * ny * nz + 5 * nz + 5;
-        assert!((grid[outside].eps_r - 1.0).abs() < 1e-12, "eps={}", grid[outside].eps_r);
+        assert!(
+            (grid[outside].eps_r - 1.0).abs() < 1e-12,
+            "eps={}",
+            grid[outside].eps_r
+        );
     }
 
     #[test]
@@ -4650,7 +4534,10 @@ mod tests {
         for face in &extension.faces {
             assert_eq!(face.coeff_p.len(), face.dims_p * face.dims_pp);
             assert_eq!(face.coeff_pp.len(), face.dims_p * face.dims_pp);
-            assert!(face.coeff_p.iter().all(|coefficient| coefficient.abs() < 1.0));
+            assert!(face
+                .coeff_p
+                .iter()
+                .all(|coefficient| coefficient.abs() < 1.0));
             assert!(face
                 .coeff_pp
                 .iter()
@@ -4718,9 +4605,7 @@ mod tests {
         assert!((op.get_edge_length(0, [3, 0, 0], false) - 3.0e-3).abs() < 1e-15);
         assert!((op.get_edge_length(1, [0, 0, 0], false) - 2.0e-3).abs() < 1e-15);
         assert!((op.get_edge_length(2, [0, 0, 0], false) - 5.0e-3).abs() < 1e-15);
-        assert!(
-            (op.get_edge_area(0, [0, 0, 0], false) - 2.0e-3 * 5.0e-3).abs() < 1e-18
-        );
+        assert!((op.get_edge_area(0, [0, 0, 0], false) - 2.0e-3 * 5.0e-3).abs() < 1e-18);
 
         // EC_C uses area/length, so vi_y / vi_x equals c_x / c_y for vacuum.
         op.base.d_t = 1.0e-15;
@@ -4740,7 +4625,6 @@ mod tests {
         assert!(dt > 0.0 && dt.is_finite(), "CFL timestep = {dt}");
     }
 }
-
 
 #[cfg(test)]
 mod timestep_tests {
@@ -5200,7 +5084,9 @@ mod lumped_rlc_tests {
                </LumpedElement>"#,
         );
         let mut op = operator(&xml);
-        op.build_lumped_rlc_extension(10.0e9).unwrap().expect("active");
+        op.build_lumped_rlc_extension(10.0e9)
+            .unwrap()
+            .expect("active");
         let vv = op.vv_ptr.as_ref().unwrap();
         // Transverse edges on both end planes are shorted.
         for plane in [5usize, 10] {
@@ -5258,12 +5144,8 @@ mod tfsf_tests {
 
         // First current sample on the lower x face: origin is one line before
         // the box, the Yee coordinate adds half a cell in the edge direction.
-        let velocity = op.calc_numeric_phase_velocity(
-            [5, 0, 0],
-            [15, 20, 20],
-            [1.0, 0.0, 0.0],
-            1.0e10,
-        );
+        let velocity =
+            op.calc_numeric_phase_velocity([5, 0, 0], [15, 20, 20], [1.0, 0.0, 0.0], 1.0e10);
         let distance = 1.0e-3;
         let expected_delay = distance / velocity / op.base.d_t;
         let delay = extension.curr_delay[0][0][1][0];
@@ -5294,12 +5176,8 @@ mod tfsf_tests {
         let mut op = Operator::new();
         op.load_csx(&plane_wave_mesh()).expect("CSX should load");
         op.calc_timestep();
-        let velocity = op.calc_numeric_phase_velocity(
-            [5, 5, 5],
-            [15, 15, 15],
-            [1.0, 0.0, 0.0],
-            1.0e10,
-        );
+        let velocity =
+            op.calc_numeric_phase_velocity([5, 5, 5], [15, 15, 15], [1.0, 0.0, 0.0], 1.0e10);
         // Numerical dispersion slows the wave down, but only slightly at 15
         // cells per wavelength.
         assert!(velocity > 0.9 * C0 && velocity <= C0, "v={velocity:e}");
@@ -5358,105 +5236,105 @@ mod debye_tests {
             .expect("centre cell present");
         let dt = op.base.d_t;
         assert!(relax_time > 3.0 * dt);
-            let mut volt = FieldArray::new("volt", [5, 5, 5]);
-            let curr = FieldArray::new("curr", [5, 5, 5]);
-            let steps = (30.0 * relax_time / dt) as usize;
-            let mut history = Vec::with_capacity(steps);
-            for _ in 0..steps {
-                // Pre reads the field left by the previous Apply2, exactly as
-                // the engine does.
-                extension.do_pre_voltage_updates(&mut volt, &curr);
-                // Fixed raw voltage: the main update would write this value.
-                *volt.get_mut(0, 2, 2, 2) = 1.0;
-                extension.do_post_voltage_updates(&mut volt, &curr);
-                extension.apply2_voltages(&mut volt, &curr);
-                history.push(extension.volt_pole_ade[0][0][index] as f64);
+        let mut volt = FieldArray::new("volt", [5, 5, 5]);
+        let curr = FieldArray::new("curr", [5, 5, 5]);
+        let steps = (30.0 * relax_time / dt) as usize;
+        let mut history = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            // Pre reads the field left by the previous Apply2, exactly as
+            // the engine does.
+            extension.do_pre_voltage_updates(&mut volt, &curr);
+            // Fixed raw voltage: the main update would write this value.
+            *volt.get_mut(0, 2, 2, 2) = 1.0;
+            extension.do_post_voltage_updates(&mut volt, &curr);
+            extension.apply2_voltages(&mut volt, &curr);
+            history.push(extension.volt_pole_ade[0][0][index] as f64);
+        }
+
+        // The pole state obeys W[n+1] = a W[n] + d V[n] with
+        // a = (2 tau - dt)/(2 tau + dt) and d = C_L vi/(2 tau + dt).
+        let relax = extension.v_relax_ade[0][0][index] as f64;
+        let drive = extension.v_drive_ade[0][0][index] as f64;
+        let expected_relax = (2.0 * relax_time - dt) / (2.0 * relax_time + dt);
+        assert!(
+            (relax - expected_relax).abs() < 1.0e-6,
+            "relax coefficient {relax:e} vs analytic {expected_relax:e}"
+        );
+
+        // Steady pole state for a constant drive. The pole is advanced
+        // twice per step (pre with V^n, post with V^(n+1)), so the
+        // trapezoidal recurrence is W[n+1] = a W[n] + d (V^n + V^(n+1))
+        // and the steady state is 2 d / (1 - a) = delta_eps / eps_inf.
+        let steady = history[steps - 1];
+        let expected_steady = 2.0 * drive / (1.0 - relax);
+        assert!(
+            (steady - expected_steady).abs() / expected_steady < 1.0e-6,
+            "steady pole state {steady:e} vs analytic {expected_steady:e}"
+        );
+        assert!(
+            (expected_steady / epsilon_delta - 1.0).abs() < 1.0e-6,
+            "static polarization ratio {expected_steady:e} vs delta_eps {epsilon_delta:e}"
+        );
+
+        // Exponential approach with the pole time constant.
+        // Keep the fit away from the f32 noise floor of the pole state.
+        let first = steps / 10;
+        let last = steps / 3;
+        let mut sum_t = 0.0;
+        let mut sum_y = 0.0;
+        let mut sum_tt = 0.0;
+        let mut sum_ty = 0.0;
+        let mut count = 0.0;
+        for step in first..last {
+            let value = (history[step] - steady).abs();
+            if value <= 1.0e-30 {
+                continue;
             }
-
-            // The pole state obeys W[n+1] = a W[n] + d V[n] with
-            // a = (2 tau - dt)/(2 tau + dt) and d = C_L vi/(2 tau + dt).
-            let relax = extension.v_relax_ade[0][0][index] as f64;
-            let drive = extension.v_drive_ade[0][0][index] as f64;
-            let expected_relax = (2.0 * relax_time - dt) / (2.0 * relax_time + dt);
-            assert!(
-                (relax - expected_relax).abs() < 1.0e-6,
-                "relax coefficient {relax:e} vs analytic {expected_relax:e}"
-            );
-
-            // Steady pole state for a constant drive. The pole is advanced
-            // twice per step (pre with V^n, post with V^(n+1)), so the
-            // trapezoidal recurrence is W[n+1] = a W[n] + d (V^n + V^(n+1))
-            // and the steady state is 2 d / (1 - a) = delta_eps / eps_inf.
-            let steady = history[steps - 1];
-            let expected_steady = 2.0 * drive / (1.0 - relax);
-            assert!(
-                (steady - expected_steady).abs() / expected_steady < 1.0e-6,
-                "steady pole state {steady:e} vs analytic {expected_steady:e}"
-            );
-            assert!(
-                (expected_steady / epsilon_delta - 1.0).abs() < 1.0e-6,
-                "static polarization ratio {expected_steady:e} vs delta_eps {epsilon_delta:e}"
-            );
-
-            // Exponential approach with the pole time constant.
-            // Keep the fit away from the f32 noise floor of the pole state.
-            let first = steps / 10;
-            let last = steps / 3;
-            let mut sum_t = 0.0;
-            let mut sum_y = 0.0;
-            let mut sum_tt = 0.0;
-            let mut sum_ty = 0.0;
-            let mut count = 0.0;
-            for step in first..last {
-                let value = (history[step] - steady).abs();
-                if value <= 1.0e-30 {
-                    continue;
-                }
-                let t = step as f64 * dt;
-                let y = value.ln();
-                sum_t += t;
-                sum_y += y;
-                sum_tt += t * t;
-                sum_ty += t * y;
-                count += 1.0;
-            }
-            let denominator = count * sum_tt - sum_t * sum_t;
-            let slope = (count * sum_ty - sum_t * sum_y) / denominator;
-            let measured_tau = -1.0 / slope;
-            // The exact discrete time constant follows from the coupled
-            // field/pole system
-            //   W[n+1] = a W[n] + d (V[n] + V[n+1]),
-            //   V[n+1] = (V_raw - (W[n+1] - W[n])) / (1 + d),
-            // whose slow eigenvalue is only ~3 % away from the continuum tau.
-            let solve_coefficient = 1.0 / (1.0 + drive);
-            let matrix = [
-                [
-                    relax + drive * (1.0 - relax) * solve_coefficient,
-                    drive * solve_coefficient,
-                ],
-                [(1.0 - relax) * solve_coefficient, -drive * solve_coefficient],
-            ];
-            let trace = matrix[0][0] + matrix[1][1];
-            let determinant = matrix[0][0] * matrix[1][1] - matrix[0][1] * matrix[1][0];
-            let discriminant = trace * trace - 4.0 * determinant;
-            let eigenvalue = (trace + discriminant.sqrt()) / 2.0;
-            let discrete_tau = -dt / eigenvalue.ln();
-            assert!(
-                (measured_tau - discrete_tau).abs() / discrete_tau < 0.01,
-                "relaxation time {measured_tau:e} vs discrete {discrete_tau:e}"
-            );
-            assert!(
-                (discrete_tau - relax_time).abs() / relax_time < 0.05,
-                "discrete time constant {discrete_tau:e} vs continuum {relax_time:e}"
-            );
-            assert_eq!(extension.positions[index], [2, 2, 2]);
-            // The implicit solve must be the inverse of one plus the summed
-            // drive, and the operator must have stored the Debye base material.
-            assert!(
-                (extension.v_solve_ade[0][index] as f64 - 1.0 / (1.0 + drive)).abs() < 1.0e-6
-            );
-            assert!((op.material_grid.as_ref().unwrap()[0].eps_r - 1.0).abs() < 1e-12);
-
+            let t = step as f64 * dt;
+            let y = value.ln();
+            sum_t += t;
+            sum_y += y;
+            sum_tt += t * t;
+            sum_ty += t * y;
+            count += 1.0;
+        }
+        let denominator = count * sum_tt - sum_t * sum_t;
+        let slope = (count * sum_ty - sum_t * sum_y) / denominator;
+        let measured_tau = -1.0 / slope;
+        // The exact discrete time constant follows from the coupled
+        // field/pole system
+        //   W[n+1] = a W[n] + d (V[n] + V[n+1]),
+        //   V[n+1] = (V_raw - (W[n+1] - W[n])) / (1 + d),
+        // whose slow eigenvalue is only ~3 % away from the continuum tau.
+        let solve_coefficient = 1.0 / (1.0 + drive);
+        let matrix = [
+            [
+                relax + drive * (1.0 - relax) * solve_coefficient,
+                drive * solve_coefficient,
+            ],
+            [
+                (1.0 - relax) * solve_coefficient,
+                -drive * solve_coefficient,
+            ],
+        ];
+        let trace = matrix[0][0] + matrix[1][1];
+        let determinant = matrix[0][0] * matrix[1][1] - matrix[0][1] * matrix[1][0];
+        let discriminant = trace * trace - 4.0 * determinant;
+        let eigenvalue = (trace + discriminant.sqrt()) / 2.0;
+        let discrete_tau = -dt / eigenvalue.ln();
+        assert!(
+            (measured_tau - discrete_tau).abs() / discrete_tau < 0.01,
+            "relaxation time {measured_tau:e} vs discrete {discrete_tau:e}"
+        );
+        assert!(
+            (discrete_tau - relax_time).abs() / relax_time < 0.05,
+            "discrete time constant {discrete_tau:e} vs continuum {relax_time:e}"
+        );
+        assert_eq!(extension.positions[index], [2, 2, 2]);
+        // The implicit solve must be the inverse of one plus the summed
+        // drive, and the operator must have stored the Debye base material.
+        assert!((extension.v_solve_ade[0][index] as f64 - 1.0 / (1.0 + drive)).abs() < 1.0e-6);
+        assert!((op.material_grid.as_ref().unwrap()[0].eps_r - 1.0).abs() < 1e-12);
     }
 
     #[test]
@@ -5544,9 +5422,12 @@ mod lorentz_tests {
                 crossings.push(step);
             }
         }
-        assert!(crossings.len() >= 5, "not enough oscillations: {crossings:?}");
-        let period = (crossings.last().unwrap() - crossings[0]) as f64
-            / (crossings.len() - 1) as f64;
+        assert!(
+            crossings.len() >= 5,
+            "not enough oscillations: {crossings:?}"
+        );
+        let period =
+            (crossings.last().unwrap() - crossings[0]) as f64 / (crossings.len() - 1) as f64;
         let measured = 1.0 / (period * dt);
         let relative = (measured - pole).abs() / pole;
         assert!(
@@ -5705,16 +5586,18 @@ mod coordinate_system_tests {
     fn cylindrical_r0_timestep_includes_the_dielectric() {
         let xml = r#"<ContinuousStructure CoordSystem="1"><RectilinearGrid DeltaUnit="0.001" CoordSystem="1"><XLines Qty="11">0,2,4,6,8,10,12,14,16,18,20</XLines><YLines Qty="17">-3.141592653589793,-2.748893571891069,-2.356194490192345,-1.9634954084936207,-1.5707963267948966,-1.1780972450961724,-0.7853981633974483,-0.39269908169872414,0,0.39269908169872414,0.7853981633974483,1.1780972450961724,1.5707963267948966,1.9634954084936207,2.356194490192345,2.748893571891069,3.141592653589793</YLines><ZLines Qty="11">0,2,4,6,8,10,12,14,16,18,20</ZLines></RectilinearGrid><BackgroundMaterial Epsilon="1" Mue="1" Kappa="0" Sigma="0"/><Properties><Material ID="0" Name="muscle" Isotropy="1"><Primitives><Box Priority="0"><P1 X="0" Y="-3.141592653589793" Z="0"/><P2 X="20" Y="3.141592653589793" Z="20"/></Box></Primitives><Property Epsilon="80,1,1" Mue="1,1,1" Kappa="1,0,0" Sigma="0,0,0" Density="1000"/><Weight Epsilon="1,1,1" Mue="1,1,1" Kappa="1,1,1" Sigma="1,1,1" Density="1"/></Material></Properties></ContinuousStructure>"#;
         let mut op = Operator::new();
-        op.load_csx(xml).expect("the lossy cylindrical CSX must load");
+        op.load_csx(xml)
+            .expect("the lossy cylindrical CSX must load");
         assert!(op.r0_included);
         let dt = op.calc_timestep();
         // the material must be resolved into the cell grid: the z-face
         // capacitance is eps_r * eps0 * annulus / dz with the dual rho bounds
         // 1 mm .. 3 mm around rho line 1
         let eps = op.get_ec_c(2, 1, 4, 4);
-        let expected_c = 80.0 * crate::constants::EPS0
+        let expected_c = 80.0
+            * crate::constants::EPS0
             * (0.5 * (std::f64::consts::FRAC_PI_8) * ((3.0e-3f64).powi(2) - (1.0e-3_f64).powi(2)))
-                / 2.0e-3;
+            / 2.0e-3;
         assert!(
             (eps - expected_c).abs() / expected_c < 1e-9,
             "ec_c = {eps} vs the eps_r = 80 value {expected_c}"
@@ -5776,7 +5659,10 @@ mod coordinate_system_tests {
             .expect("an open mesh starting at rho = 0 must load");
         assert!(op.is_cylindrical());
         assert!(!op.closed_alpha());
-        assert!(!op.r0_included, "an open azimuth has no special axis update");
+        assert!(
+            !op.r0_included,
+            "an open azimuth has no special axis update"
+        );
     }
 
     /// Native `Operator_Cylinder::CalcTimestep` forces the conservative
@@ -5807,6 +5693,9 @@ mod coordinate_system_tests {
             .expect("shifted mesh");
         shifted.base.m_time_step_var = 3;
         let dt_shifted = shifted.calc_timestep();
-        assert!(dt_shifted > dt, "Rennings_2 {dt_shifted} vs Rennings_1 {dt}");
+        assert!(
+            dt_shifted > dt,
+            "Rennings_2 {dt_shifted} vs Rennings_1 {dt}"
+        );
     }
 }

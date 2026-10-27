@@ -37,17 +37,11 @@ pub enum Hdf5Error {
     /// A path or object name contained an interior NUL byte.
     NameContainsNul,
     /// An HDF5 C call failed.
-    Hdf5 {
-        operation: &'static str,
-        code: i32,
-    },
+    Hdf5 { operation: &'static str, code: i32 },
     /// The requested object does not exist.
     NotFound(String),
     /// The dataset or attribute has an unexpected rank or shape.
-    InvalidShape {
-        path: String,
-        detail: String,
-    },
+    InvalidShape { path: String, detail: String },
 }
 
 impl fmt::Display for Hdf5Error {
@@ -172,8 +166,8 @@ mod backend {
         static mut H5T_STD_I32LE_g: Hid;
         static mut H5T_IEEE_F32LE_g: Hid;
         static mut H5T_IEEE_F64LE_g: Hid;
-    static mut H5T_STD_U8LE_g: Hid;
-    static mut H5T_NATIVE_UINT8_g: Hid;
+        static mut H5T_STD_U8LE_g: Hid;
+        static mut H5T_NATIVE_UINT8_g: Hid;
 
         fn H5open() -> Herr;
         fn H5Eset_auto2(
@@ -181,21 +175,10 @@ mod backend {
             function: Option<unsafe extern "C" fn(c_int, *mut c_void) -> c_int>,
             client_data: *mut c_void,
         ) -> Herr;
-        fn H5Fcreate(
-            filename: *const c_char,
-            flags: c_uint,
-            fcpl: Hid,
-            fapl: Hid,
-        ) -> Hid;
+        fn H5Fcreate(filename: *const c_char, flags: c_uint, fcpl: Hid, fapl: Hid) -> Hid;
         fn H5Fopen(filename: *const c_char, flags: c_uint, fapl: Hid) -> Hid;
         fn H5Fclose(file: Hid) -> Herr;
-        fn H5Gcreate2(
-            location: Hid,
-            name: *const c_char,
-            lcpl: Hid,
-            gcpl: Hid,
-            gapl: Hid,
-        ) -> Hid;
+        fn H5Gcreate2(location: Hid, name: *const c_char, lcpl: Hid, gcpl: Hid, gapl: Hid) -> Hid;
         fn H5Gopen2(location: Hid, name: *const c_char, gapl: Hid) -> Hid;
         fn H5Gclose(group: Hid) -> Herr;
         fn H5Oopen(location: Hid, name: *const c_char, lapl: Hid) -> Hid;
@@ -243,11 +226,7 @@ mod backend {
         fn H5Screate_simple(rank: c_int, dims: *const HSize, maxdims: *const HSize) -> Hid;
         fn H5Sclose(space: Hid) -> Herr;
         fn H5Sget_simple_extent_ndims(space: Hid) -> c_int;
-        fn H5Sget_simple_extent_dims(
-            space: Hid,
-            dims: *mut HSize,
-            maxdims: *mut HSize,
-        ) -> c_int;
+        fn H5Sget_simple_extent_dims(space: Hid, dims: *mut HSize, maxdims: *mut HSize) -> c_int;
         fn H5Sget_simple_extent_npoints(space: Hid) -> Hssize;
         fn H5Acreate2(
             location: Hid,
@@ -368,9 +347,7 @@ mod backend {
             } else {
                 H5F_ACC_RDONLY
             };
-            let file = unsafe {
-                check_id("H5Fopen", H5Fopen(name.as_ptr(), flags, H5P_DEFAULT))?
-            };
+            let file = unsafe { check_id("H5Fopen", H5Fopen(name.as_ptr(), flags, H5P_DEFAULT))? };
             Ok(super::Hdf5File {
                 handle: Handle {
                     id: file,
@@ -432,7 +409,10 @@ mod backend {
                 None => {
                     let name = c_name("/")?;
                     let id = unsafe {
-                        check_id("H5Gopen2", H5Gopen2(self.handle.id, name.as_ptr(), H5P_DEFAULT))?
+                        check_id(
+                            "H5Gopen2",
+                            H5Gopen2(self.handle.id, name.as_ptr(), H5P_DEFAULT),
+                        )?
                     };
                     Ok(Handle {
                         id,
@@ -556,16 +536,7 @@ mod backend {
                     return Err(error);
                 }
             };
-            let write = unsafe {
-                H5Dwrite(
-                    dataset,
-                    mem_type,
-                    H5S_ALL,
-                    H5S_ALL,
-                    H5P_DEFAULT,
-                    data,
-                )
-            };
+            let write = unsafe { H5Dwrite(dataset, mem_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, data) };
             if let Some(order) = order {
                 let _ = write_string_attribute_on(dataset, "d_order", order);
             }
@@ -761,9 +732,13 @@ mod backend {
             name: &str,
             value: f64,
         ) -> Result<(), Hdf5Error> {
-            self.write_attribute_of(path, name, unsafe { H5T_IEEE_F64LE_g }, unsafe {
-                H5T_NATIVE_DOUBLE_g
-            }, &|| &value as *const f64 as *const c_void)
+            self.write_attribute_of(
+                path,
+                name,
+                unsafe { H5T_IEEE_F64LE_g },
+                unsafe { H5T_NATIVE_DOUBLE_g },
+                &|| &value as *const f64 as *const c_void,
+            )
         }
 
         /// Write a scalar `i32` attribute on `path`.
@@ -773,9 +748,13 @@ mod backend {
             name: &str,
             value: i32,
         ) -> Result<(), Hdf5Error> {
-            self.write_attribute_of(path, name, unsafe { H5T_STD_I32LE_g }, unsafe {
-                H5T_NATIVE_INT_g
-            }, &|| &value as *const i32 as *const c_void)
+            self.write_attribute_of(
+                path,
+                name,
+                unsafe { H5T_STD_I32LE_g },
+                unsafe { H5T_NATIVE_INT_g },
+                &|| &value as *const i32 as *const c_void,
+            )
         }
 
         /// Write a boolean attribute as an `i32` so any HDF5 reader (including
@@ -855,8 +834,11 @@ mod backend {
                         code: attribute as i32,
                     });
                 } else {
-                    let write =
-                        H5Awrite(attribute, H5T_NATIVE_FLOAT_g, values.as_ptr() as *const c_void);
+                    let write = H5Awrite(
+                        attribute,
+                        H5T_NATIVE_FLOAT_g,
+                        values.as_ptr() as *const c_void,
+                    );
                     if write < 0 {
                         result = Err(Hdf5Error::Hdf5 {
                             operation: "H5Awrite",
@@ -876,8 +858,12 @@ mod backend {
 
         fn dataset_shape(&self, path: &str) -> Result<(Vec<usize>, usize), Hdf5Error> {
             let name = c_name(path)?;
-            let dataset =
-                unsafe { check_id("H5Dopen2", H5Dopen2(self.handle.id, name.as_ptr(), H5P_DEFAULT))? };
+            let dataset = unsafe {
+                check_id(
+                    "H5Dopen2",
+                    H5Dopen2(self.handle.id, name.as_ptr(), H5P_DEFAULT),
+                )?
+            };
             let shape = unsafe {
                 let space = check_id("H5Dget_space", H5Dget_space(dataset))?;
                 let rank = H5Sget_simple_extent_ndims(space);
@@ -901,7 +887,10 @@ mod backend {
                         code: dims_read.min(points as c_int),
                     });
                 }
-                (dims.into_iter().map(|value| value as usize).collect(), points as usize)
+                (
+                    dims.into_iter().map(|value| value as usize).collect(),
+                    points as usize,
+                )
             };
             unsafe {
                 let _ = H5Dclose(dataset);
@@ -918,8 +907,12 @@ mod backend {
             let (dims, points) = self.dataset_shape(path)?;
             let mut buffer = vec![0u8; points * element_size];
             let name = c_name(path)?;
-            let dataset =
-                unsafe { check_id("H5Dopen2", H5Dopen2(self.handle.id, name.as_ptr(), H5P_DEFAULT))? };
+            let dataset = unsafe {
+                check_id(
+                    "H5Dopen2",
+                    H5Dopen2(self.handle.id, name.as_ptr(), H5P_DEFAULT),
+                )?
+            };
             let read = unsafe {
                 H5Dread(
                     dataset,
@@ -940,8 +933,7 @@ mod backend {
         /// Read a real dataset as `f64` regardless of its stored precision.
         pub fn read_f64_dataset(&self, path: &str) -> Result<(Vec<usize>, Vec<f64>), Hdf5Error> {
             let _guard = lock();
-            let (dims, buffer) =
-                self.read_dataset(path, unsafe { H5T_NATIVE_DOUBLE_g }, 8)?;
+            let (dims, buffer) = self.read_dataset(path, unsafe { H5T_NATIVE_DOUBLE_g }, 8)?;
             let values = buffer
                 .chunks_exact(8)
                 .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("8 byte chunk")))
@@ -998,7 +990,10 @@ mod backend {
             let object_name = c_name(path)?;
             let attribute_name = c_name(name)?;
             let object = unsafe {
-                check_id("H5Oopen", H5Oopen(self.handle.id, object_name.as_ptr(), H5P_DEFAULT))?
+                check_id(
+                    "H5Oopen",
+                    H5Oopen(self.handle.id, object_name.as_ptr(), H5P_DEFAULT),
+                )?
             };
             let exists = unsafe { H5Aexists(object, attribute_name.as_ptr()) };
             if exists <= 0 {
@@ -1034,13 +1029,7 @@ mod backend {
             let _guard = lock();
             let (object, attribute) = self.open_attribute(path, name)?;
             let mut value = T::default();
-            let read = unsafe {
-                H5Aread(
-                    attribute,
-                    mem_type,
-                    &mut value as *mut T as *mut c_void,
-                )
-            };
+            let read = unsafe { H5Aread(attribute, mem_type, &mut value as *mut T as *mut c_void) };
             unsafe {
                 let _ = H5Aclose(attribute);
                 let _ = H5Oclose(object);
@@ -1102,8 +1091,7 @@ mod backend {
                     } else {
                         let size = H5Tget_size(type_id);
                         let mut buffer = vec![0 as c_char; size.max(1)];
-                        let read =
-                            H5Aread(attribute, type_id, buffer.as_mut_ptr() as *mut c_void);
+                        let read = H5Aread(attribute, type_id, buffer.as_mut_ptr() as *mut c_void);
                         let _ = H5Tclose(type_id);
                         if read < 0 {
                             Err(Hdf5Error::Hdf5 {
@@ -1376,11 +1364,7 @@ mod backend {
         }
     }
 
-    fn write_string_attribute_on(
-        location: Hid,
-        name: &str,
-        value: &str,
-    ) -> Result<(), Hdf5Error> {
+    fn write_string_attribute_on(location: Hid, name: &str, value: &str) -> Result<(), Hdf5Error> {
         let attribute = c_name(name)?;
         let text = c_name(value)?;
         unsafe {
@@ -1517,22 +1501,12 @@ impl Hdf5File {
         Err(Hdf5Error::Unsupported)
     }
 
-    pub fn write_f64_attribute(
-        &self,
-        path: &str,
-        name: &str,
-        value: f64,
-    ) -> Result<(), Hdf5Error> {
+    pub fn write_f64_attribute(&self, path: &str, name: &str, value: f64) -> Result<(), Hdf5Error> {
         let _ = (path, name, value);
         Err(Hdf5Error::Unsupported)
     }
 
-    pub fn write_i32_attribute(
-        &self,
-        path: &str,
-        name: &str,
-        value: i32,
-    ) -> Result<(), Hdf5Error> {
+    pub fn write_i32_attribute(&self, path: &str, name: &str, value: i32) -> Result<(), Hdf5Error> {
         let _ = (path, name, value);
         Err(Hdf5Error::Unsupported)
     }
@@ -1627,20 +1601,12 @@ impl Hdf5File {
         Err(Hdf5Error::Unsupported)
     }
 
-    pub fn read_f64_attribute_vector(
-        &self,
-        path: &str,
-        name: &str,
-    ) -> Result<Vec<f64>, Hdf5Error> {
+    pub fn read_f64_attribute_vector(&self, path: &str, name: &str) -> Result<Vec<f64>, Hdf5Error> {
         let _ = (path, name);
         Err(Hdf5Error::Unsupported)
     }
 
-    pub fn read_f32_attribute_vector(
-        &self,
-        path: &str,
-        name: &str,
-    ) -> Result<Vec<f32>, Hdf5Error> {
+    pub fn read_f32_attribute_vector(&self, path: &str, name: &str) -> Result<Vec<f32>, Hdf5Error> {
         let _ = (path, name);
         Err(Hdf5Error::Unsupported)
     }
@@ -1739,14 +1705,21 @@ mod roundtrip_tests {
                 .expect("z lines");
 
             let values: Vec<f32> = (0..3 * 2 * 2 * 2).map(|value| value as f32).collect();
-            file.write_f32_dataset_nd("/FieldData/TD", "00000001", &[3, 2, 2, 2], &values, Some("NXYZ"))
-                .expect("td dataset");
+            file.write_f32_dataset_nd(
+                "/FieldData/TD",
+                "00000001",
+                &[3, 2, 2, 2],
+                &values,
+                Some("NXYZ"),
+            )
+            .expect("td dataset");
             file.write_f32_attribute_vector("/FieldData/TD/00000001", "time", &[1.5e-12])
                 .expect("time attribute");
 
             file.create_group("/FieldData/FD").expect("fd group");
             file.write_f32_attribute_vector("/FieldData/FD", "frequency", &[1.0e9, 2.0e9])
-                .expect("frequencies");            file.write_complex_f32_dataset(
+                .expect("frequencies");
+            file.write_complex_f32_dataset(
                 "/FieldData/FD",
                 "E-Field",
                 &[3, 2, 2, 2],
@@ -1759,7 +1732,8 @@ mod roundtrip_tests {
 
         let file = Hdf5File::open(&path, false).expect("open");
         assert_eq!(
-            file.read_f64_attribute("/", "openEMS_HDF5_version").unwrap(),
+            file.read_f64_attribute("/", "openEMS_HDF5_version")
+                .unwrap(),
             OPENEMS_HDF5_VERSION
         );
         assert_eq!(file.read_i32_attribute("/", "dump_type").unwrap(), 0);
@@ -1769,7 +1743,10 @@ mod roundtrip_tests {
         let (dims, x) = file.read_f64_dataset("/Mesh/x").unwrap();
         assert_eq!(dims, vec![3]);
         assert_eq!(x, vec![0.0, 0.5, 1.0]);
-        assert_eq!(file.read_f64_attribute("/Mesh", "mesh_scaling").unwrap(), 0.001);
+        assert_eq!(
+            file.read_f64_attribute("/Mesh", "mesh_scaling").unwrap(),
+            0.001
+        );
 
         let (dims, field) = file.read_f32_dataset("/FieldData/TD/00000001").unwrap();
         assert_eq!(dims, vec![3, 2, 2, 2]);
@@ -1781,7 +1758,8 @@ mod roundtrip_tests {
             vec![1.5e-12f32]
         );
         assert_eq!(
-            file.read_string_attribute("/FieldData/TD/00000001", "d_order").unwrap(),
+            file.read_string_attribute("/FieldData/TD/00000001", "d_order")
+                .unwrap(),
             "NXYZ"
         );
 
@@ -1838,15 +1816,13 @@ mod roundtrip_tests {
     }
 }
 
-
 #[cfg(all(test, feature = "hdf5"))]
 mod native_reader_tests {
     use super::*;
 
     fn reference_dump() -> Option<String> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
-            "../../docs/migration/reference-data/msl-notchfilter-wsl/field-run-1/Et_ref.h5",
-        );
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/migration/reference-data/msl-notchfilter-wsl/field-run-1/Et_ref.h5");
         path.exists().then(|| path.to_string_lossy().into_owned())
     }
 
@@ -1864,7 +1840,9 @@ mod native_reader_tests {
         assert!(root.contains(&"FieldData".to_string()));
 
         assert_eq!(file.read_i32_attribute("/", "dump_type").unwrap(), 0);
-        let version = file.read_f64_attribute("/", "openEMS_HDF5_version").unwrap();
+        let version = file
+            .read_f64_attribute("/", "openEMS_HDF5_version")
+            .unwrap();
         assert!(version > 0.0);
 
         assert_eq!(file.read_i32_attribute("/Mesh", "mesh_type").unwrap(), 0);
@@ -1885,9 +1863,7 @@ mod native_reader_tests {
         assert_eq!(entries[0], "00000000");
         assert_eq!(entries[1], "00000102");
 
-        let (dims, values) = file
-            .read_f32_dataset("/FieldData/TD/00000000")
-            .unwrap();
+        let (dims, values) = file.read_f32_dataset("/FieldData/TD/00000000").unwrap();
         assert_eq!(dims, vec![3, 5, 5, 1]);
         assert_eq!(values.len(), 75);
         assert_eq!(
@@ -1912,7 +1888,10 @@ mod native_reader_tests {
     #[test]
     fn round_trips_the_native_field_layout() {
         let path = std::env::temp_dir()
-            .join(format!("openems_native_roundtrip_{}.h5", std::process::id()))
+            .join(format!(
+                "openems_native_roundtrip_{}.h5",
+                std::process::id()
+            ))
             .to_string_lossy()
             .into_owned();
         let values: Vec<f32> = (0..3 * 5 * 5 * 1).map(|value| value as f32).collect();
@@ -1921,16 +1900,17 @@ mod native_reader_tests {
             file.write_f64_attribute("/", "openEMS_HDF5_version", OPENEMS_HDF5_VERSION)
                 .unwrap();
             file.write_i32_attribute("/", "dump_type", 0).unwrap();
-            file.write_f64_attribute("/Mesh", "mesh_scaling", 1.0).unwrap_err();
+            file.write_f64_attribute("/Mesh", "mesh_scaling", 1.0)
+                .unwrap_err();
             file.create_group("/Mesh").unwrap();
             file.write_i32_attribute("/Mesh", "mesh_type", 0).unwrap();
-            file.write_f64_attribute("/Mesh", "mesh_scaling", 1.0).unwrap();
+            file.write_f64_attribute("/Mesh", "mesh_scaling", 1.0)
+                .unwrap();
             file.write_f64_dataset("/Mesh", "x", &[-2.0e-3, -1.0e-3, 0.0, 1.0e-3, 2.0e-3])
                 .unwrap();
             file.write_f64_dataset("/Mesh", "y", &[0.0, 1.0e-3, 2.0e-3, 3.0e-3, 4.0e-3])
                 .unwrap();
-            file.write_f64_dataset("/Mesh", "z", &[0.0])
-                .unwrap();
+            file.write_f64_dataset("/Mesh", "z", &[0.0]).unwrap();
             file.write_f32_dataset_nd(
                 "/FieldData/TD",
                 "00000000",
@@ -1943,19 +1923,23 @@ mod native_reader_tests {
                 .unwrap();
         }
         let file = Hdf5File::open(&path, false).unwrap();
-        assert_eq!(file.read_f64_attribute("/Mesh", "mesh_scaling").unwrap(), 1.0);
+        assert_eq!(
+            file.read_f64_attribute("/Mesh", "mesh_scaling").unwrap(),
+            1.0
+        );
         assert_eq!(file.read_i32_attribute("/Mesh", "mesh_type").unwrap(), 0);
         assert_eq!(
             file.read_string_attribute("/FieldData/TD/00000000", "d_order")
                 .unwrap(),
             "NXYZ"
         );
-        let (dims, read_back) = file
-            .read_f32_dataset("/FieldData/TD/00000000")
-            .unwrap();
+        let (dims, read_back) = file.read_f32_dataset("/FieldData/TD/00000000").unwrap();
         assert_eq!(dims, vec![3, 5, 5, 1]);
         assert_eq!(read_back, values);
-        assert_eq!(file.object_names("/FieldData/TD").unwrap(), vec!["00000000"]);
+        assert_eq!(
+            file.object_names("/FieldData/TD").unwrap(),
+            vec!["00000000"]
+        );
         drop(file);
         let _ = std::fs::remove_file(path);
     }

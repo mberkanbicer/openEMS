@@ -11,9 +11,7 @@ use crate::operator_extension::{
     OperatorExtensionRegistry, SteadyStateOperatorExtension, TfsfOperatorExtension,
     UpmlOperatorExtension,
 };
-use crate::processing::{
-    EngineInterface, EngineMeta, Processing, ProcessingArray,
-};
+use crate::processing::{EngineInterface, EngineMeta, Processing, ProcessingArray};
 use crate::processing_integral::{
     CurrentIntegral, FieldProbeIntegral, ModeMatchIntegral, ProcessIntegral, VoltageIntegral,
 };
@@ -303,10 +301,7 @@ impl OpenEMS {
                     f_max: excitation.f_max,
                 },
                 crate::excitation::ExcitationType::Custom => FdtdExcitation::Custom {
-                    function: excitation
-                        .custom_function()
-                        .unwrap_or_default()
-                        .to_string(),
+                    function: excitation.custom_function().unwrap_or_default().to_string(),
                     f0: excitation.f0,
                     f_max: excitation.f_max,
                 },
@@ -396,7 +391,11 @@ impl OpenEMS {
             Some(crate::fdtd_options::FdtdExcitation::Step { f_max }) => {
                 self.set_step_excite(*f_max);
             }
-            Some(crate::fdtd_options::FdtdExcitation::Custom { function, f0, f_max }) => {
+            Some(crate::fdtd_options::FdtdExcitation::Custom {
+                function,
+                f0,
+                f_max,
+            }) => {
                 self.set_custom_excite(function, *f0, *f_max);
             }
             None => {}
@@ -425,7 +424,11 @@ impl OpenEMS {
             Some(crate::fdtd_options::FdtdExcitation::Step { f_max }) => {
                 self.set_step_excite(*f_max);
             }
-            Some(crate::fdtd_options::FdtdExcitation::Custom { function, f0, f_max }) => {
+            Some(crate::fdtd_options::FdtdExcitation::Custom {
+                function,
+                f0,
+                f_max,
+            }) => {
                 self.set_custom_excite(function, *f0, *f_max);
             }
             None => {}
@@ -567,7 +570,12 @@ impl OpenEMS {
             println!("  timestep: {} s", op.get_timestep());
             println!("  number of cells: {}", op.get_number_cells());
             for n in 0..3 {
-                println!("  lines[{}]: {} ({})", n, op.get_number_of_lines(n as i32, true), op.get_dir_name(n as i32));
+                println!(
+                    "  lines[{}]: {} ({})",
+                    n,
+                    op.get_number_of_lines(n as i32, true),
+                    op.get_dir_name(n as i32)
+                );
             }
         } else {
             println!("[openEMS debug] Operator: engine not initialized");
@@ -580,7 +588,12 @@ impl OpenEMS {
             let op = &eng.op;
             println!("[openEMS debug] Box/Grid:");
             for n in 0..3 {
-                println!("  {} direction: {} lines, delta={}", op.get_dir_name(n as i32), op.get_number_of_lines(n as i32, true), op.get_grid_delta());
+                println!(
+                    "  {} direction: {} lines, delta={}",
+                    op.get_dir_name(n as i32),
+                    op.get_number_of_lines(n as i32, true),
+                    op.get_grid_delta()
+                );
             }
         } else {
             println!("[openEMS debug] Box: engine not initialized");
@@ -637,9 +650,8 @@ impl OpenEMS {
         let mut disc: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
         for axis in 0..3 {
             for index in 0..dims[axis] {
-                disc[axis].push(
-                    op.get_disc_line(axis as i32, index as u32, false) * op.base.grid_delta,
-                );
+                disc[axis]
+                    .push(op.get_disc_line(axis as i32, index as u32, false) * op.base.grid_delta);
             }
         }
         let lines: [&[f64]; 3] = [&disc[0], &disc[1], &disc[2]];
@@ -674,13 +686,8 @@ impl OpenEMS {
                         }
                     }
                 }
-                match debug_dump::write_scalar_vtk(
-                    "operator_dump.vtk",
-                    "vv",
-                    dims,
-                    lines,
-                    &values,
-                ) {
+                match debug_dump::write_scalar_vtk("operator_dump.vtk", "vv", dims, lines, &values)
+                {
                     Ok(()) => println!("[openEMS] operator written to 'operator_dump.vtk'"),
                     Err(error) => eprintln!("[openEMS] operator_dump.vtk failed: {error}"),
                 }
@@ -700,13 +707,7 @@ impl OpenEMS {
                         }
                     }
                 }
-                match debug_dump::write_scalar_vtk(
-                    "PEC_dump.vtk",
-                    "PEC",
-                    dims,
-                    lines,
-                    &values,
-                ) {
+                match debug_dump::write_scalar_vtk("PEC_dump.vtk", "PEC", dims, lines, &values) {
                     Ok(()) => println!("[openEMS] PEC written to 'PEC_dump.vtk'"),
                     Err(error) => eprintln!("[openEMS] PEC_dump.vtk failed: {error}"),
                 }
@@ -754,11 +755,7 @@ impl OpenEMS {
         let mut voltage = String::with_capacity(length * 24);
         let mut current = String::with_capacity(length * 24);
         for n in 0..length {
-            voltage.push_str(&format!(
-                "{}\t{}\n",
-                n as f64 * dt,
-                signal.voltage(n)
-            ));
+            voltage.push_str(&format!("{}\t{}\n", n as f64 * dt, signal.voltage(n)));
             current.push_str(&format!(
                 "{}\t{}\n",
                 n as f64 * dt + 0.5 * dt,
@@ -860,7 +857,8 @@ impl OpenEMS {
         self.bc_type = op.base.m_bc;
 
         // Ensure EC coefficient arrays are allocated.
-        if op.vv_ptr.is_none() || op.vi_ptr.is_none() || op.ii_ptr.is_none() || op.iv_ptr.is_none() {
+        if op.vv_ptr.is_none() || op.vi_ptr.is_none() || op.ii_ptr.is_none() || op.iv_ptr.is_none()
+        {
             let num_lines_usize: [usize; 3] = op.base.num_lines.map(|v| v as usize);
             op.init_data_storage(num_lines_usize);
         }
@@ -888,7 +886,10 @@ impl OpenEMS {
             op.calc_timestep();
         }
         if self.time_step_factor <= 0.0 || !self.time_step_factor.is_finite() {
-            eprintln!("[openEMS] Invalid timestep factor: {}", self.time_step_factor);
+            eprintln!(
+                "[openEMS] Invalid timestep factor: {}",
+                self.time_step_factor
+            );
             return false;
         }
         op.base.d_t *= self.time_step_factor;
@@ -1238,16 +1239,12 @@ impl OpenEMS {
                         created += 1;
                     }
                     29 => {
-                        let mut processing =
-                            crate::processing::ProcessFieldsSAR::new(&name, 29);
+                        let mut processing = crate::processing::ProcessFieldsSAR::new(&name, 29);
                         if cylindrical {
                             processing.set_mesh_type(mesh_type);
                         }
                         processing.set_bounds(start, stop);
-                        processing.set_cell_data(Self::build_sar_cell_data(
-                            &structure,
-                            engine,
-                        ));
+                        processing.set_cell_data(Self::build_sar_cell_data(&structure, engine));
                         processing.set_file_type(dump.file_type());
                         processing.set_dump_mode_value(dump.dump_mode());
                         processing.set_sar_method(dump.sar_method());
@@ -1342,117 +1339,116 @@ impl OpenEMS {
     }
 
     /// Per-cell volume, mass density and conductivity for the SAR dumps.
-///
-/// Mirrors `ProcessFieldsSAR::DumpFDData`: the volume from the mesh, the mass
-/// density and conductivity from the material at the cell centre
-/// (`GetCellCenterMaterialAvgCoord` + `GetPropertyByCoordPriority`).
-fn build_sar_cell_data(
-    structure: &csxcad_core::model::Structure,
-    engine: &Engine,
-) -> crate::processing::SarCellData {
-    let params = structure.parameters();
-    let num_lines = engine.num_lines;
-    let closed_alpha = matches!(
-        engine.op.mesh_type(),
-        crate::operator::MeshType::Cylindrical { .. }
-    );
-    let line = |axis: usize, index: usize| -> f64 {
-        engine.op.get_disc_line(axis as i32, index as u32, false)
-    };
-    let centre = |axis: usize, index: usize| -> f64 {
-        let count = num_lines[axis];
-        if index + 1 < count {
-            0.5 * (line(axis, index) + line(axis, index + 1))
-        } else if index > 0 {
-            line(axis, index) + 0.5 * (line(axis, index) - line(axis, index - 1))
-        } else {
-            line(axis, 0)
-        }
-    };
+    ///
+    /// Mirrors `ProcessFieldsSAR::DumpFDData`: the volume from the mesh, the mass
+    /// density and conductivity from the material at the cell centre
+    /// (`GetCellCenterMaterialAvgCoord` + `GetPropertyByCoordPriority`).
+    fn build_sar_cell_data(
+        structure: &csxcad_core::model::Structure,
+        engine: &Engine,
+    ) -> crate::processing::SarCellData {
+        let params = structure.parameters();
+        let num_lines = engine.num_lines;
+        let closed_alpha = matches!(
+            engine.op.mesh_type(),
+            crate::operator::MeshType::Cylindrical { .. }
+        );
+        let line = |axis: usize, index: usize| -> f64 {
+            engine.op.get_disc_line(axis as i32, index as u32, false)
+        };
+        let centre = |axis: usize, index: usize| -> f64 {
+            let count = num_lines[axis];
+            if index + 1 < count {
+                0.5 * (line(axis, index) + line(axis, index + 1))
+            } else if index > 0 {
+                line(axis, index) + 0.5 * (line(axis, index) - line(axis, index - 1))
+            } else {
+                line(axis, 0)
+            }
+        };
 
-    let cells = num_lines[0] * num_lines[1] * num_lines[2];
-    let mut data = crate::processing::SarCellData {
-        volume: vec![0.0; cells],
-        density: vec![0.0; cells],
-        conductivity: vec![0.0; cells],
-    };
-    for i in 0..num_lines[0] {
-        for j in 0..num_lines[1] {
-            for k in 0..num_lines[2] {
-                let index = (i * num_lines[1] + j) * num_lines[2] + k;
-                // native `GetCellVolume`: the operator metric of the cell, so
-                // a cylindrical mesh yields annulus segments and the
-                // `rho = 0` axis cells their wedge volumes
-                data.volume[index] = engine.op.get_cell_volume(
-                    [i as u32, j as u32, k as u32],
-                    false,
-                );
-                // the material lookup uses drawing units, like the native
-                // GetPropertyByCoordPriority; on a closed azimuth the seam and
-                // padding lines map back into the ring
-                // (native `GetCellCenterMaterialAvgCoord`)
-                let j_eff = if closed_alpha && j + 2 >= num_lines[1] {
-                    j - (num_lines[1] - 2)
-                } else {
-                    j
-                };
-                let coordinate = [centre(0, i), centre(1, j_eff), centre(2, k)];
-                let mut winner: Option<&csxcad_core::material::MaterialProperties> = None;
-                let mut winner_priority = i32::MIN;
-                for property in 0..structure.property_count() {
-                    let Some(property) = structure.property_by_index(property) else {
-                        continue;
+        let cells = num_lines[0] * num_lines[1] * num_lines[2];
+        let mut data = crate::processing::SarCellData {
+            volume: vec![0.0; cells],
+            density: vec![0.0; cells],
+            conductivity: vec![0.0; cells],
+        };
+        for i in 0..num_lines[0] {
+            for j in 0..num_lines[1] {
+                for k in 0..num_lines[2] {
+                    let index = (i * num_lines[1] + j) * num_lines[2] + k;
+                    // native `GetCellVolume`: the operator metric of the cell, so
+                    // a cylindrical mesh yields annulus segments and the
+                    // `rho = 0` axis cells their wedge volumes
+                    data.volume[index] = engine
+                        .op
+                        .get_cell_volume([i as u32, j as u32, k as u32], false);
+                    // the material lookup uses drawing units, like the native
+                    // GetPropertyByCoordPriority; on a closed azimuth the seam and
+                    // padding lines map back into the ring
+                    // (native `GetCellCenterMaterialAvgCoord`)
+                    let j_eff = if closed_alpha && j + 2 >= num_lines[1] {
+                        j - (num_lines[1] - 2)
+                    } else {
+                        j
                     };
-                    let Some(material) = property.material() else {
-                        continue;
-                    };
-                    for primitive in property.primitives() {
-                        if winner.is_some() && primitive.priority() <= winner_priority {
+                    let coordinate = [centre(0, i), centre(1, j_eff), centre(2, k)];
+                    let mut winner: Option<&csxcad_core::material::MaterialProperties> = None;
+                    let mut winner_priority = i32::MIN;
+                    for property in 0..structure.property_count() {
+                        let Some(property) = structure.property_by_index(property) else {
                             continue;
-                        }
-                        if primitive
-                            .is_inside(coordinate, Some(params))
-                            .unwrap_or(false)
-                        {
-                            winner = Some(material);
-                            winner_priority = primitive.priority();
+                        };
+                        let Some(material) = property.material() else {
+                            continue;
+                        };
+                        for primitive in property.primitives() {
+                            if winner.is_some() && primitive.priority() <= winner_priority {
+                                continue;
+                            }
+                            if primitive
+                                .is_inside(coordinate, Some(params))
+                                .unwrap_or(false)
+                            {
+                                winner = Some(material);
+                                winner_priority = primitive.priority();
+                            }
                         }
                     }
-                }
-                if let Some(material) = winner {
-                    data.density[index] = material
-                        .weighted_density(
-                            Some(params),
-                            coordinate,
-                            csxcad_core::grid::CoordinateSystem::Cartesian,
-                        )
-                        .unwrap_or(0.0);
-                    data.conductivity[index] = material
-                        .weighted_value(
-                            csxcad_core::material::MaterialField::Kappa,
-                            0,
-                            Some(params),
-                            coordinate,
-                            csxcad_core::grid::CoordinateSystem::Cartesian,
-                        )
-                        .ok()
-                        .flatten()
-                        .unwrap_or(0.0);
+                    if let Some(material) = winner {
+                        data.density[index] = material
+                            .weighted_density(
+                                Some(params),
+                                coordinate,
+                                csxcad_core::grid::CoordinateSystem::Cartesian,
+                            )
+                            .unwrap_or(0.0);
+                        data.conductivity[index] = material
+                            .weighted_value(
+                                csxcad_core::material::MaterialField::Kappa,
+                                0,
+                                Some(params),
+                                coordinate,
+                                csxcad_core::grid::CoordinateSystem::Cartesian,
+                            )
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0.0);
+                    }
                 }
             }
         }
+        if std::env::var_os("OPENEMS_DEBUG_PROBES").is_some() {
+            let nonzero = data.density.iter().filter(|value| **value > 0.0).count();
+            eprintln!(
+                "[debug] SAR cell data: {nonzero} of {cells} cells with density, {} properties",
+                structure.property_count()
+            );
+        }
+        data
     }
-    if std::env::var_os("OPENEMS_DEBUG_PROBES").is_some() {
-        let nonzero = data.density.iter().filter(|value| **value > 0.0).count();
-        eprintln!(
-            "[debug] SAR cell data: {nonzero} of {cells} cells with density, {} properties",
-            structure.property_count()
-        );
-    }
-    data
-}
 
-/// Create the probe processings from the CSX `ProbeBox` properties.
+    /// Create the probe processings from the CSX `ProbeBox` properties.
     ///
     /// Mirrors `openEMS::SetupProcessing` for probe boxes: voltage probes use a
     /// line integral, current probes a surface integral, field probes all three
@@ -1512,8 +1508,7 @@ fn build_sar_cell_data(
             .take()
             .unwrap_or_else(|| ProcessingArray::new(u32::MAX));
         let mut created = 0usize;
-        for property in structure.properties_by_type(csxcad_core::model::PropertyType::ProbeBox)
-        {
+        for property in structure.properties_by_type(csxcad_core::model::PropertyType::ProbeBox) {
             let Some(probe) = property.probe() else {
                 continue;
             };
@@ -1574,11 +1569,7 @@ fn build_sar_cell_data(
                             let line_stop = coordinates[1].map(|value| value * grid_delta);
                             Box::new(VoltageIntegral::new(line_start, line_stop))
                         }
-                        1 => Box::new(CurrentIntegral::new(
-                            start,
-                            stop,
-                            probe.normal_direction(),
-                        )),
+                        1 => Box::new(CurrentIntegral::new(start, stop, probe.normal_direction())),
                         2 | 3 => {
                             let centre = [
                                 0.5 * (start[0] + stop[0]),
@@ -1611,8 +1602,7 @@ fn build_sar_cell_data(
                         }
                     };
 
-                let mut processing =
-                    ProcessIntegral::new(&name, &name, start, stop, calculator);
+                let mut processing = ProcessIntegral::new(&name, &name, start, stop, calculator);
                 if probe.probe_type() == 1 || probe.probe_type() == 3 {
                     processing.set_dual_time(true);
                 }
@@ -1704,18 +1694,15 @@ fn build_sar_cell_data(
                 // native `GetDiscLine` keeps the drawing units; the cylindrical
                 // azimuth is an angle, so it never scales by the grid delta.
                 let scale = if axis == 1
-                    && matches!(
-                        mesh_type,
-                        crate::operator::MeshType::Cylindrical { .. }
-                    ) {
+                    && matches!(mesh_type, crate::operator::MeshType::Cylindrical { .. })
+                {
                     1.0
                 } else {
                     engine.op.get_grid_delta()
                 };
                 for index in 0..num_lines[axis] {
-                    disc_lines[axis].push(
-                        engine.op.get_disc_line(axis as i32, index as u32, false) * scale,
-                    );
+                    disc_lines[axis]
+                        .push(engine.op.get_disc_line(axis as i32, index as u32, false) * scale);
                 }
             }
             EngineMeta {
@@ -1932,10 +1919,7 @@ fn build_sar_cell_data(
             -10.0 * stats.end_change.max(f64::MIN_POSITIVE).log10()
         ));
 
-        for (name, contents) in [
-            ("openEMS_stats.txt", setup),
-            ("openEMS_run_stats.txt", run),
-        ] {
+        for (name, contents) in [("openEMS_stats.txt", setup), ("openEMS_run_stats.txt", run)] {
             match std::fs::write(name, contents) {
                 Ok(()) => println!("[openEMS] statistics written to '{name}'"),
                 Err(error) => eprintln!("[openEMS] could not write '{name}': {error}"),
@@ -2018,13 +2002,7 @@ mod tests {
         );
         assert!(sim.setup_fdtd());
         assert!(sim.run_fdtd());
-        assert_eq!(
-            sim.fdtd_eng
-                .as_ref()
-                .unwrap()
-                .get_number_of_timesteps(),
-            10
-        );
+        assert_eq!(sim.fdtd_eng.as_ref().unwrap().get_number_of_timesteps(), 10);
     }
 
     const SMALL_CSX: &str = r#"<ContinuousStructure CoordSystem="0">
@@ -2063,10 +2041,7 @@ mod tests {
         sim.set_csx_xml(SMALL_CSX.to_string());
         assert!(sim.setup_fdtd());
         assert!(sim.run_fdtd());
-        assert_eq!(
-            sim.fdtd_eng.as_ref().unwrap().get_number_of_timesteps(),
-            5
-        );
+        assert_eq!(sim.fdtd_eng.as_ref().unwrap().get_number_of_timesteps(), 5);
     }
 
     #[test]
@@ -2242,8 +2217,7 @@ mod upml_absorption_tests {
         let mut op = Operator::new();
         op.load_csx(&uniform_xml(nx, ny, nz, delta))
             .expect("uniform CSX should load");
-        op.base.m_bc =
-            std::array::from_fn(|face| if pml_faces[face] { BC_PML } else { BC_PEC });
+        op.base.m_bc = std::array::from_fn(|face| if pml_faces[face] { BC_PML } else { BC_PEC });
         op.calc_timestep();
         let dt = op.base.d_t;
         op.calc_ec_operator();
@@ -2252,8 +2226,7 @@ mod upml_absorption_tests {
 
         let sizes: [u32; 6] = std::array::from_fn(|face| if pml_faces[face] { 8 } else { 0 });
         let extensions = if pml_faces.iter().any(|&face| face) {
-            op.build_upml_extensions(sizes)
-                .expect("UPML should build")
+            op.build_upml_extensions(sizes).expect("UPML should build")
         } else {
             Vec::new()
         };
@@ -2321,7 +2294,6 @@ mod upml_absorption_tests {
             "UPML tail {tail:e} should be far below PEC tail {pec_tail:e}"
         );
     }
-
 }
 
 #[cfg(test)]
@@ -2629,7 +2601,10 @@ mod tfsf_wiring_tests {
         sim.set_number_of_time_steps(2_000);
         assert!(sim.setup_fdtd(), "plane-wave setup must succeed");
         let names = sim.fdtd_eng.as_ref().unwrap().extension_names();
-        assert!(names.contains(&"TFSF"), "TFSF extension is missing: {names:?}");
+        assert!(
+            names.contains(&"TFSF"),
+            "TFSF extension is missing: {names:?}"
+        );
         assert!(sim.run_fdtd());
 
         let engine = sim.fdtd_eng.as_ref().unwrap();
@@ -2682,7 +2657,10 @@ mod tfsf_wiring_tests {
         );
 
         // Amplitude inside the total-field box and in the scattered region.
-        let incident = samples.iter().map(|(_, value)| value.abs()).fold(0.0, f64::max);
+        let incident = samples
+            .iter()
+            .map(|(_, value)| value.abs())
+            .fold(0.0, f64::max);
         assert!(incident > 0.0, "no incident field inside the TFSF box");
         let scattered = (2..5)
             .map(|x| (*engine.volt_ptr.get(1, x, 10, 10) as f64).abs())

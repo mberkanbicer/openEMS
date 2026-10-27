@@ -249,5 +249,3 @@ fn dielectric_propagation_speed_matches_c_over_sqrt_eps() {
         "measured dielectric speed {measured:.4e} m/s vs {expected:.4e} m/s"
     );
 }
-
-

@@ -293,12 +293,13 @@ impl SarRunner {
                     &fields[index],
                 ),
                 None => {
-                    let conductivity = conductivity
-                        .as_ref()
-                        .ok_or_else(|| SarError::ShapeMismatch {
-                            path: "CellData/Conductivity".to_string(),
-                            detail: "the conductivity is required without J fields".to_string(),
-                        })?;
+                    let conductivity =
+                        conductivity
+                            .as_ref()
+                            .ok_or_else(|| SarError::ShapeMismatch {
+                                path: "CellData/Conductivity".to_string(),
+                                detail: "the conductivity is required without J fields".to_string(),
+                            })?;
                     calculation.add_e_field_and_conductivity(
                         *frequency,
                         &e_fields[index],
@@ -321,11 +322,7 @@ impl SarRunner {
     ) -> Result<bool, SarError> {
         let num_lines = calculation.num_lines();
         let (start, stop) = self.auto_range_block(calculation, num_lines);
-        let block = [
-            stop[0] - start[0],
-            stop[1] - start[1],
-            stop[2] - start[2],
-        ];
+        let block = [stop[0] - start[0], stop[1] - start[1], stop[2] - start[2]];
         if block.iter().any(|size| *size == 0) {
             return Ok(false);
         }
@@ -422,11 +419,7 @@ impl SarRunner {
             "valid_cubes",
             calculation.valid_cells as i32,
         )?;
-        file.write_i32_attribute(
-            "/FieldData/FD",
-            "used_cubes",
-            calculation.used_cells as i32,
-        )?;
+        file.write_i32_attribute("/FieldData/FD", "used_cubes", calculation.used_cells as i32)?;
         file.write_i32_attribute(
             "/FieldData/FD",
             "unused_cubes",
@@ -527,11 +520,7 @@ impl SarRunner {
     }
 }
 
-fn total_mass(
-    calculation: &SarCalculation,
-    start: [usize; 3],
-    stop: [usize; 3],
-) -> f64 {
+fn total_mass(calculation: &SarCalculation, start: [usize; 3], stop: [usize; 3]) -> f64 {
     let volumes = calculation.cell_volumes();
     let densities = calculation.cell_densities();
     let mut mass = 0.0;
@@ -577,10 +566,7 @@ mod tests {
                         i,
                         j,
                         k,
-                        crate::processing::ComplexPoint {
-                            re: value,
-                            im: 0.0,
-                        },
+                        crate::processing::ComplexPoint { re: value, im: 0.0 },
                     );
                 }
             }
@@ -591,11 +577,7 @@ mod tests {
     #[test]
     fn direct_result_dump_matches_the_local_sar_formula() {
         let dims = [2, 2, 2];
-        let mesh = [
-            vec![0.0, 1.0],
-            vec![0.0, 1.0],
-            vec![0.0, 1.0],
-        ];
+        let mesh = [vec![0.0, 1.0], vec![0.0, 1.0], vec![0.0, 1.0]];
         let widths = [vec![1.0, 1.0], vec![1.0, 1.0], vec![1.0, 1.0]];
         let volume = vec![1.0; 8];
         let density = vec![2.0; 8];

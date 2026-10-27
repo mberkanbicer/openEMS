@@ -230,7 +230,11 @@ impl Nf2ffCalc {
                 break;
             }
         }
-        if self.mirror_type.iter().all(|mirror| *mirror != MirrorType::Off) {
+        if self
+            .mirror_type
+            .iter()
+            .all(|mirror| *mirror != MirrorType::Off)
+        {
             for axis in [0usize, 1, 0, 2, 0, 1, 0] {
                 self.add_mirror_plane(axis, lines, num_lines, e_field, h_field, cylindrical);
             }
@@ -297,11 +301,7 @@ impl Nf2ffCalc {
         let mut h_copy = h_field.clone();
         e_copy.scale(e_factor);
         h_copy.scale(h_factor);
-        let refs: [&[f64]; 3] = [
-            &mirrored_lines[0],
-            &mirrored_lines[1],
-            &mirrored_lines[2],
-        ];
+        let refs: [&[f64]; 3] = [&mirrored_lines[0], &mirrored_lines[1], &mirrored_lines[2]];
         self.add_single_plane(refs, num_lines, &e_copy, &h_copy, cylindrical);
     }
 
@@ -423,14 +423,8 @@ impl Nf2ffCalc {
                 ms.set(2, i, j, k, current_m[2]);
 
                 let area = edge_p[pos_p] * edge_pp[pos_pp];
-                let power = mul(
-                    e_field.get(n_p, i, j, k),
-                    conj(h_field.get(n_pp, i, j, k)),
-                );
-                let power2 = mul(
-                    e_field.get(n_pp, i, j, k),
-                    conj(h_field.get(n_p, i, j, k)),
-                );
+                let power = mul(e_field.get(n_p, i, j, k), conj(h_field.get(n_pp, i, j, k)));
+                let power2 = mul(e_field.get(n_pp, i, j, k), conj(h_field.get(n_p, i, j, k)));
                 let difference = sub(power, power2);
                 self.radiated_power += 0.5 * area * difference.re * norm_dir[ny];
             }
@@ -484,16 +478,10 @@ impl Nf2ffCalc {
                             im: phase.sin(),
                         };
                         let area = edge_p[pos_p] * edge_pp[pos_pp];
-                        let current_js = [
-                            js.get(0, i, j, k),
-                            js.get(1, i, j, k),
-                            js.get(2, i, j, k),
-                        ];
-                        let current_ms = [
-                            ms.get(0, i, j, k),
-                            ms.get(1, i, j, k),
-                            ms.get(2, i, j, k),
-                        ];
+                        let current_js =
+                            [js.get(0, i, j, k), js.get(1, i, j, k), js.get(2, i, j, k)];
+                        let current_ms =
+                            [ms.get(0, i, j, k), ms.get(1, i, j, k), ms.get(2, i, j, k)];
                         let n_theta = ComplexPoint {
                             re: current_js[0].re * cos_t_cos_p + current_js[1].re * cos_t_sin_p
                                 - current_js[2].re * sin_t,
@@ -545,8 +533,7 @@ impl Nf2ffCalc {
                     re: l_phi.re + z_wave * n_theta.re,
                     im: l_phi.im + z_wave * n_theta.im,
                 };
-                self.e_theta[ti][pi] =
-                    sub(self.e_theta[ti][pi], mul(factor, term_e_theta));
+                self.e_theta[ti][pi] = sub(self.e_theta[ti][pi], mul(factor, term_e_theta));
                 let term_e_phi = ComplexPoint {
                     re: l_theta.re - z_wave * n_phi.re,
                     im: l_theta.im - z_wave * n_phi.im,
@@ -556,8 +543,7 @@ impl Nf2ffCalc {
                     re: n_phi.re - l_theta.re / z_wave,
                     im: n_phi.im - l_theta.im / z_wave,
                 };
-                self.h_theta[ti][pi] =
-                    add(self.h_theta[ti][pi], mul(factor, term_h_theta));
+                self.h_theta[ti][pi] = add(self.h_theta[ti][pi], mul(factor, term_h_theta));
                 let term_h_phi = ComplexPoint {
                     re: n_theta.re + l_phi.re / z_wave,
                     im: n_theta.im + l_phi.im / z_wave,
@@ -604,13 +590,7 @@ mod tests {
         let z0 = crate::constants::Z0;
         for j in 0..5 {
             for k in 0..5 {
-                e_field.set(
-                    2,
-                    0,
-                    j,
-                    k,
-                    ComplexPoint { re: 1.0, im: 0.0 },
-                );
+                e_field.set(2, 0, j, k, ComplexPoint { re: 1.0, im: 0.0 });
                 h_field.set(
                     1,
                     0,
@@ -661,9 +641,7 @@ mod tests {
         // A +r wave has H_phi = -E_theta / Z0 and E_phi = H_theta = 0.
         assert!(calc.e_phi[0][0].magnitude() < 1.0e-12);
         assert!(calc.h_theta[0][0].magnitude() < 1.0e-12);
-        assert!(
-            (calc.h_phi[0][0].magnitude() - measured / z0).abs() / (measured / z0) < 1.0e-9
-        );
+        assert!((calc.h_phi[0][0].magnitude() - measured / z0).abs() / (measured / z0) < 1.0e-9);
         // Directivity of the sampled aperture.
         let expected_directivity = calc.p_rad[0][0] * 4.0 * PI * radius * radius / expected_power;
         assert!(

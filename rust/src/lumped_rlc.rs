@@ -103,7 +103,11 @@ pub fn series_coefficients(dt: f64, element: &CellElement) -> SeriesCoefficients
     if c == 0.0 {
         let denominator = 2.0 * l + dt * r;
         SeriesCoefficients {
-            ib0: if denominator != 0.0 { dt / denominator } else { 0.0 },
+            ib0: if denominator != 0.0 {
+                dt / denominator
+            } else {
+                0.0
+            },
             b1: -4.0 * l / dt,
             b2: (2.0 * l - dt * r) / dt,
         }
@@ -146,11 +150,7 @@ pub fn parallel_capacitance(
 ///
 /// Native series form: `Zmin` is the magnitude of the element impedance at
 /// `f_max`, including the `1/(ωC)` term when the element has a capacitance.
-pub fn series_capacitance(
-    grid_capacitance: f64,
-    element: &CellElement,
-    f_max: f64,
-) -> f64 {
+pub fn series_capacitance(grid_capacitance: f64, element: &CellElement, f_max: f64) -> f64 {
     let omega = TAU * f_max;
     let z_min = if element.capacitance != 0.0 {
         (element.resistance.powi(2)
@@ -203,7 +203,11 @@ pub fn series_update_coefficients(
 }
 
 /// Parallel-branch coefficients, native `v_i2v` and `v_ilv`.
-pub fn parallel_update_coefficients(dt: f64, capacitance: f64, element: &CellElement) -> (f64, f64) {
+pub fn parallel_update_coefficients(
+    dt: f64,
+    capacitance: f64,
+    element: &CellElement,
+) -> (f64, f64) {
     let i2v = (dt / capacitance) / (1.0 + dt * element.conductance / (2.0 * capacitance));
     let ilv = if element.inductance > 0.0 {
         dt / element.inductance
@@ -255,8 +259,8 @@ mod tests {
         // b1 = (dt^2 - 4LC)/(dt C)
         let expected_b1 = (dt * dt - 4.0 * 1.0e-9 * 1.0e-12) / (dt * 1.0e-12);
         assert!((series.b1 - expected_b1).abs() / expected_b1.abs() < 1e-12);
-        let expected_b2 = (4.0 * 1.0e-9 * 1.0e-12 - 2.0 * dt * 10.0 * 1.0e-12 + dt * dt)
-            / (2.0 * dt * 1.0e-12);
+        let expected_b2 =
+            (4.0 * 1.0e-9 * 1.0e-12 - 2.0 * dt * 10.0 * 1.0e-12 + dt * dt) / (2.0 * dt * 1.0e-12);
         assert!((series.b2 - expected_b2).abs() / expected_b2.abs() < 1e-12);
     }
 
@@ -287,7 +291,10 @@ mod tests {
         let untouched = parallel_capacitance(0.0, 1.0e-15, 50.0, 1.0e-9, 1.0e9);
         assert_eq!(untouched, 1.0e-15);
         // An explicit element capacitance is used unchanged.
-        assert_eq!(parallel_capacitance(2.0e-12, 1.0e-9, 50.0, 1.0e-9, 1.0e9), 2.0e-12);
+        assert_eq!(
+            parallel_capacitance(2.0e-12, 1.0e-9, 50.0, 1.0e-9, 1.0e9),
+            2.0e-12
+        );
     }
 
     #[test]

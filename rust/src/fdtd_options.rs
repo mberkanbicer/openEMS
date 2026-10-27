@@ -8,10 +8,19 @@
 /// Excitation setup from the `<Excitation>` child of `<FDTD>`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FdtdExcitation {
-    Gauss { f0: f64, fc: f64 },
-    Sinus { f0: f64 },
-    Dirac { f_max: f64 },
-    Step { f_max: f64 },
+    Gauss {
+        f0: f64,
+        fc: f64,
+    },
+    Sinus {
+        f0: f64,
+    },
+    Dirac {
+        f_max: f64,
+    },
+    Step {
+        f_max: f64,
+    },
     Custom {
         function: String,
         f0: f64,
@@ -57,9 +66,7 @@ fn attributes(tag: &str) -> Vec<(String, String)> {
     let mut index = 0usize;
     while index < bytes.len() {
         // Find an attribute name.
-        while index < bytes.len()
-            && !(bytes[index] as char).is_ascii_alphabetic()
-        {
+        while index < bytes.len() && !(bytes[index] as char).is_ascii_alphabetic() {
             index += 1;
         }
         let name_start = index;
@@ -283,7 +290,11 @@ fn child_tag(xml: &str, name: &str) -> Option<String> {
 /// `BoundaryCond` children) for the given solver settings.
 pub fn write_fdtd_element(settings: &FdtdWriteSettings) -> String {
     let mut element = String::from("<FDTD");
-    attribute(&mut element, "NumberOfTimesteps", &settings.nr_ts.to_string());
+    attribute(
+        &mut element,
+        "NumberOfTimesteps",
+        &settings.nr_ts.to_string(),
+    );
     if settings.cylinder_coords {
         attribute(&mut element, "CylinderCoords", "1");
         if !settings.multi_grid.is_empty() {
@@ -299,8 +310,16 @@ pub fn write_fdtd_element(settings: &FdtdWriteSettings) -> String {
     if settings.max_time > 0.0 {
         attribute(&mut element, "MaxTime", &settings.max_time.to_string());
     }
-    attribute(&mut element, "endCriteria", &settings.end_criteria.to_string());
-    attribute(&mut element, "OverSampling", &settings.over_sampling.to_string());
+    attribute(
+        &mut element,
+        "endCriteria",
+        &settings.end_criteria.to_string(),
+    );
+    attribute(
+        &mut element,
+        "OverSampling",
+        &settings.over_sampling.to_string(),
+    );
     if settings.cell_constant_material {
         attribute(&mut element, "CellConstantMaterial", "1");
     }
@@ -310,7 +329,11 @@ pub fn write_fdtd_element(settings: &FdtdWriteSettings) -> String {
     {
         attribute(&mut element, "f_max", &f_max.to_string());
     }
-    attribute(&mut element, "TimeStepMethod", &settings.time_step_method.to_string());
+    attribute(
+        &mut element,
+        "TimeStepMethod",
+        &settings.time_step_method.to_string(),
+    );
     if settings.time_step > 0.0 {
         attribute(&mut element, "TimeStep", &settings.time_step.to_string());
     }
@@ -431,7 +454,10 @@ mod tests {
 
     #[test]
     fn a_file_without_fdtd_keeps_the_defaults() {
-        assert_eq!(parse_fdtd_options("<openEMS><ContinuousStructure/></openEMS>"), FdtdOptions::default());
+        assert_eq!(
+            parse_fdtd_options("<openEMS><ContinuousStructure/></openEMS>"),
+            FdtdOptions::default()
+        );
     }
 
     #[test]

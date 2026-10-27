@@ -136,9 +136,8 @@ impl SarCalculation {
             for j in 0..self.num_lines[1] {
                 for k in 0..self.num_lines[2] {
                     let index = self.index([i, j, k]);
-                    volume[index] = self.cell_width[0][i]
-                        * self.cell_width[1][j]
-                        * self.cell_width[2][k];
+                    volume[index] =
+                        self.cell_width[0][i] * self.cell_width[1][j] * self.cell_width[2][k];
                 }
             }
         }
@@ -403,14 +402,11 @@ impl SarCalculation {
                         let position = [i, j, k];
                         let mut partial = false;
                         for axis in 0..3 {
-                            if position[axis] == cube.start[axis]
-                                && cube.partial_start[axis] != 1.0
+                            if position[axis] == cube.start[axis] && cube.partial_start[axis] != 1.0
                             {
                                 partial = true;
                             }
-                            if position[axis] == cube.stop[axis]
-                                && cube.partial_stop[axis] != 1.0
-                            {
+                            if position[axis] == cube.stop[axis] && cube.partial_stop[axis] != 1.0 {
                                 partial = true;
                             }
                         }
@@ -457,13 +453,15 @@ impl SarCalculation {
             power_density
                 .iter()
                 .zip(self.cell_density.iter())
-                .map(|(power, density)| {
-                    if *density > 0.0 {
-                        power / density
-                    } else {
-                        0.0
-                    }
-                })
+                .map(
+                    |(power, density)| {
+                        if *density > 0.0 {
+                            power / density
+                        } else {
+                            0.0
+                        }
+                    },
+                )
                 .collect(),
         )
     }
@@ -485,10 +483,7 @@ impl SarCalculation {
 
     /// Index of the maximum SAR of one frequency.
     pub fn max_index(&self, frequency: usize) -> [usize; 3] {
-        self.max_index
-            .get(frequency)
-            .copied()
-            .unwrap_or([0; 3])
+        self.max_index.get(frequency).copied().unwrap_or([0; 3])
     }
 
     /// Total dissipated power of one frequency (W).
@@ -542,10 +537,7 @@ impl SarCalculation {
                     cube,
                 );
             }
-            if mass_valid
-                && face_valid
-                && cube.background_ratio < self.max_background_ratio
-            {
+            if mass_valid && face_valid && cube.background_ratio < self.max_background_ratio {
                 return (CubeStatus::Valid, cube);
             }
             if iteration > 0
@@ -616,8 +608,7 @@ impl SarCalculation {
                     distance += self.cell_width[axis][start];
                 }
                 if partial_start != -1.0 {
-                    partial_start =
-                        1.0 - (distance - half) / self.cell_width[axis][start];
+                    partial_start = 1.0 - (distance - half) / self.cell_width[axis][start];
                 }
                 if partial_start != -1.0 && pos[axis] == start {
                     partial_start = 2.0 * half / self.cell_width[axis][start];
@@ -657,44 +648,40 @@ impl SarCalculation {
         let mut background_volume = 0.0;
         let mut face_intersect = [false; 6];
         for i in cube.start[0]..=cube.stop[0] {
-            let weight_i = 1.0
-                * if i == cube.start[0] {
+            let weight_i =
+                1.0 * if i == cube.start[0] {
                     cube.partial_start[0].abs()
                 } else {
                     1.0
-                }
-                * if i == cube.stop[0] {
+                } * if i == cube.stop[0] {
                     cube.partial_stop[0].abs()
                 } else {
                     1.0
                 };
             for j in cube.start[1]..=cube.stop[1] {
-                let weight_j = 1.0
-                    * if j == cube.start[1] {
+                let weight_j =
+                    1.0 * if j == cube.start[1] {
                         cube.partial_start[1].abs()
                     } else {
                         1.0
-                    }
-                    * if j == cube.stop[1] {
+                    } * if j == cube.stop[1] {
                         cube.partial_stop[1].abs()
                     } else {
                         1.0
                     };
                 for k in cube.start[2]..=cube.stop[2] {
-                    let weight_k = 1.0
-                        * if k == cube.start[2] {
+                    let weight_k =
+                        1.0 * if k == cube.start[2] {
                             cube.partial_start[2].abs()
                         } else {
                             1.0
-                        }
-                        * if k == cube.stop[2] {
+                        } * if k == cube.stop[2] {
                             cube.partial_stop[2].abs()
                         } else {
                             1.0
                         };
                     let index = self.index([i, j, k]);
-                    let cell_volume =
-                        self.cell_volume[index] * weight_i * weight_j * weight_k;
+                    let cell_volume = self.cell_volume[index] * weight_i * weight_j * weight_k;
                     let density = self.cell_density[index];
                     mass += density * cell_volume;
                     volume += cell_volume;
@@ -731,37 +718,34 @@ impl SarCalculation {
         let mut values = vec![0.0f64; self.frequencies.len()];
         let mut mass = 0.0;
         for i in cube.start[0]..=cube.stop[0] {
-            let weight_i = 1.0
-                * if i == cube.start[0] {
+            let weight_i =
+                1.0 * if i == cube.start[0] {
                     cube.partial_start[0].abs()
                 } else {
                     1.0
-                }
-                * if i == cube.stop[0] {
+                } * if i == cube.stop[0] {
                     cube.partial_stop[0].abs()
                 } else {
                     1.0
                 };
             for j in cube.start[1]..=cube.stop[1] {
-                let weight_j = 1.0
-                    * if j == cube.start[1] {
+                let weight_j =
+                    1.0 * if j == cube.start[1] {
                         cube.partial_start[1].abs()
                     } else {
                         1.0
-                    }
-                    * if j == cube.stop[1] {
+                    } * if j == cube.stop[1] {
                         cube.partial_stop[1].abs()
                     } else {
                         1.0
                     };
                 for k in cube.start[2]..=cube.stop[2] {
-                    let weight_k = 1.0
-                        * if k == cube.start[2] {
+                    let weight_k =
+                        1.0 * if k == cube.start[2] {
                             cube.partial_start[2].abs()
                         } else {
                             1.0
-                        }
-                        * if k == cube.stop[2] {
+                        } * if k == cube.stop[2] {
                             cube.partial_stop[2].abs()
                         } else {
                             1.0
@@ -774,9 +758,8 @@ impl SarCalculation {
                     }
                     mass += density * self.cell_volume[index] * weight;
                     for (frequency, value) in values.iter_mut().enumerate() {
-                        *value += self.power_density[frequency][index]
-                            * self.cell_volume[index]
-                            * weight;
+                        *value +=
+                            self.power_density[frequency][index] * self.cell_volume[index] * weight;
                     }
                 }
             }
@@ -799,11 +782,7 @@ mod tests {
     fn uniform_block(cells: usize, width: f64, density: f64) -> SarCalculation {
         let lines = cells + 1;
         let mut calc = SarCalculation::new([lines, lines, lines]);
-        calc.set_cell_width([
-            vec![width; lines],
-            vec![width; lines],
-            vec![width; lines],
-        ]);
+        calc.set_cell_width([vec![width; lines], vec![width; lines], vec![width; lines]]);
         calc.set_cell_density(vec![density; lines * lines * lines]);
         calc
     }
@@ -874,7 +853,11 @@ mod tests {
         assert_eq!(cube.stop, [6, 6, 6]);
         assert_eq!(cube.partial_start, [1.0; 3]);
         assert_eq!(cube.partial_stop, [1.0; 3]);
-        assert!((cube.mass - 1.0e-3).abs() / 1.0e-3 < 1.0e-9, "mass {}", cube.mass);
+        assert!(
+            (cube.mass - 1.0e-3).abs() / 1.0e-3 < 1.0e-9,
+            "mass {}",
+            cube.mass
+        );
         assert!((cube.volume - 1.0e-6).abs() / 1.0e-6 < 1.0e-9);
     }
 

@@ -107,7 +107,11 @@ impl EngineMeta {
     }
 
     /// Material at a component/index position, if a grid is attached.
-    pub fn material_at(&self, component: usize, pos: [usize; 3]) -> Option<&crate::operator::CellMaterial> {
+    pub fn material_at(
+        &self,
+        component: usize,
+        pos: [usize; 3],
+    ) -> Option<&crate::operator::CellMaterial> {
         let grid = self.materials.as_deref()?;
         let nx = self.num_lines[0];
         let ny = self.num_lines[1];
@@ -292,9 +296,7 @@ impl EngineMeta {
         let coordinate = if axis == 1
             && matches!(
                 self.mesh_type,
-                crate::operator::MeshType::Cylindrical {
-                    closed_alpha: true
-                }
+                crate::operator::MeshType::Cylindrical { closed_alpha: true }
             ) {
             self.fit_alpha(coordinate)
         } else {
@@ -310,11 +312,8 @@ impl EngineMeta {
             && axis == 1
             && matches!(
                 self.mesh_type,
-                crate::operator::MeshType::Cylindrical {
-                    closed_alpha: true
-                }
-            )
-        {
+                crate::operator::MeshType::Cylindrical { closed_alpha: true }
+            ) {
             count_all.saturating_sub(2)
         } else {
             count_all
@@ -663,7 +662,8 @@ pub struct FieldProbe {
 
 impl FieldProbe {
     /// Create a new field probe.
-    pub fn new(name: &str, position: [f64; 3]) -> Self {        Self {
+    pub fn new(name: &str, position: [f64; 3]) -> Self {
+        Self {
             name: name.to_string(),
             processing_name: name.to_string(),
             position,
@@ -842,8 +842,9 @@ impl Processing for FieldProbe {
             || (self.process_interval == 0 && self.process_steps.is_empty())
         {
             if let Some(index) = interface.meta.index_from_coordinates(self.position) {
-                let sample =
-                    *interface.volt.get(self.component, index[0], index[1], index[2]);
+                let sample = *interface
+                    .volt
+                    .get(self.component, index[0], index[1], index[2]);
                 self.samples.push(sample);
                 let time = num_ts as f64 * interface.meta.dt;
                 for (frequency, accumulator) in self.frequencies.iter().zip(self.dft.iter_mut()) {
@@ -1530,15 +1531,14 @@ impl Processing for ProcessFieldsTD {
                 .collect()
         });
         let coordinate_refs: [&[f64]; 3] = [&coordinates[0], &coordinates[1], &coordinates[2]];
-        let reduced =
-            extract_physical_field(
-                field,
-                &indices,
-                interface.meta,
-                self.dual_mesh,
-                self.dump_mode,
-                self.dump_type,
-            );
+        let reduced = extract_physical_field(
+            field,
+            &indices,
+            interface.meta,
+            self.dual_mesh,
+            self.dump_mode,
+            self.dump_type,
+        );
 
         if self.file_type == HDF5_FILETYPE {
             // Native: /FieldData/TD/<8-digit timestep> + a `time` attribute.
@@ -1565,8 +1565,8 @@ impl Processing for ProcessFieldsTD {
                 )?;
                 writer.write_time_attribute(
                     &format!("/FieldData/TD/{dataset}"),
-                    ((num_ts as f64 + if self.dual_time { 0.5 } else { 0.0 })
-                        * interface.meta.dt) as f32,
+                    ((num_ts as f64 + if self.dual_time { 0.5 } else { 0.0 }) * interface.meta.dt)
+                        as f32,
                 )
             })();
             if let Err(error) = result {
@@ -1946,11 +1946,7 @@ impl Processing for ProcessFieldsFD {
                     &self.opt_resolution,
                 ),
             ];
-            self.dims = Some([
-                indices[0].len(),
-                indices[1].len(),
-                indices[2].len(),
-            ]);
+            self.dims = Some([indices[0].len(), indices[1].len(), indices[2].len()]);
             self.disc_lines = Some([0, 1, 2].map(|axis| {
                 indices[axis]
                     .iter()
@@ -1966,11 +1962,7 @@ impl Processing for ProcessFieldsFD {
             self.indices = Some(indices);
         }
         let indices = self.indices.clone().expect("indices built above");
-        let dims = [
-            indices[0].len(),
-            indices[1].len(),
-            indices[2].len(),
-        ];
+        let dims = [indices[0].len(), indices[1].len(), indices[2].len()];
         self.ensure_accumulators(dims);
         let field = if matches!(self.dump_type, 1 | 3 | 5) {
             interface.curr
@@ -1986,8 +1978,7 @@ impl Processing for ProcessFieldsFD {
             self.dump_type,
         );
         let [nx, ny, nz] = dims;
-        let time =
-            (num_ts as f64 + if self.dual_time { 0.5 } else { 0.0 }) * interface.meta.dt;
+        let time = (num_ts as f64 + if self.dual_time { 0.5 } else { 0.0 }) * interface.meta.dt;
         let scale = 2.0 * interface.meta.dt * interval as f64;
         for (frequency, (re, im)) in self
             .frequencies
@@ -2103,16 +2094,13 @@ impl ProcessFieldsFD {
         let field_name = Self::get_field_name_by_type(self.dump_type);
         let [nx, ny, nz] = dims;
         // Native `VTK_File_Writer` uses the real mesh lines, not the index.
-        let coordinates: [Vec<f64>; 3] = self
-            .disc_lines
-            .clone()
-            .unwrap_or_else(|| {
-                [
-                    (0..nx).map(|index| index as f64).collect(),
-                    (0..ny).map(|index| index as f64).collect(),
-                    (0..nz).map(|index| index as f64).collect(),
-                ]
-            });
+        let coordinates: [Vec<f64>; 3] = self.disc_lines.clone().unwrap_or_else(|| {
+            [
+                (0..nx).map(|index| index as f64).collect(),
+                (0..ny).map(|index| index as f64).collect(),
+                (0..nz).map(|index| index as f64).collect(),
+            ]
+        });
         for (index, frequency) in self.frequencies.iter().enumerate() {
             let re = &self.acc_re[index];
             let im = &self.acc_im[index];
@@ -2583,12 +2571,8 @@ impl ProcessFieldsSAR {
                     let dst = (ii * dims[1] + jj) * dims[2] + kk;
                     out.volume[dst] = self.cell_data.volume.get(src).copied().unwrap_or(0.0);
                     out.density[dst] = self.cell_data.density.get(src).copied().unwrap_or(0.0);
-                    out.conductivity[dst] = self
-                        .cell_data
-                        .conductivity
-                        .get(src)
-                        .copied()
-                        .unwrap_or(0.0);
+                    out.conductivity[dst] =
+                        self.cell_data.conductivity.get(src).copied().unwrap_or(0.0);
                 }
             }
         }
@@ -2767,8 +2751,7 @@ impl ProcessFieldsSAR {
                 for i in 0..dims[0] {
                     for j in 0..dims[1] {
                         for k in 0..dims[2] {
-                            let offset =
-                                ((component * dims[0] + i) * dims[1] + j) * dims[2] + k;
+                            let offset = ((component * dims[0] + i) * dims[1] + j) * dims[2] + k;
                             e_field.set(
                                 component,
                                 i,
@@ -2787,7 +2770,10 @@ impl ProcessFieldsSAR {
         }
         let mut runner = crate::sar_hdf5::SarRunner::new();
         if !runner.set_averaging_method(&self.sar_method) {
-            return Err(format!("unknown SAR averaging method '{}'", self.sar_method));
+            return Err(format!(
+                "unknown SAR averaging method '{}'",
+                self.sar_method
+            ));
         }
         runner.averaging_mass = self.averaging_mass();
         let cell_data = match &self.indices {
@@ -3200,7 +3186,12 @@ impl HDF5FileWriter {
     ///
     /// `dump_type` follows the native `DumpType` enum, `dual_mesh` records the
     /// interpolation mesh and `legacy_fmt` selects the Octave/MATLAB ordering.
-    pub fn create(&self, dump_type: i32, dual_mesh: bool, legacy_fmt: bool) -> Result<(), Hdf5Error> {
+    pub fn create(
+        &self,
+        dump_type: i32,
+        dual_mesh: bool,
+        legacy_fmt: bool,
+    ) -> Result<(), Hdf5Error> {
         let file = Hdf5File::create(&self.filename)?;
         file.write_f64_attribute("/", "openEMS_HDF5_version", OPENEMS_HDF5_VERSION)?;
         file.write_i32_attribute("/", "dump_type", dump_type)?;
@@ -3369,9 +3360,7 @@ fn compute_dump_indices(
     let closed_alpha = axis == 1
         && matches!(
             meta.mesh_type,
-            crate::operator::MeshType::Cylindrical {
-                closed_alpha: true
-            }
+            crate::operator::MeshType::Cylindrical { closed_alpha: true }
         );
     let count_nonfull = if closed_alpha {
         count.saturating_sub(2)
@@ -3494,8 +3483,7 @@ fn physical_at(
     pos: [usize; 3],
     dump_type: i32,
 ) -> f64 {
-    if pos[0] >= meta.num_lines[0] || pos[1] >= meta.num_lines[1] || pos[2] >= meta.num_lines[2]
-    {
+    if pos[0] >= meta.num_lines[0] || pos[1] >= meta.num_lines[1] || pos[2] >= meta.num_lines[2] {
         return 0.0;
     }
     let length = if dual {
@@ -3594,9 +3582,7 @@ fn extract_physical_field(
     // at `alpha = 0` and cell interpolation wraps the last azimuthal line.
     let closed_seam = matches!(
         meta.mesh_type,
-        crate::operator::MeshType::Cylindrical {
-            closed_alpha: true
-        }
+        crate::operator::MeshType::Cylindrical { closed_alpha: true }
     );
     let seam_hi = meta.num_lines[1].saturating_sub(2);
     for n in 0..3 {
@@ -3641,7 +3627,8 @@ fn extract_physical_field(
                                         let delta_down = meta.edge_length(n, lower);
                                         let ratio = delta / (delta + delta_down);
                                         upper * (1.0 - ratio)
-                                            + physical_at(values, meta, false, n, lower, mode_type) * ratio
+                                            + physical_at(values, meta, false, n, lower, mode_type)
+                                                * ratio
                                     }
                                 }
                             }
@@ -3676,7 +3663,8 @@ fn extract_physical_field(
                                 {
                                     0.0
                                 } else {
-                                    let mut summed = physical_at(values, meta, true, n, pos, mode_type);
+                                    let mut summed =
+                                        physical_at(values, meta, true, n, pos, mode_type);
                                     let mut probe = pos;
                                     probe[n_p] -= 1;
                                     summed += physical_at(values, meta, true, n, probe, mode_type);
@@ -3702,7 +3690,8 @@ fn extract_physical_field(
                                     } else {
                                         let ratio = delta / (delta + delta_up);
                                         lower * (1.0 - ratio)
-                                            + physical_at(values, meta, true, n, probe, mode_type) * ratio
+                                            + physical_at(values, meta, true, n, probe, mode_type)
+                                                * ratio
                                     }
                                 }
                             }
@@ -3782,7 +3771,11 @@ impl VTKFileWriter {
             if i > 0 {
                 w(" ");
             }
-            w(&format!("{:.precision$}", v, precision = self.precision as usize));
+            w(&format!(
+                "{:.precision$}",
+                v,
+                precision = self.precision as usize
+            ));
         }
         w("\n");
     }
@@ -4558,8 +4551,7 @@ mod fd_dump_tests {
         let steps = 2_000u32;
         for step in 0..steps {
             let time = step as f64 * meta.dt;
-            *volt.get_mut(0, 1, 1, 1) =
-                (2.0 * std::f64::consts::PI * signal * time).sin() as f32;
+            *volt.get_mut(0, 1, 1, 1) = (2.0 * std::f64::consts::PI * signal * time).sin() as f32;
             let interface = EngineInterface {
                 meta: &meta,
                 volt: &volt,
@@ -4706,7 +4698,8 @@ mod hdf5_dump_tests {
         let path = format!("{prefix}.h5");
         let file = Hdf5File::open(&path, false).expect("open dump");
         assert_eq!(
-            file.read_f64_attribute("/", "openEMS_HDF5_version").unwrap(),
+            file.read_f64_attribute("/", "openEMS_HDF5_version")
+                .unwrap(),
             OPENEMS_HDF5_VERSION
         );
         assert_eq!(file.read_i32_attribute("/", "dump_type").unwrap(), 0);
@@ -4727,7 +4720,8 @@ mod hdf5_dump_tests {
         let component_z = 2 * 27 + 1 * 9 + 1 * 3 + 1;
         assert_eq!(values[component_z], 3.0);
         assert_eq!(
-            file.read_string_attribute("/FieldData/TD/00000001", "d_order").unwrap(),
+            file.read_string_attribute("/FieldData/TD/00000001", "d_order")
+                .unwrap(),
             "NZYX"
         );
         let time = file
@@ -4772,17 +4766,11 @@ mod hdf5_dump_tests {
         // D = eps0 * eps_r * E (native `m_epsR` stores absolute permittivity)
         let d_field = extract_physical_field(&volt, &indices, &meta, false, 0, 4);
         let expected_d = crate::constants::EPS0 * 2.0 * 5.0;
-        assert!(
-            (*d_field.get(0, 0, 0, 0) as f64 - expected_d).abs()
-                <= 1e-6 * expected_d.abs()
-        );
+        assert!((*d_field.get(0, 0, 0, 0) as f64 - expected_d).abs() <= 1e-6 * expected_d.abs());
         // B = mue0 * mue_r * H (native `m_mueR` stores absolute permeability)
         let b_field = extract_physical_field(&curr, &indices, &meta, false, 0, 5);
         let expected_b = crate::constants::MU0 * 3.0 * 7.0;
-        assert!(
-            (*b_field.get(0, 0, 0, 0) as f64 - expected_b).abs()
-                <= 1e-6 * expected_b.abs()
-        );
+        assert!((*b_field.get(0, 0, 0, 0) as f64 - expected_b).abs() <= 1e-6 * expected_b.abs());
         // rot(H)_x = (2 - 1 + 3 - 1) / 1
         let rot = extract_physical_field(&curr, &indices, &meta, false, 0, 3);
         assert_eq!(*rot.get(0, 0, 0, 0), 3.0);
@@ -4834,8 +4822,7 @@ mod hdf5_dump_tests {
         dump.add_frequency(1.0e9);
         for step in 0..400u32 {
             let time = step as f64 * meta.dt;
-            *volt.get_mut(2, 2, 1, 1) =
-                (2.0 * std::f64::consts::PI * 1.0e9 * time).sin() as f32;
+            *volt.get_mut(2, 2, 1, 1) = (2.0 * std::f64::consts::PI * 1.0e9 * time).sin() as f32;
             let interface = EngineInterface {
                 meta: &meta,
                 volt: &volt,
@@ -5129,7 +5116,9 @@ mod cylindrical_dump_tests {
             disc_lines: [rho, alpha, z],
             dt: 1.0e-12,
             materials: None,
-            mesh_type: crate::operator::MeshType::Cylindrical { closed_alpha: false },
+            mesh_type: crate::operator::MeshType::Cylindrical {
+                closed_alpha: false,
+            },
             grid_delta: 1.0e-3,
         };
         let mut volt = FieldArray::new("volt", [3, 3, 2]);
