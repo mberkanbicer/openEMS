@@ -1030,6 +1030,110 @@ impl Operator {
                 }
             }
         }
+
+        // Native `CalcECOperator` calls `CalcPEC_Curves` after the containment
+        // pass: a metal `Curve` is not a volume, so the material grid never
+        // marks its edges as PEC.
+        self.calc_pec_curves();
+    }
+
+    /// Mark the edges along a metal `Curve` as perfect conductors.
+    ///
+    /// Mirrors `Operator::CalcPEC_Curves` (`FDTD/operator.cpp:2064-2097`): for
+    /// every METAL property, every `Curve` primitive is walked point by point
+    /// with [`Self::find_path`], and each edge on the path gets `VV = VI = 0`.
+    /// The primitive is marked used when a path is non-empty. Like the native
+    /// code, a `Wire` is not a curve (`CSPrimitives::ToCurve()` matches
+    /// `Type == CURVE` only), and the native `m_Nr_PEC` statistics counter has
+    /// no Rust consumer.
+    fn calc_pec_curves(&mut self) {
+        let Some(structure) = self.structure.as_ref() else {
+            return;
+        };
+        let mesh_system = if self.is_cylindrical() {
+            csxcad_core::grid::CoordinateSystem::Cylindrical
+        } else {
+            csxcad_core::grid::CoordinateSystem::Cartesian
+        };
+        let params = structure.parameters();
+        let mut paths: Vec<(usize, usize, Vec<(usize, [usize; 3])>)> = Vec::new();
+        for index in 0..structure.property_count() {
+            let Some(property) = structure.property_by_index(index) else {
+                continue;
+            };
+            if property.property_type() != csxcad_core::model::PropertyType::Metal {
+                continue;
+            }
+            for (primitive_index, primitive) in property.primitives().iter().enumerate() {
+                let Some(curve) = primitive.curve_shape() else {
+                    continue;
+                };
+                let point_system =
+                    if primitive.coordinate_system() == csxcad_core::grid::CoordinateSystem::Undefined
+                    {
+                        primitive.mesh_type()
+                    } else {
+                        primitive.coordinate_system()
+                    };
+                let point = |at: usize| -> Option<[f64; 3]> {
+                    let coordinates = curve.point(at, Some(params)).ok()??;
+                    let cartesian = csxcad_core::grid::transform_coordinates(
+                        coordinates,
+                        point_system,
+                        csxcad_core::grid::CoordinateSystem::Cartesian,
+                    );
+                    let cartesian = primitive
+                        .transform()
+                        .map_or(cartesian, |transform| transform.transform(cartesian));
+                    Some(csxcad_core::grid::transform_coordinates(
+                        cartesian,
+                        csxcad_core::grid::CoordinateSystem::Cartesian,
+                        mesh_system,
+                    ))
+                };
+                let mut edges = Vec::new();
+                for at in 1..curve.point_count() {
+                    let (Some(p1), Some(p2)) = (point(at - 1), point(at)) else {
+                        continue;
+                    };
+                    let path = self.find_path(p1, p2);
+                    for (edge, direction) in path.dir.iter().enumerate() {
+                        edges.push((
+                            *direction as usize,
+                            [
+                                path.pos_path[0][edge] as usize,
+                                path.pos_path[1][edge] as usize,
+                                path.pos_path[2][edge] as usize,
+                            ],
+                        ));
+                    }
+                }
+                if !edges.is_empty() {
+                    paths.push((index, primitive_index, edges));
+                }
+            }
+        }
+        if paths.is_empty() {
+            return;
+        }
+
+        if let (Some(vv), Some(vi)) = (self.vv_ptr.as_mut(), self.vi_ptr.as_mut()) {
+            for (_, _, edges) in &paths {
+                for &(n, pos) in edges {
+                    *vv.get_mut(n, pos[0], pos[1], pos[2]) = 0.0;
+                    *vi.get_mut(n, pos[0], pos[1], pos[2]) = 0.0;
+                }
+            }
+        }
+        if let Some(structure) = self.structure.as_mut() {
+            for (property_index, primitive_index, _) in &paths {
+                if let Some(property) = structure.property_by_index_mut(*property_index) {
+                    if let Some(primitive) = property.primitive_mut(*primitive_index) {
+                        primitive.set_used(true);
+                    }
+                }
+            }
+        }
     }
 
     /// Recompute the update coefficients for one edge from its (possibly
@@ -6403,5 +6507,57 @@ mod coordinate_system_tests {
         op.base.d_t = 1.0e-12;
         let extension = op.build_excitation_extension(&signal);
         assert!(!extension.voltage_excitations.is_empty());
+    }
+
+    /// Native `Operator::CalcPEC_Curves` (`FDTD/operator.cpp:2064-2097`): a
+    /// metal `Curve` is walked with `FindPath` and every edge on the path gets
+    /// `VV = VI = 0`; a `Wire` is not a curve and never marks anything.
+    #[test]
+    fn metal_curve_marks_the_path_as_pec() {
+        let values: Vec<String> = (0..7).map(|index| index.to_string()).collect();
+        let joined = values.join(",");
+        let xml = format!(
+            r#"<ContinuousStructure CoordSystem="0">
+                <RectilinearGrid DeltaUnit="0.001">
+                    <XLines>{joined}</XLines>
+                    <YLines>{joined}</YLines>
+                    <ZLines>{joined}</ZLines>
+                </RectilinearGrid>
+                <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                <Properties>
+                    <Metal Name="strip">
+                        <Primitives>
+                            <Curve Priority="0">
+                                <Vertex X="2" Y="2" Z="2"/>
+                                <Vertex X="4" Y="2" Z="2"/>
+                            </Curve>
+                        </Primitives>
+                    </Metal>
+                </Properties>
+            </ContinuousStructure>"#
+        );
+        let mut op = Operator::new();
+        op.load_csx(&xml).expect("metal curve CSX should load");
+        op.base.m_bc = [crate::BC_PEC; 6];
+        op.calc_timestep();
+        op.calc_ec_operator();
+
+        let vv = op.vv_ptr.as_ref().expect("vv allocated");
+        let vi = op.vi_ptr.as_ref().expect("vi allocated");
+        for pos in [[2, 2, 2], [3, 2, 2]] {
+            assert_eq!(*vv.get(0, pos[0], pos[1], pos[2]), 0.0, "vv at {pos:?}");
+            assert_eq!(*vi.get(0, pos[0], pos[1], pos[2]), 0.0, "vi at {pos:?}");
+        }
+        // The neighbouring edge on the same line is unaffected.
+        assert_ne!(*vv.get(0, 1, 2, 2), 0.0);
+        assert!(*vi.get(0, 1, 2, 2) > 0.0);
+
+        let used = op
+            .structure
+            .as_ref()
+            .and_then(|structure| structure.property_by_index(0))
+            .and_then(|property| property.primitive(0))
+            .map(|primitive| primitive.is_used());
+        assert_eq!(used, Some(true), "the metal curve must be marked used");
     }
 }
