@@ -757,15 +757,36 @@ mod backend {
             )
         }
 
-        /// Write a boolean attribute as an `i32` so any HDF5 reader (including
-        /// `h5readatt` in Octave/MATLAB) sees a plain number.
+        /// Write a boolean attribute as an unsigned byte.
+        ///
+        /// Native `HDF5_File_Writer` stores `dual_mesh`, `legacy_fmt` and the
+        /// other flags as `H5T_NATIVE_UCHAR`; writing them as `i32` makes the
+        /// native `HDF5_File_Reader` report "Unexpected attribute data type"
+        /// and fall back to the wrong layout, which breaks `nf2ff` on a
+        /// Rust-written dump.
         pub fn write_bool_attribute(
             &self,
             path: &str,
             name: &str,
             value: bool,
         ) -> Result<(), Hdf5Error> {
-            self.write_i32_attribute(path, name, i32::from(value))
+            self.write_u8_attribute(path, name, u8::from(value))
+        }
+
+        /// Write an unsigned-byte attribute on `path`.
+        pub fn write_u8_attribute(
+            &self,
+            path: &str,
+            name: &str,
+            value: u8,
+        ) -> Result<(), Hdf5Error> {
+            self.write_attribute_of(
+                path,
+                name,
+                unsafe { H5T_STD_U8LE_g },
+                unsafe { H5T_NATIVE_UINT8_g },
+                &|| &value as *const u8 as *const c_void,
+            )
         }
 
         /// Write a variable-length UTF-8 string attribute on `path`.
