@@ -10,7 +10,7 @@ use crate::extensions::{
     EngineExtTFSF, EngineExtUPML, LumpedRLCCoeffs,
 };
 use crate::operator_base::{GridPath, OperatorBase};
-use csxcad_core::grid::transform_coordinates;
+use csxcad_core::grid::{transform_coordinates, CoordinateSystem};
 use csxcad_core::material::{ConductingSheetProperties, ExcitationProperties, MaterialField};
 use csxcad_core::model::{Primitive, PropertyType};
 use std::collections::HashMap;
@@ -371,6 +371,19 @@ impl Operator {
     /// True for a full `2*pi` azimuthal mesh with a duplicated seam plane.
     pub fn closed_alpha(&self) -> bool {
         matches!(self.mesh_type, MeshType::Cylindrical { closed_alpha: true })
+    }
+
+    /// Number of alpha lines in the requested mesh.
+    ///
+    /// Mirrors native `Operator_Cylinder::GetNumberOfLines`
+    /// (`FDTD/operator_cylinder.cpp:110-120`): with `full_mesh == false` a
+    /// closed azimuth hides the two seam lines (`numLines[1] - 2`, i.e. the
+    /// number of cells), with `full_mesh == true` all lines are reported.
+    fn alpha_line_count(&self, full_mesh: bool) -> u32 {
+        if !full_mesh && self.closed_alpha() {
+            return self.base.num_lines[1].saturating_sub(2);
+        }
+        self.base.num_lines[1]
     }
 
     /// Index into the flat per-component EC arrays.
@@ -1068,13 +1081,13 @@ impl Operator {
                 let Some(curve) = primitive.curve_shape() else {
                     continue;
                 };
-                let point_system =
-                    if primitive.coordinate_system() == csxcad_core::grid::CoordinateSystem::Undefined
-                    {
-                        primitive.mesh_type()
-                    } else {
-                        primitive.coordinate_system()
-                    };
+                let point_system = if primitive.coordinate_system()
+                    == csxcad_core::grid::CoordinateSystem::Undefined
+                {
+                    primitive.mesh_type()
+                } else {
+                    primitive.coordinate_system()
+                };
                 let point = |at: usize| -> Option<[f64; 3]> {
                     let coordinates = curve.point(at, Some(params)).ok()??;
                     let cartesian = csxcad_core::grid::transform_coordinates(
@@ -1496,11 +1509,23 @@ impl Operator {
 
     // ----- private helpers -----
 
-    /// Snap one coordinate to a mesh line index. Mirrors native
-    /// `Operator::SnapToMeshLine`.
+    /// Snap one coordinate to a mesh line index.
+    ///
+    /// Mirrors native `Operator::SnapToMeshLine` (`FDTD/operator.cpp:253-282`)
+    /// with the `Operator_Cylinder` override in front of it
+    /// (`FDTD/operator_cylinder.cpp:277-282`): an azimuth is folded into the
+    /// alpha range with `FitToAlphaRange` before the base snap runs. The other
+    /// directions, and every direction of a Cartesian mesh, are untouched.
     ///
     /// Returns the index and whether the coordinate was inside the mesh.
     pub fn snap_to_mesh_line(&self, axis: usize, coord: f64, dual: bool) -> (u32, bool) {
+        let coord = if axis == 1 && self.is_cylindrical() {
+            // operator_cylinder.cpp:279-280 — `FitToAlphaRange(coord)` with the
+            // default `fullMesh = false`.
+            self.fit_to_alpha_range(coord, false)
+        } else {
+            coord
+        };
         let counts = self.base.num_lines;
         let n = counts[axis] as usize;
         if n == 0 {
@@ -1635,13 +1660,42 @@ impl Operator {
 
     /// Snap a start/stop coordinate pair along a line onto the mesh.
     ///
-    /// Mirrors native `Operator::SnapLine2Mesh` (`FDTD/operator.cpp:361-389`)
-    /// with `dualMesh` and `fullMesh` as parameters. `None` is the native
-    /// `-1` return: both endpoints of at least one axis lie on the same side
-    /// outside the mesh, i.e. the line cannot be snapped at all. The native
-    /// positive return value only reports which endpoints were clamped and is
-    /// not used by `FindPath`, so it is not modelled.
+    /// The shared entry point for native `SnapLine2Mesh`: the base version
+    /// (`FDTD/operator.cpp:361-389`) plus, on a cylindrical mesh, the
+    /// `Operator_Cylinder` override (`FDTD/operator_cylinder.cpp:307-317`) that
+    /// re-anchors a stop index which the base snap folded over the azimuth
+    /// seam. `None` is the native `-1` return: both endpoints of at least one
+    /// axis lie on the same side outside the mesh, i.e. the line cannot be
+    /// snapped at all. The native positive return value only reports which
+    /// endpoints were clamped and is not used by `FindPath`, so it is not
+    /// modelled.
     pub fn snap_line_to_mesh_native(
+        &self,
+        start: [f64; 3],
+        stop: [f64; 3],
+        dual: bool,
+        full_mesh: bool,
+    ) -> Option<([u32; 3], [u32; 3])> {
+        let mut snapped = self.snap_line_to_mesh_base(start, stop, dual, full_mesh)?;
+        if self.is_cylindrical() {
+            // operator_cylinder.cpp:311-314. `GetNumberOfLines(1, fullMesh)` is
+            // the full line count when `fullMesh` is set, which is the only way
+            // `FindPath` calls this; the pad line is dropped from the closed
+            // count, then `-1` moves from the line to the cell index.
+            let last_alpha = self.alpha_line_count(full_mesh) - 1 - u32::from(self.closed_alpha());
+            if stop[1] > start[1] && snapped.1[1] < snapped.0[1] && snapped.1[1] == 0 {
+                snapped.1[1] = last_alpha;
+            }
+            if stop[1] < start[1] && snapped.1[1] > snapped.0[1] && snapped.1[1] == last_alpha {
+                snapped.1[1] = 0;
+            }
+        }
+        Some(snapped)
+    }
+
+    /// Native base `Operator::SnapLine2Mesh` (`FDTD/operator.cpp:361-389`),
+    /// without the cylindrical seam remap.
+    fn snap_line_to_mesh_base(
         &self,
         start: [f64; 3],
         stop: [f64; 3],
@@ -1717,7 +1771,232 @@ impl Operator {
 
     /// Path of mesh edges from `start` to `stop`.
     ///
-    /// Mirrors native `Operator::FindPath` (`FDTD/operator.cpp:391-497`):
+    /// The shared entry point for native `FindPath`: a Cartesian mesh (and any
+    /// non-cylindrical operator) walks the base implementation, a cylindrical
+    /// mesh walks `Operator_Cylinder::FindPath` (`FDTD/operator_cylinder.cpp:320-475`),
+    /// which folds the azimuth, swaps decreasing endpoints, and stitches a
+    /// segment that crosses the closed-azimuth seam. Both curve consumers —
+    /// the excitation curve branch and `calc_pec_curves` — call this method and
+    /// therefore take the override automatically, exactly like the native
+    /// virtual call.
+    pub fn find_path(&self, start: [f64; 3], stop: [f64; 3]) -> GridPath {
+        if self.is_cylindrical() {
+            self.find_path_cylindrical(start, stop)
+        } else {
+            self.find_path_base(start, stop)
+        }
+    }
+
+    /// Fold an azimuth into the alpha range of the mesh.
+    ///
+    /// Mirrors native `Operator_Cylinder::FitToAlphaRange`
+    /// (`FDTD/operator_cylinder.cpp:226-250`) verbatim, including the two
+    /// `while` loops, the "cannot happen" tail and the mesh range it folds
+    /// into: `GetDiscLine(1, GetNumberOfLines(1, fullMesh) - 1)`. On a closed
+    /// azimuth with `full_mesh == false` that upper bound is one cell short of
+    /// `2*pi`, so a coordinate can be returned unchanged even though it lies
+    /// above the bound (native `operator_cylinder.cpp:240-247` returns the
+    /// original value then) — the callers rely on that.
+    pub fn fit_to_alpha_range(&self, coord: f64, full_mesh: bool) -> f64 {
+        if !self.is_cylindrical() {
+            return coord;
+        }
+        let metric = self.metric();
+        let count = self.alpha_line_count(full_mesh) as usize;
+        if count == 0 {
+            return coord;
+        }
+        let min = metric.line(1, 0, false);
+        let max = metric.line(1, count - 1, false);
+        let mut a_coord = coord;
+        if (a_coord >= min) && (a_coord <= max) {
+            return a_coord;
+        }
+        while a_coord < min {
+            a_coord += 2.0 * std::f64::consts::PI;
+            if a_coord > max {
+                return a_coord - 2.0 * std::f64::consts::PI;
+            }
+            if a_coord > min {
+                return a_coord;
+            }
+        }
+        while a_coord > max {
+            a_coord -= 2.0 * std::f64::consts::PI;
+            if a_coord < min {
+                return a_coord + 2.0 * std::f64::consts::PI;
+            }
+            if a_coord < max {
+                return a_coord;
+            }
+        }
+        // this cannot happen
+        a_coord
+    }
+
+    /// Cylindrical `FindPath`. Mirrors native `Operator_Cylinder::FindPath`
+    /// (`FDTD/operator_cylinder.cpp:320-475`).
+    fn find_path_cylindrical(&self, start: [f64; 3], stop: [f64; 3]) -> GridPath {
+        let empty = || GridPath {
+            pos_path: [Vec::new(), Vec::new(), Vec::new()],
+            dir: Vec::new(),
+        };
+        let counts = self.base.num_lines;
+        let metric = self.metric();
+        let mesh_system = CoordinateSystem::Cylindrical;
+
+        let mut l_start = start;
+        let mut l_stop = stop;
+
+        // operator_cylinder.cpp:331-337: fold the azimuth difference into
+        // +/-pi, so a span above half a turn is walked the short way round.
+        while (l_stop[1] - l_start[1]).abs() > std::f64::consts::PI {
+            if l_stop[1] > l_start[1] {
+                l_stop[1] -= 2.0 * std::f64::consts::PI;
+            } else {
+                l_stop[1] += 2.0 * std::f64::consts::PI;
+            }
+        }
+
+        // operator_cylinder.cpp:339-348: the greedy walk only moves forward, so
+        // a decreasing azimuth swaps the two endpoints component by component.
+        if l_start[1] > l_stop[1] {
+            for n in 0..3 {
+                std::mem::swap(&mut l_start[n], &mut l_stop[n]);
+            }
+        }
+
+        // operator_cylinder.cpp:350-358
+        let a_start = self.fit_to_alpha_range(l_start[1], false);
+        let a_stop = self.fit_to_alpha_range(l_stop[1], false);
+        if a_stop >= a_start {
+            l_start[1] = a_start;
+            l_stop[1] = a_stop;
+            // Native `Operator_Multithread::FindPath` — the base walk, whose
+            // `SnapLine2Mesh` is still the virtual cylindrical one.
+            return self.find_path_base(l_start, l_stop);
+        }
+
+        // operator_cylinder.cpp:362-369: only a line whose two endpoints lie on
+        // the same side of an axis fails; the bounds are the full mesh.
+        for n in 0..3 {
+            let lower = metric.line(n, 0, false);
+            let upper = metric.line(n, counts[n] as usize - 1, false);
+            if (l_start[n] < lower) && (l_stop[n] < lower) {
+                return empty(); // lower bound violation
+            }
+            if (l_start[n] > upper) && (l_stop[n] > upper) {
+                return empty(); // upper bound violation
+            }
+        }
+
+        // operator_cylinder.cpp:374-465: the segment steps over the alpha
+        // bounds, so both ends are walked separately and stitched together.
+        // The seam plane sits at the last alpha line that is not the pad.
+        let seam_index = counts[1] as usize - 1 - usize::from(self.closed_alpha());
+        let seam_alpha = metric.line(1, seam_index, false);
+
+        // operator_cylinder.cpp:381-403: plane through the alpha = max corner.
+        let mut p0 = [
+            metric.line(0, 0, false),
+            metric.line(1, 0, false),
+            metric.line(2, 0, false),
+        ];
+        let mut p1 = p0;
+        let mut p2 = p0;
+        p0[1] = seam_alpha;
+        p1[1] = seam_alpha;
+        p2[1] = seam_alpha;
+        p1[0] = metric.line(0, counts[0] as usize - 1, false);
+        p2[2] = metric.line(2, counts[2] as usize - 1, false);
+        let p0 = transform_coordinates(p0, mesh_system, CoordinateSystem::Cartesian);
+        let p1 = transform_coordinates(p1, mesh_system, CoordinateSystem::Cartesian);
+        let p2 = transform_coordinates(p2, mesh_system, CoordinateSystem::Cartesian);
+        let c_start = transform_coordinates(l_start, mesh_system, CoordinateSystem::Cartesian);
+        let c_stop = transform_coordinates(l_stop, mesh_system, CoordinateSystem::Cartesian);
+
+        let (mut ret, mut intersect) = line_plane_intersection(p0, p1, p2, c_start, c_stop);
+        if ret < 0 {
+            eprintln!("FindPath: Error, unable to calculate intersection, this should not happen!");
+            return empty(); // return empty path;
+        }
+
+        let mut path1 = empty();
+        let mut path2 = empty();
+
+        if ret == 0 {
+            // operator_cylinder.cpp:410-418
+            intersect = transform_coordinates(intersect, CoordinateSystem::Cartesian, mesh_system);
+            intersect[1] = seam_alpha;
+            l_start[1] = self.fit_to_alpha_range(l_start[1], false);
+            // Native calls `Operator::FindPath` here, i.e. the base walk.
+            path1 = self.find_path_base(l_start, intersect);
+        }
+
+        if !self.closed_alpha() {
+            // operator_cylinder.cpp:420-440: the same plane at the alpha
+            // minimum. `ret` and `intersect` are overwritten, so on a closed
+            // azimuth the values of the upper bound above are reused below —
+            // that is native behaviour, not an omission.
+            let q0 = [
+                metric.line(0, 0, false),
+                metric.line(1, 0, false),
+                metric.line(2, 0, false),
+            ];
+            let mut q1 = q0;
+            let mut q2 = q0;
+            q1[0] = metric.line(0, counts[0] as usize - 1, false);
+            q2[2] = metric.line(2, counts[2] as usize - 1, false);
+            let q0 = transform_coordinates(q0, mesh_system, CoordinateSystem::Cartesian);
+            let q1 = transform_coordinates(q1, mesh_system, CoordinateSystem::Cartesian);
+            let q2 = transform_coordinates(q2, mesh_system, CoordinateSystem::Cartesian);
+            let c_start = transform_coordinates(l_start, mesh_system, CoordinateSystem::Cartesian);
+            let c_stop = transform_coordinates(l_stop, mesh_system, CoordinateSystem::Cartesian);
+
+            let (lower_ret, lower_intersect) = line_plane_intersection(q0, q1, q2, c_start, c_stop);
+            ret = lower_ret;
+            intersect =
+                transform_coordinates(lower_intersect, CoordinateSystem::Cartesian, mesh_system);
+        }
+
+        if ret == 0 {
+            // operator_cylinder.cpp:442-449
+            intersect[1] = metric.line(1, 0, false);
+            l_stop[1] = self.fit_to_alpha_range(l_stop[1], false);
+            path2 = self.find_path_base(intersect, l_stop);
+        }
+
+        // operator_cylinder.cpp:451-465: path1 then path2, in that order.
+        let mut path = empty();
+        for t in 0..path1.dir.len() {
+            path.pos_path[0].push(path1.pos_path[0][t]);
+            path.pos_path[1].push(path1.pos_path[1][t]);
+            path.pos_path[2].push(path1.pos_path[2][t]);
+            path.dir.push(path1.dir[t]);
+        }
+        for t in 0..path2.dir.len() {
+            path.pos_path[0].push(path2.pos_path[0][t]);
+            path.pos_path[1].push(path2.pos_path[1][t]);
+            path.pos_path[2].push(path2.pos_path[2][t]);
+            path.dir.push(path2.dir[t]);
+        }
+
+        // operator_cylinder.cpp:467-472: on a closed azimuth the radial and z
+        // edges of the second half still sit on alpha line 0; move them to the
+        // duplicated seam plane so both halves meet.
+        if self.closed_alpha() {
+            for t in 0..path.dir.len() {
+                if ((path.dir[t] == 0) || (path.dir[t] == 2)) && (path.pos_path[1][t] == 0) {
+                    path.pos_path[1][t] = counts[1] - 2;
+                }
+            }
+        }
+
+        path
+    }
+
+    /// Native base `Operator::FindPath` (`FDTD/operator.cpp:391-497`).
+    ///
     /// `SnapLine2Mesh` with the main mesh (`dualMesh=false`, `fullMesh=true`),
     /// then a greedy walk over the six neighbouring nodes that only accepts a
     /// foot parameter strictly larger than the current one (`foot > currFoot`)
@@ -1730,7 +2009,7 @@ impl Operator {
     /// An unsnappable line or a walk that leaves the domain yields the empty
     /// path, exactly like the native early returns (`operator.cpp:397-398` and
     /// `465-468`).
-    pub fn find_path(&self, start: [f64; 3], stop: [f64; 3]) -> GridPath {
+    fn find_path_base(&self, start: [f64; 3], stop: [f64; 3]) -> GridPath {
         let empty = || GridPath {
             pos_path: [Vec::new(), Vec::new(), Vec::new()],
             dir: Vec::new(),
@@ -4355,6 +4634,84 @@ fn edge_length_value(
     disc_delta_value(&lines[n], counts[n] as usize, pos[n], dual) * grid_delta
 }
 
+/// 3x3 determinant in the row-major layout of native `Determinant`
+/// (`tools/useful.cpp:272-275`).
+fn determinant3(mat: &[f64; 9]) -> f64 {
+    mat[0] * mat[4] * mat[8] + mat[1] * mat[5] * mat[6] + mat[2] * mat[3] * mat[7]
+        - mat[2] * mat[4] * mat[6]
+        - mat[1] * mat[3] * mat[8]
+        - mat[0] * mat[5] * mat[7]
+}
+
+/// 3x3 inverse in the row-major layout of native `Invert`
+/// (`tools/useful.cpp:277-290`). The caller has already rejected a vanishing
+/// determinant, so this is only reached for the values native divides by.
+fn invert3(mat: &[f64; 9]) -> [f64; 9] {
+    let det = determinant3(mat);
+    [
+        (mat[4] * mat[8] - mat[5] * mat[7]) / det,
+        (mat[2] * mat[7] - mat[1] * mat[8]) / det,
+        (mat[1] * mat[5] - mat[2] * mat[4]) / det,
+        (mat[5] * mat[6] - mat[3] * mat[8]) / det,
+        (mat[0] * mat[8] - mat[2] * mat[6]) / det,
+        (mat[2] * mat[3] - mat[0] * mat[5]) / det,
+        (mat[3] * mat[7] - mat[4] * mat[6]) / det,
+        (mat[1] * mat[6] - mat[0] * mat[7]) / det,
+        (mat[0] * mat[4] - mat[1] * mat[3]) / det,
+    ]
+}
+
+/// Intersection of the segment `l_start`-`l_stop` with the parallelogram
+/// `p0`, `p1`, `p2`.
+///
+/// Mirrors native `LinePlaneIntersection` (`tools/useful.cpp:292-328`):
+/// returns `-1` for a degenerate matrix, `1` when the intersection lies outside
+/// the parallelogram (`u`/`v` outside `[0, 1]`), `2` when it lies outside the
+/// segment (`t` outside `[0, 1]`) and `0` for a real hit. The returned point is
+/// always `l_start*(1-t) + l_stop*t`, i.e. the native `is_point`, which is only
+/// meaningful for a `0` return. The native `dist` out-parameter is `t` and has
+/// no other consumer.
+fn line_plane_intersection(
+    p0: [f64; 3],
+    p1: [f64; 3],
+    p2: [f64; 3],
+    l_start: [f64; 3],
+    l_stop: [f64; 3],
+) -> (i32, [f64; 3]) {
+    let mut is_point = [0.0; 3];
+    let mut mat = [0.0; 9];
+    for n in 0..3 {
+        mat[3 * n] = l_start[n] - l_stop[n];
+        mat[3 * n + 1] = p1[n] - p0[n];
+        mat[3 * n + 2] = p2[n] - p0[n];
+    }
+    let det = determinant3(&mat);
+    if det.abs() < 1e-50 {
+        return (-1, is_point);
+    }
+    let inv_mat = invert3(&mat);
+
+    let mut t = 0.0;
+    let mut u = 0.0;
+    let mut v = 0.0;
+    for n in 0..3 {
+        t += inv_mat[n] * (l_start[n] - p0[n]);
+        u += inv_mat[3 + n] * (l_start[n] - p0[n]);
+        v += inv_mat[6 + n] * (l_start[n] - p0[n]);
+    }
+    for n in 0..3 {
+        is_point[n] = l_start[n] * (1.0 - t) + l_stop[n] * t;
+    }
+
+    if (u < 0.0) || (u > 1.0) || (v < 0.0) || (v > 1.0) {
+        return (1, is_point);
+    }
+    if (t < 0.0) || (t > 1.0) {
+        return (2, is_point);
+    }
+    (0, is_point)
+}
+
 impl Default for Operator {
     fn default() -> Self {
         Self::new()
@@ -4400,11 +4757,8 @@ impl OperatorBase for Operator {
         let axis = ny as usize;
         // native `Operator_Cylinder::GetNumberOfLines`: a closed azimuth hides
         // the duplicated seam lines from post-processing and the energy estimate
-        if !full
-            && axis == 1
-            && matches!(self.mesh_type, MeshType::Cylindrical { closed_alpha: true })
-        {
-            return self.base.num_lines[1].saturating_sub(2);
+        if axis == 1 {
+            return self.alpha_line_count(full);
         }
         self.base.num_lines[axis]
     }
@@ -6339,6 +6693,347 @@ mod coordinate_system_tests {
         assert!(
             (dist - std::f64::consts::FRAC_PI_4).abs() > 0.3,
             "dist {dist} must not be the naive (rho, alpha) distance"
+        );
+    }
+
+    /// Exact alpha line values, so the snapped coordinates and the mesh lines
+    /// are bit-identical.
+    const ALPHA_90: f64 = std::f64::consts::FRAC_PI_2;
+    const ALPHA_300: f64 = 5.235987755982989;
+    const ALPHA_360: f64 = std::f64::consts::TAU;
+
+    /// A quarter-turn open azimuth: 0/30/60/90 deg, rho 0..6 mm, z 0..4 mm.
+    fn quarter_turn_mesh() -> Operator {
+        let mut op = Operator::new();
+        op.load_csx(&cylindrical_mesh(
+            "0,1,2,3,4,5,6",
+            "0,0.5235987755982988,1.0471975511965976,1.5707963267948966",
+        ))
+        .expect("the open quarter-turn mesh must load");
+        op
+    }
+
+    /// A three-quarter-turn open azimuth: 0/90/180/270 deg.
+    fn three_quarter_mesh() -> Operator {
+        let mut op = Operator::new();
+        op.load_csx(&cylindrical_mesh(
+            "0,1,2,3,4,5,6",
+            "0,1.5707963267948966,3.141592653589793,4.71238898038469",
+        ))
+        .expect("the open three-quarter mesh must load");
+        op
+    }
+
+    /// A closed azimuth with six sectors: alpha lines at 0, 60, ..., 360 deg
+    /// plus the native pad line at 420 deg, i.e. `numLines[1] = 8`.
+    fn closed_six_sector_mesh() -> Operator {
+        let mut op = Operator::new();
+        op.load_csx(&cylindrical_mesh(
+            "0,1,2,3,4,5,6",
+            "0,1.0471975511965976,2.0943951023931953,3.141592653589793,4.1887902047863905,5.235987755982989,6.283185307179586",
+        ))
+        .expect("the closed six-sector mesh must load");
+        assert!(op.closed_alpha());
+        assert_eq!(op.base.num_lines[1], 8);
+        op
+    }
+
+    /// A decreasing azimuth is walked in the increasing direction, because
+    /// native swaps the two endpoints first.
+    ///
+    /// `Operator_Cylinder::FindPath` (`FDTD/operator_cylinder.cpp:331-348`):
+    ///
+    /// ```text
+    ///     while (fabs(l_stop[1]-l_start[1])>PI) { ... }   // pi fold
+    ///     if (l_start[1]>l_stop[1]) { for (n) swap(start[n], stop[n]); }
+    /// ```
+    ///
+    /// so 90 deg -> 0 deg is handed to the base walk as 0 deg -> 90 deg and
+    /// yields exactly the edges of the increasing case. On this mesh (alpha
+    /// lines 0/30/60/90 deg, unit rho lines, z = 3 mm) the increasing path was
+    /// derived from `operator.cpp:391-497` in
+    /// `find_path_on_a_cylindrical_mesh_uses_the_cartesian_metric`: rho 3->4 at
+    /// alpha 0, then three alpha edges at rho 3, then rho 3->4 at alpha 90.
+    ///
+    /// Dropping the swap would walk the same chord backwards (the probes only
+    /// accept `foot > currFoot`), and the first accepted neighbour from
+    /// (4, 90 deg) would be the rho-lower node (0, 3) at foot 0.125, distance
+    /// 0.707, so that path would start with `(0, [3, 3, 3])` and end with
+    /// `(0, [3, 0, 3])` — the mirrored order asserted against below.
+    #[test]
+    fn cylindrical_find_path_swaps_a_decreasing_azimuth() {
+        let op = quarter_turn_mesh();
+        let expected = vec![
+            (0, [3, 0, 3]),
+            (1, [3, 0, 3]),
+            (1, [3, 1, 3]),
+            (1, [3, 2, 3]),
+            (0, [3, 3, 3]),
+        ];
+        assert_eq!(
+            path_edges(&op.find_path([4.0, 0.0, 3.0], [4.0, ALPHA_90, 3.0])),
+            expected,
+            "the increasing azimuth must walk the documented path"
+        );
+        assert_eq!(
+            path_edges(&op.find_path([4.0, ALPHA_90, 3.0], [4.0, 0.0, 3.0])),
+            expected,
+            "the decreasing azimuth must be swapped onto the same path"
+        );
+        // The fold itself is not involved here: the delta is exactly pi/2.
+        assert_eq!(op.fit_to_alpha_range(ALPHA_90, false), ALPHA_90);
+        assert_eq!(op.fit_to_alpha_range(0.0, false), 0.0);
+    }
+
+    /// An azimuth span above pi is folded into +/-pi, so a curve that runs
+    /// 90 deg -> 300 deg is walked the short way round — backwards, out of the
+    /// open mesh, where it clamps to alpha line 0.
+    ///
+    /// Native (`operator_cylinder.cpp:331-348`) folds first and swaps after:
+    ///
+    /// ```text
+    ///     |300-90| > PI, stop > start  =>  l_stop[1] = 300 - 360 = -60 deg
+    ///     l_start[1] (90) > l_stop[1] (-60)  =>  swap  =>
+    ///         l_start = (4, -60 deg, 2), l_stop = (4, 90 deg, 2)
+    /// ```
+    ///
+    /// `FitToAlphaRange` (`:226-250`) then runs with `fullMesh=false`, so its
+    /// upper bound is `GetDiscLine(1, GetNumberOfLines(1,false)-1)` = 270 deg:
+    /// -60 deg is below the minimum, `+2*pi` lands on 300 deg which is above
+    /// the bound, so native returns `300 - 2*pi = -60 deg` unchanged
+    /// (`:240-247`), and 90 deg is inside the range. `a_stop >= a_start`, so
+    /// the base walk runs (`:353-358`); its `SnapLine2Mesh` folds -60 deg again
+    /// and clamps it to line 0 (outside the mesh), while 90 deg snaps to line 1
+    /// (the dual line is 0.5*(90+180) = 135 deg).
+    ///
+    /// Walk (`operator.cpp:391-497`), chord from (4,-60 deg) = (2, -3.4641) to
+    /// (4, 90 deg) = (0, 4) in Cartesian. The snapped start node (4, 0 deg, 2)
+    /// sits at foot 0.366 and the snapped stop node (4, 90 deg, 2) at foot 1, so
+    /// the loop runs: the rho-lower node (3, 0 deg, 2) is accepted first (foot
+    /// 0.399, distance 1.86), then replaced by the alpha-upper node (4, 90 deg,
+    /// 2) — the snapped stop node itself, distance 0 and foot 1. One alpha
+    /// edge, and the closure loop adds nothing because the walk ends on the
+    /// snapped stop index.
+    #[test]
+    fn cylindrical_find_path_folds_an_azimuth_span_above_pi() {
+        let op = three_quarter_mesh();
+        // 5*pi/3 is not the exact mesh literal; the value a Cartesian curve
+        // point would produce is -pi/3, and both fold into the same interval.
+        let stop = 5.0 * std::f64::consts::PI / 3.0;
+        assert_eq!(
+            path_edges(&op.find_path([4.0, ALPHA_90, 2.0], [4.0, stop, 2.0])),
+            vec![(1, [4, 0, 2])]
+        );
+        // The fold itself: 300 deg is not in [0, 270 deg], and neither is
+        // -60 deg, so both are returned unchanged; 90 deg stays put.
+        assert_eq!(op.fit_to_alpha_range(ALPHA_300, false), ALPHA_300);
+        // `:232-239` adds 2*pi, finds the result above the 270 deg bound and
+        // subtracts it again (`:235-236`), so the value is the round trip.
+        let folded_back = -std::f64::consts::FRAC_PI_3 + 2.0 * std::f64::consts::PI;
+        assert_eq!(
+            op.fit_to_alpha_range(-std::f64::consts::FRAC_PI_3, false),
+            folded_back - 2.0 * std::f64::consts::PI
+        );
+    }
+
+    /// A curve that crosses the azimuth seam of a closed mesh is split at the
+    /// alpha = 360 deg plane, and the second half's radial edges move onto the
+    /// duplicated seam plane.
+    ///
+    /// Native `Operator_Cylinder::FindPath` (`operator_cylinder.cpp:320-475`),
+    /// step by step for the curve (rho 2, alpha 300 deg) -> (rho 5, alpha
+    /// 10 deg) at z = 2 mm:
+    ///
+    /// 1. fold (`:331-337`): `|10-300| = 290 > pi` and `stop > start`, so
+    ///    `l_stop[1] = 370 deg`; no swap (300 < 370).
+    /// 2. fit (`:350-351`, `:226-250`): `a_start = Fit(300) = 300 deg`
+    ///    (`GetDiscLine(1, GetNumberOfLines(1,false)-1)` = line 5 = 300 deg is
+    ///    the upper bound), `a_stop = Fit(370) = 370 - 360 = 10 deg`. Since
+    ///    `a_stop < a_start`, the seam branch runs.
+    /// 3. seam plane (`:381-396`): `p0 = (0, 360 deg, 0)`, `p1 = (6, 360 deg,
+    ///    0)`, `p2 = (0, 360 deg, 4)` in mesh coordinates, i.e. the half plane
+    ///    y = 0 in Cartesian. The segment (1, -1.7321, 2) -> (4.9239, 0.8682, 2)
+    ///    crosses it at t = 1.7321/2.6003 = 0.6661 and x = 3.6131, so
+    ///    `intersect = (3.6131, 360 deg, 2)` and `LinePlaneIntersection`
+    ///    returns 0 (u = 0.60, v = 0.5, both inside the parallelogram).
+    /// 4. `path1 = Operator::FindPath((2, 300 deg, 2), (3.6131, 360 deg, 2))`
+    ///    (`:415`), i.e. the base walk: rho 2 and alpha 300 deg snap to
+    ///    (2, 5), the intersection snaps to rho 4 / alpha 0, which the
+    ///    cylindrical `SnapLine2Mesh` remaps to alpha 6 (`:311-314`) because
+    ///    the raw stop alpha is greater. Chord (1,-1.7321) -> (3.6131, 0):
+    ///
+    ///    | node after the step | edge taken | foot |
+    ///    | --- | --- | --- |
+    ///    | (2,6,2) | alpha 300->360 at rho 2, dist 0.891 beats rho-lower 0.998 | 0.571 |
+    ///    | (3,6,2) | rho 2->3 at alpha 360, dist 0.339 beats alpha 420 at 3.33 | 0.837 |
+    ///    | (4,6,2) | rho 3->4 at alpha 360, dist 0.214, foot = stopFoot | 1.103 |
+    ///
+    /// 5. closed alpha: the lower-bound block (`:420-440`) is skipped and
+    ///    `ret`/`intersect` still hold the upper-bound values, so
+    ///    (`:442-449`) `path2 = Operator::FindPath((3.6131, 0, 2), (5, 10 deg,
+    ///    2))`: rho 4 -> rho 5, one radial edge `(0, [4, 0, 2])`.
+    /// 6. the closed-alpha remap (`:467-472`) moves that edge to
+    ///    `numLines[1] - 2 = 6`.
+    ///
+    /// Result: alpha 300->360 at rho 2, then rho 2->3, 3->4 and 4->5 along the
+    /// seam plane. Without the split the base walk would snap 10 deg onto the
+    /// start node and walk a different set.
+    #[test]
+    fn cylindrical_find_path_splits_a_seam_crossing_segment() {
+        let op = closed_six_sector_mesh();
+        let stop_alpha = 10.0 * std::f64::consts::PI / 180.0;
+        let expected = vec![
+            (1, [2, 5, 2]),
+            (0, [2, 6, 2]),
+            (0, [3, 6, 2]),
+            (0, [4, 6, 2]),
+        ];
+        assert_eq!(
+            path_edges(&op.find_path([2.0, ALPHA_300, 2.0], [5.0, stop_alpha, 2.0])),
+            expected
+        );
+        // The same curve as a Cartesian point would present it: atan2 returns
+        // 300 deg as -60 deg, and the fold normalises both to the same edges.
+        assert_eq!(
+            path_edges(&op.find_path(
+                [2.0, -std::f64::consts::FRAC_PI_3, 2.0],
+                [5.0, stop_alpha, 2.0]
+            )),
+            expected
+        );
+        // `FitToAlphaRange` on the closed mesh folds into [0, 300 deg]: 370 deg
+        // is reduced by one full turn (`:240-247`), 300 deg is on the bound, and
+        // the full-mesh range reaches the pad line at 420 deg.
+        assert_eq!(
+            op.fit_to_alpha_range(370.0_f64.to_radians(), false),
+            370.0_f64.to_radians() - 2.0 * std::f64::consts::PI
+        );
+        assert_eq!(op.fit_to_alpha_range(ALPHA_300, true), ALPHA_300);
+        assert_eq!(op.fit_to_alpha_range(ALPHA_300, false), ALPHA_300);
+    }
+
+    /// End to end: an `<Excitation>` whose primitive is a cylindrical `<Curve>`
+    /// that crosses the azimuth seam excites exactly the edges native
+    /// `Operator_Ext_Excitation` would excite.
+    ///
+    /// `FDTD/extensions/operator_ext_excitation.cpp:235-288` walks every
+    /// consecutive point pair with `m_Op->FindPath` — i.e. the virtual
+    /// cylindrical override — and turns every path edge into a voltage
+    /// excitation with `GetWeightedExcitation(n, volt_coord) * GetEdgeLength(n,
+    /// pos)`. The curve points are resolved into `m_Op->m_MeshType`, so on this
+    /// mesh the vertices are `(rho, alpha, z)` and the path is the one derived
+    /// in `cylindrical_find_path_splits_a_seam_crossing_segment`:
+    /// `[(1,[2,5,2]), (0,[2,6,2]), (0,[3,6,2]), (0,[4,6,2])]`.
+    ///
+    /// The alpha edge runs from 300 deg to 360 deg at rho line 2, so its native
+    /// length is `dalpha_m * rho_line_2` = `(pi/3)*1e-3 * 2` (the drawing-unit
+    /// rho factor of `Operator_Cylinder::GetEdgeLength`,
+    /// `operator_cylinder.cpp:205-211`).
+    #[test]
+    fn cylindrical_curve_excitation_crosses_the_azimuth_seam() {
+        let xml = r#"<ContinuousStructure CoordSystem="1">
+            <RectilinearGrid DeltaUnit="0.001">
+                <XLines>0,1,2,3,4,5,6</XLines>
+                <YLines>0,1.0471975511965976,2.0943951023931953,3.141592653589793,4.1887902047863905,5.235987755982989,6.283185307179586</YLines>
+                <ZLines>0,1,2,3,4</ZLines>
+            </RectilinearGrid>
+            <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+            <Properties>
+                <Excitation Name="seam" Type="0" Excite="1,1,1">
+                    <Primitives>
+                        <Curve Priority="0">
+                            <Vertex X="2" Y="5.235987755982989" Z="2"/>
+                            <Vertex X="5" Y="0.17453292519943295" Z="2"/>
+                        </Curve>
+                    </Primitives>
+                </Excitation>
+            </Properties>
+        </ContinuousStructure>"#;
+        let mut op = Operator::new();
+        op.load_csx(xml)
+            .expect("the cylindrical curve CSX must load");
+        assert!(op.closed_alpha());
+        op.base.m_bc = [crate::BC_PEC; 6];
+        let dt = op.calc_timestep();
+        op.calc_ec_operator();
+        op.apply_electric_bc();
+        op.apply_magnetic_bc();
+
+        let mut signal = crate::excitation::Excitation::gauss(1.0e9, 1.0e9);
+        signal
+            .build(dt, 100)
+            .expect("the gaussian signal must build");
+        let extension = op.build_excitation_extension(&signal);
+        let edges: Vec<(usize, [usize; 3])> = extension
+            .voltage_excitations
+            .iter()
+            .map(|excitation| (excitation.component, excitation.pos))
+            .collect();
+        assert_eq!(
+            edges,
+            vec![
+                (1, [2, 5, 2]),
+                (0, [2, 6, 2]),
+                (0, [3, 6, 2]),
+                (0, [4, 6, 2]),
+            ],
+            "the curve must excite the seam-split path edges in path order"
+        );
+
+        // Native amplitude of the alpha edge: `weight * excitation * length`
+        // with a unit weight and a unit excitation, and the length of an alpha
+        // edge is `dalpha * rho` in drawing units times the grid delta.
+        let alpha_edge = extension
+            .voltage_excitations
+            .iter()
+            .find(|excitation| excitation.component == 1)
+            .expect("the alpha edge must be excited");
+        let expected = ((ALPHA_360 - ALPHA_300) * 1.0e-3 * 2.0) as f32;
+        assert!(
+            (alpha_edge.amp - expected).abs() < 1.0e-9,
+            "alpha edge amplitude {} is not the native {}",
+            alpha_edge.amp,
+            expected
+        );
+        assert_eq!(alpha_edge.pos, [2, 5, 2]);
+
+        // The curve is marked used (native `prim->SetPrimitiveUsed(true)`).
+        let used = op
+            .structure
+            .as_ref()
+            .and_then(|structure| structure.property_by_index(0))
+            .and_then(|property| property.primitive(0))
+            .map(|primitive| primitive.is_used());
+        assert_eq!(used, Some(true));
+    }
+
+    /// The base walk is untouched on a Cartesian mesh: no azimuth fold, no
+    /// swap, no seam — `find_path` dispatches on the mesh type exactly like the
+    /// native virtual `Operator::FindPath` / `Operator_Cylinder::FindPath`.
+    #[test]
+    fn cartesian_find_path_ignores_the_cylindrical_override() {
+        let op = find_path_mesh(1e-3, 7);
+        assert!(!op.is_cylindrical());
+
+        // A decreasing y walks back one line. Native emits the edge index of
+        // the *lower* node in the down case (`operator.cpp:458-460`: `minPos`
+        // is decremented), so the single edge is the one from y = 0 to y = 1.
+        assert_eq!(
+            path_edges(&op.find_path([4.0, 1.5, 3.0], [4.0, 0.0, 3.0])),
+            vec![(1, [4, 0, 3])]
+        );
+
+        // A span above pi is *not* folded on a Cartesian mesh: 0 -> 5 walks five
+        // y edges instead of turning round.
+        assert_eq!(
+            path_edges(&op.find_path([4.0, 0.0, 3.0], [4.0, 5.0, 3.0])),
+            vec![
+                (1, [4, 0, 3]),
+                (1, [4, 1, 3]),
+                (1, [4, 2, 3]),
+                (1, [4, 3, 3]),
+                (1, [4, 4, 3]),
+            ]
         );
     }
 
