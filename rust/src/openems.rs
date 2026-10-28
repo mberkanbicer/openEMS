@@ -2072,6 +2072,47 @@ mod tests {
         assert!(!sim.run_fdtd());
     }
 
+    /// Native `SetupFDTD` registers one UPML extension per PML face and keeps
+    /// that order (`OperatorExtensionRegistry::build` sorts by the native
+    /// priorities). A Gaussian source in a PML box with no CSX excitation
+    /// property registers exactly those six regions: the steady-state detector
+    /// needs a periodic signal, TFSF needs a plane wave, the excitation
+    /// extension needs an `<Excitation>` primitive, and Mur/sheets/lumped/
+    /// Debye/Lorentz need their own properties. Native prints the same
+    /// "no excitation properties found" warning and builds six PML regions.
+    #[test]
+    fn setup_registers_extensions_for_a_pml_fixture() {
+        let lines = (0..21)
+            .map(|index| index.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let xml = format!(
+            r#"<ContinuousStructure CoordSystem="0">
+                <RectilinearGrid DeltaUnit="0.001">
+                    <XLines>{lines}</XLines>
+                    <YLines>{lines}</YLines>
+                    <ZLines>{lines}</ZLines>
+                </RectilinearGrid>
+                <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                <Properties></Properties>
+            </ContinuousStructure>"#
+        );
+        let mut sim = OpenEMS::new();
+        sim.set_csx_xml(xml);
+        sim.set_gauss_excite(5.0e9, 5.0e9);
+        for face in 0..6 {
+            sim.set_bc_type(face, 3); // PML
+        }
+        sim.set_number_of_time_steps(1);
+        assert!(sim.setup_fdtd(), "PML setup must succeed");
+        let names = sim.fdtd_eng.as_ref().unwrap().extension_names();
+        assert_eq!(
+            names,
+            vec!["UPML"; 6],
+            "six PML regions, one per face: {names:?}"
+        );
+    }
+
     /// Native `SetupFDTD` aborts with code 3 when no CSX geometry is present;
     /// the port must fail instead of fabricating a grid.
     #[test]
