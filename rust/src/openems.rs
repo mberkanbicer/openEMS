@@ -2050,6 +2050,18 @@ mod tests {
         assert!(!sim.run_fdtd());
     }
 
+    /// Native `SetupFDTD` aborts with code 3 when no CSX geometry is present;
+    /// the port must fail instead of fabricating a grid.
+    #[test]
+    fn setup_requires_a_csx_geometry() {
+        let mut sim = OpenEMS::new();
+        assert!(!sim.setup_fdtd(), "setup must fail without a CSX geometry");
+        assert!(
+            sim.fdtd_eng.is_none(),
+            "no engine or fallback grid may be created"
+        );
+    }
+
     #[test]
     fn test_add_processing() {
         use crate::processing::FieldProbe;

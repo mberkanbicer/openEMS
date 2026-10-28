@@ -5378,6 +5378,72 @@ mod tests {
     }
 
     #[test]
+    fn mur_uses_the_local_face_delta_on_a_graded_mesh() {
+        // DeltaUnit 1 mm; graded X (1, 2, 3 mm), Y (2 mm), Z (5 mm). Native
+        // `GetDiscDelta` repeats the previous delta at the last node, so the
+        // x-max face also sees 3 mm. A hard-coded or global delta would give
+        // the same coefficient on every face.
+        let xml = r#"<ContinuousStructure CoordSystem="0">
+            <RectilinearGrid DeltaUnit="0.001">
+                <XLines>0,1,3,6</XLines>
+                <YLines>0,2,4</YLines>
+                <ZLines>0,5,10</ZLines>
+            </RectilinearGrid>
+            <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+            <Properties></Properties>
+        </ContinuousStructure>"#;
+        let mut op = Operator::new();
+        op.load_csx(xml).expect("graded CSX should load");
+        let dt = 1.0e-12;
+        op.base.d_t = dt;
+        op.base.set_boundary_condition([2; 6]);
+        op.init_data_storage([4, 3, 3]);
+
+        let extension = op.build_mur_extension([0.0; 6]);
+        assert_eq!(extension.faces.len(), 6);
+
+        let c_dt = C0 * dt;
+        for face in &extension.faces {
+            let delta = match (face.dir, face.top) {
+                (0, false) => 1.0e-3,
+                (0, true) => 3.0e-3,
+                (1, _) => 2.0e-3,
+                (2, _) => 5.0e-3,
+                _ => unreachable!("face direction {0}", face.dir),
+            };
+            let expected = ((c_dt - delta) / (c_dt + delta)) as f32;
+            for coefficient in face.coeff_p.iter().chain(face.coeff_pp.iter()) {
+                assert!(
+                    (coefficient - expected).abs() < 1.0e-6,
+                    "face {} (dir {}, top {}) coefficient {coefficient} vs {expected} for delta {delta}",
+                    face.face,
+                    face.dir,
+                    face.top
+                );
+            }
+        }
+
+        // The two x faces must differ: the same coefficient everywhere would
+        // mean the delta was not taken from the mesh.
+        let x_min = extension
+            .faces
+            .iter()
+            .find(|f| f.dir == 0 && !f.top)
+            .unwrap();
+        let x_max = extension
+            .faces
+            .iter()
+            .find(|f| f.dir == 0 && f.top)
+            .unwrap();
+        assert!(
+            (x_min.coeff_p[0] - x_max.coeff_p[0]).abs() > 0.2,
+            "the graded x faces must use different deltas: {} vs {}",
+            x_min.coeff_p[0],
+            x_max.coeff_p[0]
+        );
+    }
+
+    #[test]
     fn upml_builds_six_regions_with_finite_coefficients() {
         let mut op = Operator::new();
         op.base.grid_delta = 1.0e-3;
