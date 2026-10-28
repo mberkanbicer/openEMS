@@ -676,18 +676,47 @@ impl OpenEMS {
         }
 
         if self.debug_operator_dump {
-            if let Some(vv) = op.vv_ptr.as_ref() {
-                let mut values = vec![0.0; cells];
-                for i in 0..dims[0] {
-                    for j in 0..dims[1] {
-                        for k in 0..dims[2] {
-                            let index = (i * dims[1] + j) * dims[2] + k;
-                            values[index] = *vv.get(0, i, j, k) as f64;
+            // Native `--debug-operator` writes `vv`, `vi`, `ii` and `iv` as
+            // three-component vectors (`VTK_File_Writer::SetNativeDump`), so
+            // the dump carries the full operator, not just one scalar.
+            let mut fields: Vec<(&str, [Vec<f64>; 3])> = Vec::new();
+            for (name, array) in [
+                ("vv", &op.vv_ptr),
+                ("vi", &op.vi_ptr),
+                ("ii", &op.ii_ptr),
+                ("iv", &op.iv_ptr),
+            ] {
+                let Some(values) = array.as_ref() else {
+                    continue;
+                };
+                let mut components = [vec![0.0; cells], vec![0.0; cells], vec![0.0; cells]];
+                for (n, component) in components.iter_mut().enumerate() {
+                    for i in 0..dims[0] {
+                        for j in 0..dims[1] {
+                            for k in 0..dims[2] {
+                                let index = (i * dims[1] + j) * dims[2] + k;
+                                component[index] = *values.get(n, i, j, k) as f64;
+                            }
                         }
                     }
                 }
-                match debug_dump::write_scalar_vtk("operator_dump.vtk", "vv", dims, lines, &values)
-                {
+                fields.push((name, components));
+            }
+            if !fields.is_empty() {
+                let refs: Vec<(&str, [&[f64]; 3])> = fields
+                    .iter()
+                    .map(|(name, components)| {
+                        (
+                            *name,
+                            [
+                                components[0].as_slice(),
+                                components[1].as_slice(),
+                                components[2].as_slice(),
+                            ],
+                        )
+                    })
+                    .collect();
+                match debug_dump::write_operator_vtk("operator_dump.vtk", dims, lines, &refs) {
                     Ok(()) => println!("[openEMS] operator written to 'operator_dump.vtk'"),
                     Err(error) => eprintln!("[openEMS] operator_dump.vtk failed: {error}"),
                 }

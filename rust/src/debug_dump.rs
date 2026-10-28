@@ -23,11 +23,68 @@ pub fn write_scalar_vtk(
     writeln!(file, "DATASET STRUCTURED_GRID")?;
     writeln!(file, "DIMENSIONS {} {} {}", dims[0], dims[1], dims[2])?;
     writeln!(file, "POINTS {} double", dims[0] * dims[1] * dims[2])?;
-    for i in 0..dims[0] {
-        let x = if lines[0].is_empty() {
-            i as f64
+    write_points(&mut file, dims, lines)?;
+    writeln!(file, "POINT_DATA {}", values.len())?;
+    writeln!(file, "SCALARS {name} double 1")?;
+    writeln!(file, "LOOKUP_TABLE default")?;
+    // VTK orders point data with i fastest, like `VTK_File_Writer`.
+    for k in 0..dims[2] {
+        for j in 0..dims[1] {
+            for i in 0..dims[0] {
+                let index = (i * dims[1] + j) * dims[2] + k;
+                writeln!(file, "{:.12e}", values[index])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write the operator coefficients as a legacy VTK structured grid.
+///
+/// Mirrors the native `--debug-operator` dump (`VTK_File_Writer` with
+/// `SetNativeDump(true)`): every coefficient set is a three-component vector
+/// at the mesh nodes, in the order `vv`, `vi`, `ii`, `iv`.
+pub fn write_operator_vtk(
+    path: &str,
+    dims: [usize; 3],
+    lines: [&[f64]; 3],
+    fields: &[(&str, [&[f64]; 3])],
+) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    writeln!(file, "# vtk DataFile Version 3.0")?;
+    writeln!(file, "openEMS operator")?;
+    writeln!(file, "ASCII")?;
+    writeln!(file, "DATASET STRUCTURED_GRID")?;
+    writeln!(file, "DIMENSIONS {} {} {}", dims[0], dims[1], dims[2])?;
+    writeln!(file, "POINTS {} double", dims[0] * dims[1] * dims[2])?;
+    write_points(&mut file, dims, lines)?;
+    writeln!(file, "POINT_DATA {}", dims[0] * dims[1] * dims[2])?;
+    for (name, components) in fields {
+        writeln!(file, "VECTORS {name} double")?;
+        for k in 0..dims[2] {
+            for j in 0..dims[1] {
+                for i in 0..dims[0] {
+                    let index = (i * dims[1] + j) * dims[2] + k;
+                    writeln!(
+                        file,
+                        "{:.12e} {:.12e} {:.12e}",
+                        components[0][index], components[1][index], components[2][index]
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_points(file: &mut File, dims: [usize; 3], lines: [&[f64]; 3]) -> io::Result<()> {
+    // VTK stores points with i fastest; native `VTK_File_Writer` iterates
+    // k, j, i (`vtk_file_writer.cpp`, the `SetTuple3` loop).
+    for k in 0..dims[2] {
+        let z = if lines[2].is_empty() {
+            k as f64
         } else {
-            lines[0][i]
+            lines[2][k]
         };
         for j in 0..dims[1] {
             let y = if lines[1].is_empty() {
@@ -35,21 +92,15 @@ pub fn write_scalar_vtk(
             } else {
                 lines[1][j]
             };
-            for k in 0..dims[2] {
-                let z = if lines[2].is_empty() {
-                    k as f64
+            for i in 0..dims[0] {
+                let x = if lines[0].is_empty() {
+                    i as f64
                 } else {
-                    lines[2][k]
+                    lines[0][i]
                 };
                 writeln!(file, "{x:.12e} {y:.12e} {z:.12e}")?;
             }
         }
-    }
-    writeln!(file, "POINT_DATA {}", values.len())?;
-    writeln!(file, "SCALARS {name} double 1")?;
-    writeln!(file, "LOOKUP_TABLE default")?;
-    for value in values {
-        writeln!(file, "{value:.12e}")?;
     }
     Ok(())
 }
