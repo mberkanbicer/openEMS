@@ -278,6 +278,10 @@ impl Excitation {
         }
 
         let mut parser = fparser::Parser::new();
+        // Native `CalcCustomExcitation` registers the two constants before
+        // parsing (`FDTD/excitation.cpp:227-235`).
+        parser.add_constant("pi", std::f64::consts::PI);
+        parser.add_constant("e", std::f64::consts::E);
         parser
             .parse(expression, "t", false)
             .map_err(|error| ExcitationError::Parse(error.to_string()))?;
@@ -327,6 +331,20 @@ impl Excitation {
             (1.0 / (self.f0 * self.dt)).round() as u32
         } else {
             0
+        }
+    }
+
+    /// Period in seconds, as native `Excitation::GetSignalPeriod()`.
+    ///
+    /// Only a sinusoidal excitation is periodic (`excitation.cpp:66-72`); the
+    /// Gaussian, Dirac, Step and Custom types set it to 0. `CalcECOperator` uses
+    /// it to shrink the timestep to an integer number of steps per period
+    /// (`FDTD/operator.cpp:1014-1020`).
+    pub fn signal_period_seconds(&self) -> f64 {
+        if self.exc_type == ExcitationType::Sinus && self.f0 > 0.0 {
+            1.0 / self.f0
+        } else {
+            0.0
         }
     }
 

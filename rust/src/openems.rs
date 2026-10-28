@@ -882,7 +882,14 @@ impl OpenEMS {
         op.base.m_time_step_var = if self.time_step_method == 3 { 3 } else { 1 };
         if self.time_step > 0.0 {
             op.base.d_t = self.time_step;
-        } else {
+        }
+        // Native order (`FDTD/operator.cpp:986-1012`): `Calc_EC()` fills
+        // EC_C/EC_G/EC_L/EC_R first, then `CalcTimestep()` runs on those
+        // coefficients, and only afterwards the time-step factor is applied.
+        // Var3 reads EC_C/EC_L, so computing the step before the operator left
+        // it with empty arrays and a 13% larger step on a 1 mm mesh.
+        op.calc_ec_operator();
+        if self.time_step <= 0.0 {
             op.calc_timestep();
         }
         if self.time_step_factor <= 0.0 || !self.time_step_factor.is_finite() {
@@ -894,7 +901,22 @@ impl OpenEMS {
         }
         op.base.d_t *= self.time_step_factor;
 
-        // Compute EC coefficients (vv, vi, ii, iv) for all cells.
+        // Native `CalcECOperator` (`FDTD/operator.cpp:1014-1020`) shrinks the
+        // step to an integer number of steps per signal period, so a sinusoid
+        // repeats exactly; the sampled excitation and the steady-state detector
+        // both rely on it.
+        if let Some(signal) = self.excitation.as_deref() {
+            let period = signal.signal_period_seconds();
+            if period > 0.0 {
+                let steps = (period / op.base.d_t).ceil();
+                if steps >= 1.0 {
+                    op.base.d_t = period / steps;
+                }
+            }
+        }
+
+        // Compute EC coefficients (vv, vi, ii, iv) for all cells with the final
+        // timestep; the first pass above only needed the material coefficients.
         op.calc_ec_operator();
 
         // Build the excitation waveform now that the timestep is known.
