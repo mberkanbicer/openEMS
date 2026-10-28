@@ -679,6 +679,7 @@ impl OpenEMS {
             // Native `--debug-operator` writes `vv`, `vi`, `ii` and `iv` as
             // three-component vectors (`VTK_File_Writer::SetNativeDump`), so
             // the dump carries the full operator, not just one scalar.
+            let bc = op.base.m_bc;
             let mut fields: Vec<(&str, [Vec<f64>; 3])> = Vec::new();
             for (name, array) in [
                 ("vv", &op.vv_ptr),
@@ -695,7 +696,34 @@ impl OpenEMS {
                         for j in 0..dims[1] {
                             for k in 0..dims[2] {
                                 let index = (i * dims[1] + j) * dims[2] + k;
-                                component[index] = *values.get(n, i, j, k) as f64;
+                                // Native zeroes these edges in the operator
+                                // itself (`ApplyElectricBC` with every face
+                                // that is not "none", `FDTD/operator.cpp:1042`):
+                                // the normal component on the high line and
+                                // both tangential components on every face.
+                                // The solver never integrates them, so the port
+                                // keeps the bulk value and reports the native
+                                // value here.
+                                let pos = [i, j, k];
+                                // Only the electric arrays get the boundary
+                                // mask: native applies the magnetic BC only
+                                // to PMC faces.
+                                let boundary = (name == "vv" || name == "vi")
+                                    && (0..3).any(|axis| {
+                                        if bc[2 * axis] == -1 && bc[2 * axis + 1] == -1 {
+                                            return false;
+                                        }
+                                        if axis == n {
+                                            pos[axis] + 1 == dims[axis]
+                                        } else {
+                                            pos[axis] == 0 || pos[axis] + 1 == dims[axis]
+                                        }
+                                    });
+                                component[index] = if boundary {
+                                    0.0
+                                } else {
+                                    *values.get(n, i, j, k) as f64
+                                };
                             }
                         }
                     }
