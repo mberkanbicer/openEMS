@@ -1231,8 +1231,8 @@ impl Operator {
                 for j in 0..ny {
                     for k in 0..nz {
                         let pos = [i, j, k];
-                        let pos_pm = shift_node(pos, n_p, -1, counts);
-                        let pos_ppm = shift_node(pos, n_pp, -1, counts);
+                        let pos_pm = reflected_pos(pos, shift_rel([0; 3], n_p, -1), counts);
+                        let pos_ppm = reflected_pos(pos, shift_rel([0; 3], n_pp, -1), counts);
 
                         let l_a = self.get_ec_l(n_p as i32, pos[0], pos[1], pos[2]);
                         let l_b = self.get_ec_l(n_p as i32, pos_ppm[0], pos_ppm[1], pos_ppm[2]);
@@ -1292,29 +1292,47 @@ impl Operator {
                 for j in 0..ny {
                     for k in 0..nz {
                         let pos = [i, j, k];
-                        let pos_pm = shift_node(pos, n_p, -1, counts);
-                        let pos_pp_mm = shift_node(pos_pm, n_pp, -1, counts);
+                        // Native keeps the shift as a *relative* offset and
+                        // reflects against the base cell in `AdrOp::GetPos`
+                        // (`tools/AdrOp.cpp:119-160`, `SetReflection2Cell`:
+                        // offset 1). Reflecting an already mirrored absolute
+                        // coordinate gave a different neighbour at the domain
+                        // edge, which is the graded-mesh Var3 difference.
+                        let rel = [0i32; 3];
+                        let rel_pm = shift_rel(rel, n_p, -1);
+                        let rel_pp_mm = shift_rel(rel_pm, n_pp, -1);
+
+                        let pos_pm = reflected_pos(pos, rel_pm, counts);
+                        let pos_pp_mm = reflected_pos(pos, rel_pp_mm, counts);
 
                         let c_here = c_at(self, n, pos);
                         let mut terms: [Option<f64>; 8] = [None; 8];
                         terms[0] = inverse_product(
                             l_at(self, n_pp, pos),
-                            c_at(self, n, shift_node(pos, n_p, 1, counts)),
+                            c_at(self, n, reflected_pos(pos, shift_rel(rel, n_p, 1), counts)),
                         );
                         terms[1] = inverse_product(l_at(self, n_pp, pos), c_here);
                         terms[2] = inverse_product(
                             l_at(self, n_p, pos),
-                            c_at(self, n, shift_node(pos, n_pp, 1, counts)),
+                            c_at(self, n, reflected_pos(pos, shift_rel(rel, n_pp, 1), counts)),
                         );
                         terms[3] = inverse_product(l_at(self, n_p, pos), c_here);
                         terms[4] = inverse_product(
                             l_at(self, n_pp, pos_pm),
-                            c_at(self, n, shift_node(pos_pm, n_p, 1, counts)),
+                            c_at(
+                                self,
+                                n,
+                                reflected_pos(pos, shift_rel(rel_pm, n_p, 1), counts),
+                            ),
                         );
                         terms[5] = inverse_product(l_at(self, n_pp, pos_pm), c_at(self, n, pos_pm));
                         terms[6] = inverse_product(
                             l_at(self, n_p, pos_pp_mm),
-                            c_at(self, n, shift_node(pos_pp_mm, n_pp, 1, counts)),
+                            c_at(
+                                self,
+                                n,
+                                reflected_pos(pos, shift_rel(rel_pp_mm, n_pp, 1), counts),
+                            ),
                         );
                         terms[7] =
                             inverse_product(l_at(self, n_p, pos_pp_mm), c_at(self, n, pos_pp_mm));
@@ -1327,7 +1345,11 @@ impl Operator {
                             inverse_product(l_at(self, n_pp, pos_pm), c_at(self, n_p, pos)),
                             inverse_product(l_at(self, n_p, pos), c_at(self, n_pp, pos)),
                             inverse_product(
-                                l_at(self, n_p, shift_node(pos, n_pp, -1, counts)),
+                                l_at(
+                                    self,
+                                    n_p,
+                                    reflected_pos(pos, shift_rel(rel, n_pp, -1), counts),
+                                ),
                                 c_at(self, n_pp, pos),
                             ),
                         ];
@@ -1335,13 +1357,17 @@ impl Operator {
                             continue;
                         };
 
-                        let shifted_n = shift_node(pos, n, 1, counts);
+                        let shifted_n = reflected_pos(pos, shift_rel(rel, n, 1), counts);
                         let wt_2 = [
                             inverse_product(l_at(self, n_pp, pos), c_at(self, n_p, shifted_n)),
                             inverse_product(l_at(self, n_pp, pos_pm), c_at(self, n_p, shifted_n)),
                             inverse_product(l_at(self, n_p, pos), c_at(self, n_pp, shifted_n)),
                             inverse_product(
-                                l_at(self, n_p, shift_node(pos, n_pp, -1, counts)),
+                                l_at(
+                                    self,
+                                    n_p,
+                                    reflected_pos(pos, shift_rel(rel, n_pp, -1), counts),
+                                ),
                                 c_at(self, n_pp, shifted_n),
                             ),
                         ];
@@ -4545,19 +4571,32 @@ fn disc_delta_value(lines: &Option<Vec<f64>>, count: usize, pos: usize, dual: bo
 
 /// Reflect a node index across the mesh boundary, matching `AdrOp::GetPos`
 /// with `SetReflection2Cell` (`uiTypeOffset = 1`).
-pub fn shift_node(pos: [usize; 3], axis: usize, delta: i32, counts: [u32; 3]) -> [usize; 3] {
-    let mut result = pos;
-    let index = pos[axis] as i32;
-    let maximum = counts[axis] as i32 - 1;
-    let mut shift = delta;
-    if index + shift < 0 {
-        shift = -2 * index - shift - 1;
+/// Add a relative shift along one axis.
+fn shift_rel(mut rel: [i32; 3], axis: usize, delta: i32) -> [i32; 3] {
+    rel[axis] += delta;
+    rel
+}
+
+/// Apply a relative shift to `base` with the native cell reflection.
+///
+/// Mirrors `AdrOp::GetPos` with `SetReflection2Cell()` (`uiTypeOffset = 1`,
+/// `tools/AdrOp.cpp:119-160`, `:423-433`): the shift is reflected against the
+/// base index, so `-1` at index 0 stays at 0 and `+1` at the last index stays
+/// at the last index.
+fn reflected_pos(base: [usize; 3], rel: [i32; 3], counts: [u32; 3]) -> [usize; 3] {
+    let mut out = base;
+    for axis in 0..3 {
+        let max = counts[axis] as i32 - 1;
+        let mut r = rel[axis];
+        if base[axis] as i32 + r < 0 {
+            r = -2 * base[axis] as i32 - r - 1;
+        }
+        if base[axis] as i32 + r > max {
+            r = 2 * (max - base[axis] as i32) - r + 1;
+        }
+        out[axis] = (base[axis] as i32 + r).clamp(0, max) as usize;
     }
-    if index + shift > maximum {
-        shift = 2 * (maximum - index) - shift + 1;
-    }
-    result[axis] = (index + shift).clamp(0, maximum) as usize;
-    result
+    out
 }
 
 /// Sum `1/(L*C)` terms; `None` when any coefficient is non-positive.
@@ -5545,6 +5584,41 @@ mod timestep_tests {
         let mut op = Operator::new();
         op.load_csx(&xml).expect("uniform CSX should load");
         op
+    }
+
+    #[test]
+    fn var3_matches_native_on_uniform_and_graded_meshes() {
+        // The pinned native binary prints 1.92583e-12 s for the uniform 1 mm
+        // mesh (4 cells) and 3.03659e-12 s for the graded mesh, both with
+        // `Rennings_2`. Native computes the EC arrays first and the step
+        // afterwards (`FDTD/operator.cpp:986-1010`).
+        let cases = [
+            ("0.001", "0,1,2,3,4", "0,1,2,3,4", "0,1,2,3,4", 1.92583e-12),
+            ("0.001", "0,1,3,6", "0,2,4", "0,5,10", 3.03659e-12),
+            ("0.0005", "0,1,2,3,4", "0,1,2,3,4", "0,1,2,3,4", 9.62917e-13),
+        ];
+        for (unit, x, y, z, native) in cases {
+            let xml = format!(
+                r#"<ContinuousStructure CoordSystem="0">
+                    <RectilinearGrid DeltaUnit="{unit}">
+                        <XLines>{x}</XLines>
+                        <YLines>{y}</YLines>
+                        <ZLines>{z}</ZLines>
+                    </RectilinearGrid>
+                    <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                    <Properties></Properties>
+                </ContinuousStructure>"#
+            );
+            let mut op = Operator::new();
+            op.load_csx(&xml).expect("mesh should load");
+            op.base.m_time_step_var = 3;
+            op.calc_ec_operator();
+            let dt = op.calc_timestep();
+            assert!(
+                (dt - native).abs() / native < 1.0e-5,
+                "Var3 dt {dt:e} vs native {native:e} for {x} / {y} / {z}"
+            );
+        }
     }
 
     #[test]
