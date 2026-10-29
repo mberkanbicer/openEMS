@@ -81,6 +81,10 @@ pub struct OpenEMS {
     /// Write field dumps in the legacy Octave/MATLAB HDF5 layout
     /// (native `--legacyHDF5Dumps` / `g_settings.GetLegacyHDF5Dumps`).
     pub legacy_hdf5_dumps: bool,
+    /// Dump the native staggered field components instead of rotating the
+    /// cylindrical `(rho, alpha, z)` components into `(x, y, z)`
+    /// (native `--nativeFieldDumps`). Cartesian dumps are unchanged.
+    pub native_field_dumps: bool,
     pub time_step_method: i32,
     pub time_step: f64,
     pub time_step_factor: f64,
@@ -135,6 +139,7 @@ impl OpenEMS {
             multi_grid: Vec::new(),
             max_time: 0.0,
             legacy_hdf5_dumps: false,
+            native_field_dumps: false,
             // native `openEMS::openEMS()` default: 3 (Rennings_2), the largest
             // stable step on rectilinear meshes
             time_step_method: 3,
@@ -235,6 +240,15 @@ impl OpenEMS {
 
     pub fn get_legacy_hdf5_dumps(&self) -> bool {
         self.legacy_hdf5_dumps
+    }
+
+    /// Dump the native staggered field components (native `--nativeFieldDumps`).
+    pub fn set_native_field_dumps(&mut self, val: bool) {
+        self.native_field_dumps = val;
+    }
+
+    pub fn get_native_field_dumps(&self) -> bool {
+        self.native_field_dumps
     }
 
     /// Set the timestep method.
@@ -1242,6 +1256,7 @@ impl OpenEMS {
                         processing.set_file_type(dump.file_type());
                         processing.set_dump_mode(dump.dump_mode());
                         processing.set_legacy_format(self.legacy_hdf5_dumps);
+                        processing.set_native_field_dumps(self.native_field_dumps);
                         processing.set_process_interval(interval);
                         if cylindrical {
                             processing.set_mesh_type(mesh_type);
@@ -1278,6 +1293,7 @@ impl OpenEMS {
                         processing.set_file_type(dump.file_type());
                         processing.set_dump_mode_value(dump.dump_mode());
                         processing.set_legacy_format(self.legacy_hdf5_dumps);
+                        processing.set_native_field_dumps(self.native_field_dumps);
                         processing.set_process_interval(interval);
                         processing.set_fd_nyquist(nyquist);
                         // native: FD dumps default to the plain Nyquist rate

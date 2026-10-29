@@ -1298,6 +1298,9 @@ pub struct ProcessFieldsTD {
     legacy_fmt: bool,
     /// Mesh type for the dump files, native `SetMeshType`.
     mesh_type: MeshType,
+    /// Native `--nativeFieldDumps`: keep the cylindrical `(rho, alpha, z)`
+    /// components instead of rotating them into `(x, y, z)`.
+    native_field_dumps: bool,
 }
 
 impl ProcessFieldsTD {
@@ -1321,12 +1324,22 @@ impl ProcessFieldsTD {
             dual_time: false,
             legacy_fmt: false,
             mesh_type: MeshType::Cartesian,
+            native_field_dumps: false,
         }
     }
 
     /// Set the mesh type of the dump files, native `SetMeshType`.
     pub fn set_mesh_type_value(&mut self, mesh_type: MeshType) {
         self.mesh_type = mesh_type;
+    }
+
+    /// Dump the native staggered components (native `--nativeFieldDumps`).
+    pub fn set_native_field_dumps(&mut self, val: bool) {
+        self.native_field_dumps = val;
+    }
+
+    pub fn get_native_field_dumps(&self) -> bool {
+        self.native_field_dumps
     }
 
     /// Select the legacy (Octave/MATLAB) HDF5 field layout.
@@ -1585,6 +1598,7 @@ impl Processing for ProcessFieldsTD {
                     dims,
                     coordinate_refs,
                     &reduced,
+                    self.native_field_dumps,
                 )
             } else {
                 writer.write_structured_grid(&field_name, dims, coordinate_refs, &reduced)
@@ -1644,6 +1658,9 @@ pub struct ProcessFieldsFD {
     /// Nyquist step count of the highest excited frequency (native
     /// `m_FD_Nyquist`); caps the per-frequency DFT interval.
     fd_nyquist: u32,
+    /// Native `--nativeFieldDumps`: keep the cylindrical `(rho, alpha, z)`
+    /// components instead of rotating them into `(x, y, z)`.
+    native_field_dumps: bool,
 }
 
 impl ProcessFieldsFD {
@@ -1676,7 +1693,17 @@ impl ProcessFieldsFD {
             legacy_fmt: false,
             indices: None,
             fd_nyquist: 0,
+            native_field_dumps: false,
         }
+    }
+
+    /// Dump the native staggered components (native `--nativeFieldDumps`).
+    pub fn set_native_field_dumps(&mut self, val: bool) {
+        self.native_field_dumps = val;
+    }
+
+    pub fn get_native_field_dumps(&self) -> bool {
+        self.native_field_dumps
     }
 
     /// Cap the DFT interval at the excitation Nyquist, as native
@@ -2128,6 +2155,7 @@ impl ProcessFieldsFD {
                 dims,
                 &coordinates,
                 &magnitude,
+                self.native_field_dumps,
             );
             write_fd_dump(
                 self.mesh_type,
@@ -2136,6 +2164,7 @@ impl ProcessFieldsFD {
                 dims,
                 &coordinates,
                 &phase,
+                self.native_field_dumps,
             );
 
             // 21 phase snapshots, matching the native VTK FD dump.
@@ -2165,6 +2194,7 @@ impl ProcessFieldsFD {
                     dims,
                     &coordinates,
                     &snapshot,
+                    self.native_field_dumps,
                 );
             }
         }
@@ -2242,6 +2272,7 @@ fn write_structured_vts_cylindrical(
     dims: [usize; 3],
     lines: &[Vec<f64>; 3],
     values: &FieldArray,
+    native_dump: bool,
 ) -> std::io::Result<()> {
     let [nx, ny, nz] = dims;
     let mut text = String::new();
@@ -2272,12 +2303,17 @@ fn write_structured_vts_cylindrical(
                 let v0 = f64::from(*values.get(0, i, j, k));
                 let v1 = f64::from(*values.get(1, i, j, k));
                 let v2 = f64::from(*values.get(2, i, j, k));
-                text.push_str(&format!(
-                    "{:e} {:e} {:e} ",
-                    v0 * cos_a - v1 * sin_a,
-                    v0 * sin_a + v1 * cos_a,
-                    v2
-                ));
+                if native_dump {
+                    // Native `m_NativeDump`: the cylindrical components are
+                    // written unchanged.
+                    text.push_str(&format!("{v0:e} {v1:e} {v2:e} "));
+                } else {
+                    text.push_str(&format!(
+                        "{:e} {:e} {v2:e} ",
+                        v0 * cos_a - v1 * sin_a,
+                        v0 * sin_a + v1 * cos_a
+                    ));
+                }
             }
         }
     }
@@ -2317,9 +2353,10 @@ fn write_fd_dump(
     dims: [usize; 3],
     coordinates: &[Vec<f64>; 3],
     values: &FieldArray,
+    native_dump: bool,
 ) {
     let _ = if mesh_type == MeshType::Cylindrical {
-        write_structured_vts_cylindrical(prefix, field_name, dims, coordinates, values)
+        write_structured_vts_cylindrical(prefix, field_name, dims, coordinates, values, native_dump)
     } else {
         write_rectilinear_vtr(prefix, field_name, dims, coordinates, values)
     };
@@ -3790,6 +3827,7 @@ impl VTKFileWriter {
         dims: [usize; 3],
         coordinates: [&[f64]; 3],
         values: &FieldArray,
+        native_dump: bool,
     ) -> std::io::Result<()> {
         use std::io::Write;
         let [nx, ny, nz] = dims;
@@ -3828,14 +3866,24 @@ impl VTKFileWriter {
                     let v0 = f64::from(*values.get(0, i, j, k));
                     let v1 = f64::from(*values.get(1, i, j, k));
                     let v2 = f64::from(*values.get(2, i, j, k));
-                    writeln!(
-                        file,
-                        "{:.precision$} {:.precision$} {:.precision$}",
-                        v0 * cos_a - v1 * sin_a,
-                        v0 * sin_a + v1 * cos_a,
-                        v2,
-                        precision = precision
-                    )?;
+                    if native_dump {
+                        // Native `VTK_File_Writer::AddVectorField`: with
+                        // `m_NativeDump` the cylindrical components are
+                        // written unchanged.
+                        writeln!(
+                            file,
+                            "{v0:.precision$} {v1:.precision$} {v2:.precision$}",
+                            precision = precision
+                        )?;
+                    } else {
+                        writeln!(
+                            file,
+                            "{:.precision$} {:.precision$} {v2:.precision$}",
+                            v0 * cos_a - v1 * sin_a,
+                            v0 * sin_a + v1 * cos_a,
+                            precision = precision
+                        )?;
+                    }
                 }
             }
         }
@@ -5137,6 +5185,51 @@ mod cylindrical_dump_tests {
         let text = std::fs::read_to_string(&filename).expect("dump exists");
         // alpha = pi/2 rotates an Erho pulse onto +y
         assert!(text.contains("0.000000000000 1.000000000000"), "{text}");
+        let _ = std::fs::remove_file(filename);
+    }
+
+    #[test]
+    fn native_field_dumps_keep_the_cylindrical_components() {
+        let prefix = std::env::temp_dir()
+            .join(format!("oems_cyl_td_native_{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let rho = vec![1.0e-3, 2.0e-3, 3.0e-3];
+        let alpha = vec![0.0, std::f64::consts::FRAC_PI_2, std::f64::consts::PI];
+        let z = vec![0.0, 1.0e-3];
+        let meta = EngineMeta {
+            num_lines: [3, 3, 2],
+            disc_lines: [rho, alpha, z],
+            dt: 1.0e-12,
+            materials: None,
+            mesh_type: crate::operator::MeshType::Cylindrical {
+                closed_alpha: false,
+            },
+            grid_delta: 1.0e-3,
+        };
+        let mut volt = FieldArray::new("volt", [3, 3, 2]);
+        *volt.get_mut(0, 1, 1, 1) = 1.0e-3;
+        let curr = FieldArray::new("curr", [3, 3, 2]);
+        let interface = EngineInterface {
+            meta: &meta,
+            volt: &volt,
+            curr: &curr,
+        };
+        let mut dump = ProcessFieldsTD::new(&prefix, [0.0; 3], [1.0; 3]);
+        dump.set_mesh_type_value(MeshType::Cylindrical);
+        dump.set_native_field_dumps(true);
+        dump.process_fields(1, &interface);
+
+        let filename = format!("{prefix}_0000000001.vtk");
+        let text = std::fs::read_to_string(&filename).expect("dump exists");
+        // Native `m_NativeDump` keeps (Erho, Ealpha, Ez): the Erho pulse stays
+        // on component 0 even at alpha = pi/2 (the physical value is 1.0 after
+        // the edge-length division).
+        assert!(
+            text.contains("1.000000000000 0.000000000000 0.000000000000"),
+            "{text}"
+        );
+        assert!(!text.contains("0.000000000000 1.000000000000"), "{text}");
         let _ = std::fs::remove_file(filename);
     }
 

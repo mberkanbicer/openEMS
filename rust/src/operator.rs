@@ -1620,6 +1620,35 @@ impl Operator {
         full_mesh: bool,
         snap_method: i32,
     ) -> (i32, [u32; 3], [u32; 3], [bool; 3], [bool; 3]) {
+        // Native `Operator_Cylinder::SnapBox2Mesh`
+        // (`FDTD/operator_cylinder.cpp:283-304`): the azimuth span is
+        // re-centred on the wrapped midpoint and clamped into the mesh range
+        // before the base snap runs. Without it a seam-crossing or full-circle
+        // box folds to an empty span.
+        let (start, stop) = if self.is_cylindrical() {
+            let count = self.alpha_line_count(full_mesh) as usize;
+            if count > 0 {
+                let lines = self.base.num_lines[1] as usize;
+                let a_min = disc_line_value(&self.base.disc_lines[1], lines, 0, false);
+                let a_max = disc_line_value(&self.base.disc_lines[1], lines, count - 1, false);
+                let size = stop[1] - start[1];
+                let centre = self.fit_to_alpha_range(0.5 * (start[1] + stop[1]), false);
+                let raw_start = centre - size * 0.5;
+                let a_start = raw_start.clamp(a_min, a_max);
+                let a_stop = (raw_start + size).clamp(a_min, a_max);
+                let mut start = start;
+                let mut stop = stop;
+                start[1] = a_start;
+                stop[1] = a_stop;
+                (start, stop)
+            } else {
+                (start, stop)
+            }
+        } else {
+            (start, stop)
+        };
+        let start = start;
+        let stop = stop;
         let mut lower = [0.0f64; 3];
         let mut upper = [0.0f64; 3];
         for axis in 0..3 {

@@ -157,6 +157,7 @@ fn main() -> ExitCode {
     sim.set_engine(&args.engine);
     sim.set_enable_dumps(!args.disable_dumps);
     sim.set_legacy_hdf5_dumps(args.legacy_hdf5_dumps > 0);
+    sim.set_native_field_dumps(args.native_field_dumps > 0);
     sim.set_no_simulation(args.no_simulation);
     sim.set_dump_statistics(args.dump_statistics);
     sim.set_exact_end_criteria(args.exact_end_criteria);
@@ -197,9 +198,8 @@ fn main() -> ExitCode {
         }
     }
     if args.native_field_dumps > 0 {
-        eprintln!(
-            "openEMS - --nativeFieldDumps is not applied yet by the Rust dump layer"
-        );
+        // Native `Global::optionDesc` prints this on the switch.
+        println!("openEMS - dumping all fields using the native field components");
     }
 
     if !sim.setup_fdtd() {
