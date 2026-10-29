@@ -617,6 +617,35 @@ mod backend {
             )
         }
 
+        /// Write an N-dimensional `f64` dataset.
+        pub fn write_f64_dataset_nd(
+            &self,
+            group: &str,
+            name: &str,
+            dims: &[usize],
+            data: &[f64],
+            order: Option<&str>,
+        ) -> Result<(), Hdf5Error> {
+            let expected: usize = dims.iter().product();
+            if expected != data.len() {
+                return Err(Hdf5Error::InvalidShape {
+                    path: format!("{group}/{name}"),
+                    detail: format!("{expected} values expected, {} given", data.len()),
+                });
+            }
+            let file_type = unsafe { H5T_IEEE_F64LE_g };
+            let mem_type = unsafe { H5T_NATIVE_DOUBLE_g };
+            self.write_dataset(
+                group,
+                name,
+                file_type,
+                mem_type,
+                dims,
+                data.as_ptr() as *const c_void,
+                order,
+            )
+        }
+
         /// Write a complex `f32` dataset as an HDF5 compound of `r`/`i`,
         /// matching `HDF5_File_Reader::GetH5Type<std::complex<float>>()`.
         pub fn write_complex_f32_dataset(
@@ -657,6 +686,66 @@ mod backend {
                 check(
                     "H5Tinsert",
                     H5Tinsert(id, imag.as_ptr(), 4, H5T_NATIVE_FLOAT_g),
+                )?;
+                id
+            };
+            let result = self.write_dataset(
+                group,
+                name,
+                compound,
+                compound,
+                dims,
+                interleaved.as_ptr() as *const c_void,
+                order,
+            );
+            unsafe {
+                let _ = H5Tclose(compound);
+            }
+            result
+        }
+
+        /// Write a complex `f64` dataset as an HDF5 compound of `r`/`i`.
+        ///
+        /// Native `nf2ff::Write2HDF5` writes `std::complex<double>` data, so
+        /// the non-legacy far-field dataset is a compound of two doubles.
+        pub fn write_complex_f64_dataset(
+            &self,
+            group: &str,
+            name: &str,
+            dims: &[usize],
+            re: &[f64],
+            im: &[f64],
+            order: Option<&str>,
+        ) -> Result<(), Hdf5Error> {
+            if re.len() != im.len() {
+                return Err(Hdf5Error::InvalidShape {
+                    path: format!("{group}/{name}"),
+                    detail: "real and imaginary parts differ in length".to_string(),
+                });
+            }
+            let expected: usize = dims.iter().product();
+            if expected != re.len() {
+                return Err(Hdf5Error::InvalidShape {
+                    path: format!("{group}/{name}"),
+                    detail: format!("{expected} values expected, {} given", re.len()),
+                });
+            }
+            let mut interleaved = Vec::with_capacity(2 * re.len());
+            for (real, imag) in re.iter().zip(im.iter()) {
+                interleaved.push(*real);
+                interleaved.push(*imag);
+            }
+            let compound = unsafe {
+                let id = check_id("H5Tcreate", H5Tcreate(H5T_COMPOUND, 16))?;
+                let real = c_name("r")?;
+                let imag = c_name("i")?;
+                check(
+                    "H5Tinsert",
+                    H5Tinsert(id, real.as_ptr(), 0, H5T_NATIVE_DOUBLE_g),
+                )?;
+                check(
+                    "H5Tinsert",
+                    H5Tinsert(id, imag.as_ptr(), 8, H5T_NATIVE_DOUBLE_g),
                 )?;
                 id
             };

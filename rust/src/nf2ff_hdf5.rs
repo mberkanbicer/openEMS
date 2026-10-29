@@ -248,8 +248,12 @@ impl Nf2ffRunner {
                 "the E- and H-field time sequences differ in length".to_string(),
             ));
         }
+        // Native `HDF5_File_Reader::CalcFDVectorData` takes the integration
+        // weight from the *last* recorded interval, not from the solver
+        // timestep: dumps may be written every N steps, and the sum is a
+        // trapezoidal integral over the recorded samples.
         let dt = if e_td.time.len() > 1 {
-            e_td.time[1] - e_td.time[0]
+            e_td.time[e_td.time.len() - 1] - e_td.time[e_td.time.len() - 2]
         } else {
             return Err(Nf2ffError::MissingData(
                 "at least two time samples are needed for the DFT".to_string(),
@@ -301,8 +305,8 @@ impl Nf2ffRunner {
                 let mut im = Vec::with_capacity(num_theta * num_phi);
                 for ti in 0..num_theta {
                     for pi in 0..num_phi {
-                        re.push(field[ti][pi].re as f32);
-                        im.push(field[ti][pi].im as f32);
+                        re.push(field[ti][pi].re);
+                        im.push(field[ti][pi].im);
                     }
                 }
                 if self.legacy_fmt {
@@ -315,14 +319,14 @@ impl Nf2ffRunner {
                             legacy_im.push(im[ti * num_phi + pi]);
                         }
                     }
-                    file.write_f32_dataset_nd(
+                    file.write_f64_dataset_nd(
                         &group,
                         &format!("f{frequency_index}_real"),
                         &[num_phi, num_theta],
                         &legacy_re,
                         None,
                     )?;
-                    file.write_f32_dataset_nd(
+                    file.write_f64_dataset_nd(
                         &group,
                         &format!("f{frequency_index}_imag"),
                         &[num_phi, num_theta],
@@ -330,7 +334,7 @@ impl Nf2ffRunner {
                         None,
                     )?;
                 } else {
-                    file.write_complex_f32_dataset(
+                    file.write_complex_f64_dataset(
                         &group,
                         &format!("f{frequency_index}"),
                         &[num_theta, num_phi],
@@ -348,10 +352,10 @@ impl Nf2ffRunner {
             if self.legacy_fmt {
                 for pi in 0..num_phi {
                     for ti in 0..num_theta {
-                        values.push(calculator.p_rad[ti][pi] as f32);
+                        values.push(calculator.p_rad[ti][pi]);
                     }
                 }
-                file.write_f32_dataset_nd(
+                file.write_f64_dataset_nd(
                     "/nf2ff/P_rad/FD",
                     &format!("f{frequency_index}"),
                     &[num_phi, num_theta],
@@ -361,10 +365,10 @@ impl Nf2ffRunner {
             } else {
                 for ti in 0..num_theta {
                     for pi in 0..num_phi {
-                        values.push(calculator.p_rad[ti][pi] as f32);
+                        values.push(calculator.p_rad[ti][pi]);
                     }
                 }
-                file.write_f32_dataset_nd(
+                file.write_f64_dataset_nd(
                     "/nf2ff/P_rad/FD",
                     &format!("f{frequency_index}"),
                     &[num_theta, num_phi],
@@ -374,7 +378,10 @@ impl Nf2ffRunner {
             }
         }
 
-        file.write_f64_attribute_vector("/nf2ff", "Frequency", &self.frequencies)?;
+        // Native writes the frequency list as `float` (`m_freq` is
+        // `std::vector<float>`); the Python/Octave readers upcast it.
+        let frequencies: Vec<f32> = self.frequencies.iter().map(|value| *value as f32).collect();
+        file.write_f32_attribute_vector("/nf2ff", "Frequency", &frequencies)?;
         let prad: Vec<f64> = (0..self.calculators.len())
             .map(|index| self.radiated_power(index))
             .collect();
@@ -572,6 +579,12 @@ fn discrete_fourier_transform(
     if nx == 0 || ny == 0 || nz == 0 {
         return field;
     }
+    // Native `CalcFDVectorData` closes the trapezoidal integration with
+    // `time_diff *= 2` before the per-sample sum is scaled, so the raw sum is
+    // multiplied by twice the recorded sample interval. Without this factor
+    // the far field is low by `1 / (2 * dt)` while every normalised quantity
+    // (directivity, patterns) is unaffected.
+    let weight = 2.0 * dt;
     for component in 0..3 {
         for i in 0..nx {
             for j in 0..ny {
@@ -583,8 +596,8 @@ fn discrete_fourier_transform(
                         j,
                         k,
                         ComplexPoint {
-                            re: re[offset],
-                            im: im[offset],
+                            re: re[offset] * weight,
+                            im: im[offset] * weight,
                         },
                     );
                 }
@@ -625,6 +638,35 @@ mod tests {
         }
         file.write_complex_f32_dataset("/FieldData/FD", "f0", &dims, &re, &im, None)
             .unwrap();
+    }
+
+    #[test]
+    fn time_domain_dft_applies_the_native_trapezoidal_weight() {
+        // f = 1 / (4 dt) gives the exact samples 1, 0, -1. The DFT sum is
+        // 1 - (-1) * exp(-j*pi) = 2, and native scales it by 2 * dt, so the
+        // result must be 4 * dt, not 2.
+        let dt = 2.0e-11;
+        let frequency = 1.0 / (4.0 * dt);
+        let samples: Vec<Vec<f32>> = (0..3)
+            .map(|n| {
+                let phase = 2.0 * PI * frequency * (n as f64 * dt);
+                vec![phase.cos() as f32]
+            })
+            .collect();
+        let data = TimeDomainData {
+            time: (0..3).map(|n| n as f64 * dt).collect(),
+            samples,
+            dims: [1, 1, 1],
+        };
+        let field = discrete_fourier_transform(&data, frequency, dt, [1, 1, 1]);
+        let value = field.get(0, 0, 0, 0);
+        let expected = 4.0 * dt;
+        assert!(
+            (value.re - expected).abs() < expected * 1.0e-12,
+            "DFT real {value_re:e} vs native-weighted {expected:e}",
+            value_re = value.re
+        );
+        assert!(value.im.abs() < expected * 1.0e-6);
     }
 
     #[test]

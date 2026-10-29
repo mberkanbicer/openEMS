@@ -5623,6 +5623,10 @@ mod timestep_tests {
 
     #[test]
     fn var1_and_var3_match_the_uniform_mesh_analytic_values() {
+        // Native `Operator::Operator()` starts on Rennings_2 (Var3); the
+        // engine and the XML path already force it, so the bare library
+        // default must match too.
+        assert_eq!(Operator::new().base.m_time_step_var, 3);
         let delta = 1.0e-3;
         let mut op = uniform_operator(delta, 5);
         let c = 1.0 / (EPS0 * MU0).sqrt();
@@ -6243,10 +6247,20 @@ mod debye_tests {
             (steady - expected_steady).abs() / expected_steady < 1.0e-6,
             "steady pole state {steady:e} vs analytic {expected_steady:e}"
         );
-        assert!(
-            (expected_steady / epsilon_delta - 1.0).abs() < 1.0e-6,
-            "static polarization ratio {expected_steady:e} vs delta_eps {epsilon_delta:e}"
-        );
+        // `2 d / (1 - a) = delta_eps` holds in exact arithmetic. The native
+        // coefficient arrays are `FDTD_FLOAT` (f32), so at Var3 the identity
+        // is only accurate to a few 1e-7 relative; assert the stored values
+        // are the correctly rounded analytic coefficients instead of
+        // loosening the identity bound.
+        let metric = op.metric();
+        let pos = [2usize, 2, 2];
+        let area_per_length =
+            metric.edge_area(0, pos, false) / metric.edge_length(0, pos, false);
+        let c_l = EPS0 * epsilon_delta * area_per_length;
+        let vi = f64::from(op.vi_at(0, pos));
+        let expected_drive = c_l * vi / (2.0 * relax_time + dt);
+        assert_eq!(relax, f64::from(expected_relax as f32));
+        assert_eq!(drive, f64::from(expected_drive as f32));
 
         // Exponential approach with the pole time constant.
         // Keep the fit away from the f32 noise floor of the pole state.

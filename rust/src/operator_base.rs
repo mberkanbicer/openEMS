@@ -251,7 +251,7 @@ impl OperatorBaseImpl {
             m_mesh_type: CoordinateSystem::Cartesian,
             num_lines: [0, 0, 0],
             grid_delta: 0.0,
-            m_time_step_var: 1,
+            m_time_step_var: 3,
         }
     }
 }
