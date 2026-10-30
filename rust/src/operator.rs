@@ -234,6 +234,36 @@ impl Operator {
         }
     }
 
+    /// Bytes held by the operator arrays, grouped like the native
+    /// `ArrayLib::MemTrack` report.
+    pub fn memory_bytes(&self) -> Vec<(&'static str, usize)> {
+        let operator_arrays: usize = [
+            self.vv_ptr.as_ref(),
+            self.vi_ptr.as_ref(),
+            self.ii_ptr.as_ref(),
+            self.iv_ptr.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|array| array.byte_len())
+        .sum();
+        let coefficients = (self.ec_c.len()
+            + self.ec_g.len()
+            + self.ec_l.len()
+            + self.ec_r.len())
+            * std::mem::size_of::<FDTD_FLOAT>();
+        let materials = self
+            .material_grid
+            .as_ref()
+            .map(|grid| grid.len() * std::mem::size_of::<CellMaterial>())
+            .unwrap_or(0);
+        vec![
+            ("operator arrays (vv/vi/ii/iv)", operator_arrays),
+            ("EC C/G/L/R coefficients", coefficients),
+            ("material grid", materials),
+        ]
+    }
+
     /// Geometry helper for the current mesh.
     pub fn metric(&self) -> MeshMetric<'_> {
         MeshMetric::new(
@@ -4817,6 +4847,10 @@ impl Default for Operator {
 }
 
 impl OperatorBase for Operator {
+    fn memory_bytes(&self) -> Vec<(&'static str, usize)> {
+        Operator::memory_bytes(self)
+    }
+
     fn mesh_type(&self) -> MeshType {
         self.mesh_type
     }

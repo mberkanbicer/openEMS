@@ -14,6 +14,12 @@ pub struct GridPath {
 /// Abstract base trait for a common operator.
 /// Mirrors the C++ `Operator_Base` abstract class.
 pub trait OperatorBase {
+    /// Bytes held by the operator arrays, grouped for `--debug-memory`
+    /// (native `ArrayLib::MemTrack`).
+    fn memory_bytes(&self) -> Vec<(&'static str, usize)> {
+        Vec::new()
+    }
+
     /// Set the CSX geometry (returns false if null).
     fn set_geometry_csx(&mut self, geo: *mut std::ffi::c_void) -> bool;
 

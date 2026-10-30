@@ -22,6 +22,7 @@ pub mod extensions;
 pub mod fdtd_options;
 pub mod hdf5;
 pub mod lumped_rlc;
+pub mod memory;
 pub mod nf2ff;
 #[cfg(feature = "hdf5")]
 pub mod nf2ff_hdf5;

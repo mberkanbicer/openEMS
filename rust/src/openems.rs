@@ -106,6 +106,8 @@ pub struct OpenEMS {
     pub debug_material_dump: bool,
     pub debug_operator_dump: bool,
     pub debug_box_dump: bool,
+    /// Report the array memory and the peak RSS (native `--debug-memory`).
+    pub debug_memory: bool,
     pub debug_pec_dump: bool,
     pub debug_csx_dump: bool,
     /// Statistics of the last run.
@@ -155,6 +157,7 @@ impl OpenEMS {
             debug_material_dump: false,
             debug_operator_dump: false,
             debug_box_dump: false,
+        debug_memory: false,
             debug_pec_dump: false,
             debug_csx_dump: false,
             last_run_stats: None,
@@ -582,6 +585,52 @@ impl OpenEMS {
         self.debug_box_dump = boxes;
         self.debug_pec_dump = pec;
         self.debug_csx_dump = csx;
+    }
+
+    /// Report the array memory and the peak resident memory
+    /// (native `--debug-memory`).
+    pub fn set_debug_memory(&mut self, val: bool) {
+        self.debug_memory = val;
+    }
+
+    /// Native `openEMS::ShowMemoryStat`: the operator and field arrays plus
+    /// the peak RSS the OS counted, per FDTD cell.
+    pub fn show_memory_stat(&self, stage: &str) {
+        println!("------- Stat: memory ({stage}) -------");
+        let mut total = 0usize;
+        let mut cells = 0u64;
+        if let Some(engine) = self.fdtd_eng.as_ref() {
+            for (name, bytes) in engine.op.memory_bytes() {
+                println!("{name:<30}: {:.2} MiB", bytes as f64 / 1024.0 / 1024.0);
+                total += bytes;
+            }
+            let fields = engine.volt_ptr.byte_len() + engine.curr_ptr.byte_len();
+            println!(
+                "{:<30}: {:.2} MiB",
+                "field arrays (volt/curr)",
+                fields as f64 / 1024.0 / 1024.0
+            );
+            total += fields;
+            cells = (engine.num_lines[0] * engine.num_lines[1] * engine.num_lines[2]) as u64;
+        }
+        let per_cell = if cells > 0 { total as f64 / cells as f64 } else { 0.0 };
+        println!(
+            "{:<30}: {:.2} MiB ({:.2} Byte/cell)",
+            "total (arrays)",
+            total as f64 / 1024.0 / 1024.0,
+            per_cell
+        );
+        if let Some(rss) = crate::memory::peak_resident_bytes() {
+            print!(
+                "Peak memory (RSS)             : {:.2} MiB",
+                rss as f64 / 1024.0 / 1024.0
+            );
+            if cells > 0 {
+                print!(" ({:.2} Byte/cell)", rss as f64 / cells as f64);
+            }
+            println!();
+        }
+        println!("-----------------------------------");
     }
 
     /// Enable debug material output.
@@ -1170,6 +1219,9 @@ impl OpenEMS {
         }
         self.fdtd_eng = Some(Box::new(engine));
         self.fdtd_op = None; // operator is owned by the engine
+        if self.debug_memory {
+            self.show_memory_stat("operator built");
+        }
 
         // Native `openems.cpp` writes the sampled excitation waveforms (`et`,
         // `ht`) before `SetupProcessing`; a probe that reuses those names then
@@ -1982,6 +2034,9 @@ impl OpenEMS {
         }
 
         println!("[openEMS] FDTD simulation completed: {} timesteps.", ts);
+        if self.debug_memory {
+            self.show_memory_stat("simulation done");
+        }
 
         let cells = self
             .fdtd_eng
@@ -2508,6 +2563,25 @@ mod pml_setup_tests {
             assert_eq!(sim.get_pml_size(face), 8);
         }
         assert!(sim.run_fdtd());
+    }
+
+    #[test]
+    fn the_memory_report_lists_the_operator_arrays() {
+        let mut sim = OpenEMS::new();
+        sim.set_csx_xml(mesh_xml());
+        sim.set_number_of_time_steps(2);
+        sim.set_debug_memory(true);
+        assert!(sim.setup_fdtd(), "setup must succeed");
+        let engine = sim.fdtd_eng.as_ref().expect("engine");
+        let report = engine.op.memory_bytes();
+        assert!(!report.is_empty(), "operator arrays are reported");
+        assert!(
+            report.iter().all(|(_, bytes)| *bytes > 0),
+            "every reported group has bytes: {report:?}"
+        );
+        assert!(engine.volt_ptr.byte_len() > 0);
+        // The native-style report runs without a panic and returns.
+        sim.show_memory_stat("test");
     }
 
     #[test]

@@ -34,6 +34,11 @@ struct Args {
     /// Disable all field dumps for a faster simulation.
     #[arg(long = "disable-dumps")]
     disable_dumps: bool,
+    /// Report the memory held by the field and operator arrays and the
+    /// peak resident memory (native `--debug-memory`).
+    #[arg(long = "debug-memory")]
+    debug_memory: bool,
+
 
     /// Dump the material distribution to `material_dump.vtk`.
     #[arg(long = "debug-material")]
@@ -162,6 +167,7 @@ fn main() -> ExitCode {
     sim.set_legacy_hdf5_dumps(args.legacy_hdf5_dumps > 0);
     sim.set_native_field_dumps(args.native_field_dumps > 0);
     sim.set_no_simulation(args.no_simulation);
+    sim.set_debug_memory(args.debug_memory);
     sim.set_dump_statistics(args.dump_statistics);
     sim.set_exact_end_criteria(args.exact_end_criteria);
     sim.set_debug_dumps(

@@ -46,6 +46,21 @@ impl<T> ArrayNIJK<T> {
     }
 
     /// Return the number of components (N dimension, always 3).
+        /// Number of stored values (all components).
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Bytes held by the storage buffer.
+    pub fn byte_len(&self) -> usize {
+        self.data.len() * std::mem::size_of::<T>()
+    }
+
+    /// Whether the storage is empty.
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     pub fn n_components(&self) -> usize {
         self.extent[0]
     }
