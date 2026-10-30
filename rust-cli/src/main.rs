@@ -154,7 +154,10 @@ fn main() -> ExitCode {
     let mut sim = OpenEMS::new();
     sim.set_csx_xml(xml);
     sim.set_verbose_level(args.verbose as i32);
-    sim.set_engine(&args.engine);
+    if let Err(error) = sim.set_engine(&args.engine) {
+        eprintln!("openEMS - {error}");
+        return ExitCode::from(1);
+    }
     sim.set_enable_dumps(!args.disable_dumps);
     sim.set_legacy_hdf5_dumps(args.legacy_hdf5_dumps > 0);
     sim.set_native_field_dumps(args.native_field_dumps > 0);

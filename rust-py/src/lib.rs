@@ -231,8 +231,9 @@ impl PyOpenEMS {
     }
 
     /// Set a Gaussian pulse excitation.
-    fn set_gauss_excite(&mut self, f0: f64, fc: f64) {
-        self.inner.set_gauss_excite(f0, fc);
+    #[pyo3(signature = (f0, fc, dc_free = false))]
+    fn set_gauss_excite(&mut self, f0: f64, fc: f64, dc_free: bool) {
+        self.inner.set_gauss_excite_with_dc(f0, fc, dc_free);
     }
 
     /// Set a sinusoidal excitation.

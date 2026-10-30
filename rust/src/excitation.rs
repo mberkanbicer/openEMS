@@ -71,6 +71,8 @@ pub struct Excitation {
     pub exc_type: ExcitationType,
     pub f0: f64,
     pub fc: f64,
+    /// Sine carrier instead of a cosine one (native `DCFree`), Gaussian only.
+    pub gauss_dc_free: bool,
     pub f_max: f64,
     /// Timestep used to sample the signal, in seconds.
     pub dt: f64,
@@ -90,6 +92,7 @@ impl Excitation {
             exc_type: ExcitationType::Gauss,
             f0,
             fc,
+            gauss_dc_free: false,
             f_max: 0.0,
             dt: 0.0,
             signal_volt: Vec::new(),
@@ -99,12 +102,27 @@ impl Excitation {
         }
     }
 
+    /// Create a DC-free Gaussian excitation (native
+    /// `SetGaussExcite(f0, fc, dc_free=true)`).
+    pub fn gauss_dc_free(f0: f64, fc: f64) -> Self {
+        Self {
+            gauss_dc_free: true,
+            ..Self::gauss(f0, fc)
+        }
+    }
+
+    /// Select the sine carrier of a Gaussian pulse (native `DCFree`).
+    pub fn set_gauss_dc_free(&mut self, dc_free: bool) {
+        self.gauss_dc_free = dc_free;
+    }
+
     /// Create a sinusoidal excitation.
     pub fn sinus(f0: f64) -> Self {
         Self {
             exc_type: ExcitationType::Sinus,
             f0,
             fc: 0.0,
+            gauss_dc_free: false,
             f_max: 0.0,
             dt: 0.0,
             signal_volt: Vec::new(),
@@ -120,6 +138,7 @@ impl Excitation {
             exc_type: ExcitationType::Dirac,
             f0: 0.0,
             fc: 0.0,
+            gauss_dc_free: false,
             f_max,
             dt: 0.0,
             signal_volt: Vec::new(),
@@ -135,6 +154,7 @@ impl Excitation {
             exc_type: ExcitationType::Step,
             f0: 0.0,
             fc: 0.0,
+            gauss_dc_free: false,
             f_max,
             dt: 0.0,
             signal_volt: Vec::new(),
@@ -150,6 +170,7 @@ impl Excitation {
             exc_type: ExcitationType::Custom,
             f0,
             fc: 0.0,
+            gauss_dc_free: false,
             f_max: fmax,
             dt: 0.0,
             signal_volt: Vec::new(),
@@ -224,12 +245,13 @@ impl Excitation {
         let mut curr = vec![0.0f32; length];
         for n in 1..length {
             let t = n as f64 * dt;
-            volt[n] = gauss_sample(self.f0, self.fc, t, delay) as f32;
-            curr[n] = gauss_sample(self.f0, self.fc, t + 0.5 * dt, delay) as f32;
+            volt[n] = gauss_sample(self.f0, self.fc, t, delay, self.gauss_dc_free) as f32;
+            curr[n] =
+                gauss_sample(self.f0, self.fc, t + 0.5 * dt, delay, self.gauss_dc_free) as f32;
         }
         self.signal_volt = volt;
         self.signal_curr = curr;
-        self.f_max = self.f0 + self.fc;
+        self.f_max = calc_gauss_max_freq(self.f0, self.fc, self.gauss_dc_free);
         self.nyquist_ts = calc_nyquist_num(self.f_max, dt);
         Ok(())
     }
@@ -375,9 +397,44 @@ impl Default for Excitation {
 }
 
 /// Native Gaussian sample at time `t` with the fixed `9/(2*pi*fc)` delay.
-fn gauss_sample(f0: f64, fc: f64, t: f64, delay: f64) -> f64 {
-    let envelope_arg = 2.0 * PI * fc * t / 3.0 - 3.0;
-    (2.0 * PI * f0 * (t - delay)).cos() * (-(envelope_arg * envelope_arg)).exp()
+fn gauss_sample(f0: f64, fc: f64, t: f64, delay: f64, dc_free: bool) -> f64 {
+    // Native `Excitation::CalcGaussianPulse`.
+    let u = 2.0 * PI * fc * t / 3.0 - 3.0;
+    let envelope = (-(u * u)).exp();
+    if !dc_free {
+        return (2.0 * PI * f0 * (t - delay)).cos() * envelope;
+    }
+    if f0 > 0.0 {
+        return (2.0 * PI * f0 * (t - delay)).sin() * envelope;
+    }
+    // Monocycle: the derivative of the envelope, peak 1 at u = -1/sqrt(2).
+    -u * envelope * (2.0 * std::f64::consts::E).sqrt()
+}
+
+/// Native `Excitation::CalcGaussianMaxFreq`: the -20 dB edge of the spectrum.
+fn calc_gauss_max_freq(f0: f64, fc: f64, dc_free: bool) -> f64 {
+    if !dc_free || f0 >= fc {
+        return f0 + fc;
+    }
+    // Below f0=fc the two sidebands of the sine carrier overlap and push the
+    // -20 dB edge above f0+fc, up to 1.3*fc at f0=0.
+    let a = 2.25 / (fc * fc);
+    let df = fc * 1.0e-3;
+    let mut peak = 0.0f64;
+    let mut f = 0.0f64;
+    loop {
+        let s = if f0 > 0.0 {
+            (-a * (f - f0) * (f - f0)).exp() - (-a * (f + f0) * (f + f0)).exp()
+        } else {
+            f * (-a * f * f).exp()
+        };
+        if s > peak {
+            peak = s;
+        } else if s < 0.1 * peak {
+            return f;
+        }
+        f += df;
+    }
 }
 
 /// Native `CalcNyquistNum`: floor(1/fmax/2/dt), `u32::MAX` when fmax is zero.
@@ -426,8 +483,8 @@ mod tests {
 
         for n in [1usize, 10, 100, 5729] {
             let t = n as f64 * dt;
-            let expected_volt = gauss_sample(f0, fc, t, delay);
-            let expected_curr = gauss_sample(f0, fc, t + 0.5 * dt, delay);
+            let expected_volt = gauss_sample(f0, fc, t, delay, false);
+            let expected_curr = gauss_sample(f0, fc, t + 0.5 * dt, delay, false);
             assert_close(excitation.voltage(n), expected_volt, 1.0e-6);
             assert_close(excitation.current(n), expected_curr, 1.0e-6);
         }
@@ -515,5 +572,93 @@ mod tests {
         assert!(!excitation.is_built());
         assert_eq!(excitation.voltage(3), 0.0);
         assert_eq!(excitation.current(3), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod dc_free_tests {
+    use super::*;
+
+    fn built(mut excitation: Excitation, dt: f64) -> Excitation {
+        excitation.build(dt, 0).expect("build");
+        excitation
+    }
+
+    fn mean(signal: &[f32]) -> f64 {
+        signal.iter().map(|value| *value as f64).sum::<f64>() / signal.len() as f64
+    }
+
+    #[test]
+    fn the_sine_carrier_removes_the_dc_part() {
+        let dt = 1.0e-12;
+        let plain = built(Excitation::gauss(1.0e9, 1.0e9), dt);
+        let dc_free = built(Excitation::gauss_dc_free(1.0e9, 1.0e9), dt);
+        // The cosine carrier of the plain pulse adds at DC; the sine carrier
+        // cancels there (the point of the native DCFree option).
+        assert!(
+            mean(&plain.signal_volt).abs() > 5.0e-3,
+            "plain mean {:e}",
+            mean(&plain.signal_volt)
+        );
+        assert!(
+            mean(&dc_free.signal_volt).abs() < 1.0e-4,
+            "dc-free mean {:e}",
+            mean(&dc_free.signal_volt)
+        );
+        // Both carriers stay normalised to about one.
+        let peak = |signal: &[f32]| signal.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(peak(&plain.signal_volt) > 0.5 && peak(&plain.signal_volt) < 1.1);
+        assert!(peak(&dc_free.signal_volt) > 0.5 && peak(&dc_free.signal_volt) < 1.1);
+    }
+
+    #[test]
+    fn the_dc_free_sample_matches_the_native_formula() {
+        let (f0, fc, dt) = (2.0e9, 5.0e8, 1.0e-12);
+        let excitation = built(Excitation::gauss_dc_free(f0, fc), dt);
+        let delay = 9.0 / (2.0 * PI * fc);
+        for n in [1usize, 50, 200, 400] {
+            let t = n as f64 * dt;
+            let u = 2.0 * PI * fc * t / 3.0 - 3.0;
+            let expected = (2.0 * PI * f0 * (t - delay)).sin() * (-(u * u)).exp();
+            assert!(
+                (excitation.signal_volt[n] as f64 - expected).abs() < 1.0e-6,
+                "sample {n}: {} vs {expected:e}",
+                excitation.signal_volt[n]
+            );
+        }
+    }
+
+    #[test]
+    fn f0_zero_is_the_monocycle_with_a_unit_peak() {
+        let excitation = built(Excitation::gauss_dc_free(0.0, 1.0e9), 1.0e-12);
+        let peak = excitation
+            .signal_volt
+            .iter()
+            .fold(0.0f32, |max, value| max.max(value.abs()));
+        assert!((peak - 1.0).abs() < 5.0e-3, "peak {peak}");
+        assert!((mean(&excitation.signal_volt)).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn the_max_frequency_comes_from_the_spectrum_when_f0_is_small() {
+        // Above f0=fc the spectrum is unchanged.
+        assert_eq!(calc_gauss_max_freq(1.0e9, 1.0e9, true), 2.0e9);
+        assert_eq!(calc_gauss_max_freq(1.0e9, 1.0e9, false), 2.0e9);
+        // At f0=0 the -20 dB edge is about 1.3*fc.
+        let edge = calc_gauss_max_freq(0.0, 1.0e9, true);
+        assert!((1.2e9..1.35e9).contains(&edge), "edge {edge:e}");
+        // Below fc the edge is above f0+fc.
+        let edge = calc_gauss_max_freq(0.5e9, 1.0e9, true);
+        assert!(edge > 1.5e9, "edge {edge:e}");
+    }
+
+    #[test]
+    fn the_dc_free_nyquist_rate_follows_the_wider_spectrum() {
+        let dt = 1.0e-12;
+        let plain = built(Excitation::gauss(0.0, 1.0e9), dt);
+        let dc_free = built(Excitation::gauss_dc_free(0.0, 1.0e9), dt);
+        assert_eq!(plain.f_max, 1.0e9);
+        assert!(dc_free.f_max > plain.f_max);
+        assert!(dc_free.nyquist_ts < plain.nyquist_ts);
     }
 }

@@ -165,7 +165,11 @@ impl OpenEMS {
 
     /// Set the number of time steps.
     pub fn set_number_of_time_steps(&mut self, val: u32) {
-        self.nr_ts = val;
+        // Native `SetNumberOfTimeSteps`: the run counts the timesteps as int,
+        // so anything above INT_MAX is clamped (a run that long is unlimited
+        // in practice). Without the clamp the native setup failed with
+        // "excitation setup failed".
+        self.nr_ts = val.min(i32::MAX as u32);
     }
 
     /// Set the end criteria.
@@ -304,6 +308,7 @@ impl OpenEMS {
                 crate::excitation::ExcitationType::Gauss => FdtdExcitation::Gauss {
                     f0: excitation.f0,
                     fc: excitation.fc,
+                    dc_free: excitation.gauss_dc_free,
                 },
                 crate::excitation::ExcitationType::Sinus => {
                     FdtdExcitation::Sinus { f0: excitation.f0 }
@@ -320,7 +325,11 @@ impl OpenEMS {
                     f_max: excitation.f_max,
                 },
             },
-            None => FdtdExcitation::Gauss { f0: 0.0, fc: 0.0 },
+            None => FdtdExcitation::Gauss {
+                f0: 0.0,
+                fc: 0.0,
+                dc_free: false,
+            },
         };
         crate::fdtd_options::write_fdtd_element(&FdtdWriteSettings {
             nr_ts: self.nr_ts,
@@ -393,8 +402,8 @@ impl OpenEMS {
             }
         }
         match &options.excitation {
-            Some(crate::fdtd_options::FdtdExcitation::Gauss { f0, fc }) => {
-                self.set_gauss_excite(*f0, *fc);
+            Some(crate::fdtd_options::FdtdExcitation::Gauss { f0, fc, dc_free }) => {
+                self.set_gauss_excite_with_dc(*f0, *fc, *dc_free);
             }
             Some(crate::fdtd_options::FdtdExcitation::Sinus { f0 }) => {
                 self.set_sinus_excite(*f0);
@@ -426,8 +435,8 @@ impl OpenEMS {
         excitation: Option<&crate::fdtd_options::FdtdExcitation>,
     ) {
         match excitation {
-            Some(crate::fdtd_options::FdtdExcitation::Gauss { f0, fc }) => {
-                self.set_gauss_excite(*f0, *fc);
+            Some(crate::fdtd_options::FdtdExcitation::Gauss { f0, fc, dc_free }) => {
+                self.set_gauss_excite_with_dc(*f0, *fc, *dc_free);
             }
             Some(crate::fdtd_options::FdtdExcitation::Sinus { f0 }) => {
                 self.set_sinus_excite(*f0);
@@ -452,6 +461,14 @@ impl OpenEMS {
     /// Set a Gaussian pulse excitation.
     pub fn set_gauss_excite(&mut self, f0: f64, fc: f64) {
         self.excitation = Some(Box::new(Excitation::gauss(f0, fc)));
+    }
+
+    /// Set a Gaussian excitation, optionally with the DC-free sine carrier
+    /// (native `SetGaussExcite(f0, fc, dc_free)`).
+    pub fn set_gauss_excite_with_dc(&mut self, f0: f64, fc: f64, dc_free: bool) {
+        let mut excitation = Excitation::gauss(f0, fc);
+        excitation.set_gauss_dc_free(dc_free);
+        self.excitation = Some(Box::new(excitation));
     }
 
     /// Set a sinusoidal excitation.
@@ -519,13 +536,20 @@ impl OpenEMS {
 
     /// Select the engine (`fastest`, `basic`, `sse`, `sse-compressed`,
     /// `multithreaded`). Unknown names keep the previous selection.
-    pub fn set_engine(&mut self, engine: &str) {
+    /// Select the engine. An unknown name is an error, as in the native
+    /// application: it used to silently run the default engine.
+    pub fn set_engine(&mut self, engine: &str) -> Result<(), String> {
         let normalized = engine.to_ascii_lowercase();
         if matches!(
             normalized.as_str(),
             "fastest" | "basic" | "sse" | "sse-compressed" | "multithreaded"
         ) {
             self.engine = normalized;
+            Ok(())
+        } else {
+            Err(format!(
+                "unknown engine '{engine}'; use fastest, basic, sse, sse-compressed or multithreaded"
+            ))
         }
     }
 
@@ -2932,5 +2956,40 @@ mod option_wiring_tests {
         let mut sim = OpenEMS::new();
         sim.set_over_sampling(0);
         assert_eq!(sim.over_sampling, 1);
+    }
+}
+
+#[cfg(test)]
+mod upstream_parity_tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_engine_is_an_error() {
+        let mut sim = OpenEMS::new();
+        sim.set_engine("basic").expect("basic engine");
+        let error = sim.set_engine("cuda").expect_err("unknown engine");
+        assert!(error.contains("cuda"), "{error}");
+        // The failed switch leaves the previous engine in place.
+        assert_eq!(sim.engine, "basic");
+    }
+
+    #[test]
+    fn the_timestep_count_is_limited_to_int_max() {
+        let mut sim = OpenEMS::new();
+        sim.set_number_of_time_steps(u32::MAX);
+        assert_eq!(sim.nr_ts, i32::MAX as u32);
+    }
+
+    #[test]
+    fn the_dc_free_excitation_reaches_the_written_fdtd_element() {
+        let mut sim = OpenEMS::new();
+        sim.set_gauss_excite_with_dc(1.0e9, 5.0e8, true);
+        assert!(sim
+            .excitation
+            .as_ref()
+            .expect("excitation")
+            .gauss_dc_free);
+        let written = sim.write_fdtd_element();
+        assert!(written.contains("DCFree=\"1\""), "{written}");
     }
 }

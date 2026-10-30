@@ -11,6 +11,8 @@ pub enum FdtdExcitation {
     Gauss {
         f0: f64,
         fc: f64,
+        /// Sine carrier without a DC part (native `DCFree="1"`).
+        dc_free: bool,
     },
     Sinus {
         f0: f64,
@@ -262,7 +264,13 @@ pub fn parse_fdtd_options(xml: &str) -> FdtdOptions {
             .and_then(|value| value.trim().parse::<f64>().ok())
             .unwrap_or(0.0);
         options.excitation = match excitation_type {
-            0 => Some(FdtdExcitation::Gauss { f0, fc }),
+            0 => Some(FdtdExcitation::Gauss {
+                f0,
+                fc,
+                dc_free: get("DCFree")
+                    .and_then(|value| value.trim().parse::<i32>().ok())
+                    .is_some_and(|value| value != 0),
+            }),
             1 => Some(FdtdExcitation::Sinus { f0 }),
             2 => Some(FdtdExcitation::Dirac { f_max }),
             3 => Some(FdtdExcitation::Step { f_max }),
@@ -348,10 +356,13 @@ pub fn write_fdtd_element(settings: &FdtdWriteSettings) -> String {
 
     let mut excitation = String::from("<Excitation");
     match &settings.excitation {
-        FdtdExcitation::Gauss { f0, fc } => {
+        FdtdExcitation::Gauss { f0, fc, dc_free } => {
             attribute(&mut excitation, "Type", "0");
             attribute(&mut excitation, "f0", &f0.to_string());
             attribute(&mut excitation, "fc", &fc.to_string());
+            if *dc_free {
+                attribute(&mut excitation, "DCFree", "1");
+            }
         }
         FdtdExcitation::Sinus { f0 } => {
             attribute(&mut excitation, "Type", "1");
@@ -466,5 +477,59 @@ mod tests {
         let options = parse_fdtd_options(xml);
         assert_eq!(options.nr_ts, Some(42));
         assert_eq!(options.end_criteria, Some(1e-6));
+    }
+}
+
+#[cfg(test)]
+mod dc_free_option_tests {
+    use super::*;
+
+    #[test]
+    fn the_dc_free_flag_is_read_and_written() {
+        let xml = r#"<openEMS><FDTD NumberOfTimesteps="10">
+            <Excitation Type="0" f0="1e9" fc="5e8" DCFree="1"/>
+        </FDTD></openEMS>"#;
+        let options = parse_fdtd_options(xml);
+        assert_eq!(
+            options.excitation,
+            Some(FdtdExcitation::Gauss {
+                f0: 1.0e9,
+                fc: 5.0e8,
+                dc_free: true,
+            })
+        );
+
+        let settings = FdtdWriteSettings {
+            nr_ts: 10,
+            end_criteria: 0.0,
+            max_time: 0.0,
+            over_sampling: 0,
+            cell_constant_material: false,
+            cylinder_coords: false,
+            multi_grid: Vec::new(),
+            time_step: 0.0,
+            time_step_factor: 0.0,
+            time_step_method: 0,
+            bc_type: [0; 6],
+            pml_size: [0; 6],
+            mur_phase_velocity: [None; 6],
+            excitation: FdtdExcitation::Gauss {
+                f0: 1.0e9,
+                fc: 5.0e8,
+                dc_free: true,
+            },
+        };
+        let written = write_fdtd_element(&settings);
+        assert!(written.contains("DCFree=\"1\""), "{written}");
+
+        let plain = FdtdWriteSettings {
+            excitation: FdtdExcitation::Gauss {
+                f0: 1.0e9,
+                fc: 5.0e8,
+                dc_free: false,
+            },
+            ..settings
+        };
+        assert!(!write_fdtd_element(&plain).contains("DCFree"));
     }
 }
