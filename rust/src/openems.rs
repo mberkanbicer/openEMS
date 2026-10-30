@@ -277,8 +277,14 @@ impl OpenEMS {
     }
 
     /// Set the timestep factor (multiplier on CFL timestep).
+    ///
+    /// Native `Operator::SetTimestepFactor` accepts `(0, 1]` and ignores
+    /// anything else with a warning. The same validation is applied here so an
+    /// invalid factor cannot make the step larger than the CFL limit.
     pub fn set_time_step_factor(&mut self, val: f64) {
-        self.time_step_factor = val;
+        if val > 0.0 && val <= 1.0 && val.is_finite() {
+            self.time_step_factor = val;
+        }
     }
 
     /// Set the oversampling factor for time-domain dumps/probes.
@@ -390,7 +396,7 @@ impl OpenEMS {
             self.time_step = time_step;
         }
         if let Some(time_step_factor) = options.time_step_factor {
-            self.time_step_factor = time_step_factor;
+            self.set_time_step_factor(time_step_factor);
         }
         if let Some(time_step_method) = options.time_step_method {
             self.time_step_method = time_step_method;
@@ -984,7 +990,7 @@ impl OpenEMS {
             self.time_step = value;
         }
         if let Some(value) = options.time_step_factor {
-            self.time_step_factor = value;
+            self.set_time_step_factor(value);
         }
         if let Some(value) = options.time_step_method {
             self.time_step_method = value;
@@ -2251,6 +2257,27 @@ mod tests {
         assert!(halved.setup_fdtd());
         let dt_halved = halved.fdtd_eng.as_ref().unwrap().op.get_timestep();
         assert!((dt_halved / dt_reference - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn invalid_timestep_factors_are_ignored() {
+        let mut sim = OpenEMS::new();
+        for value in [0.0, -1.0, 1.5, f64::NAN, f64::INFINITY] {
+            sim.set_time_step_factor(value);
+            assert_eq!(sim.time_step_factor, 1.0, "factor {value}");
+        }
+        sim.set_time_step_factor(0.5);
+        assert_eq!(sim.time_step_factor, 0.5);
+    }
+
+    #[test]
+    fn timestep_factor_is_written_and_read_back() {
+        let mut sim = OpenEMS::new();
+        sim.set_time_step_factor(0.5);
+        let xml = sim.write_fdtd_element();
+        assert!(xml.contains("TimeStepFactor=\"0.5\""), "{xml}");
+        let options = crate::fdtd_options::parse_fdtd_options(&xml);
+        assert_eq!(options.time_step_factor, Some(0.5));
     }
 
     #[test]

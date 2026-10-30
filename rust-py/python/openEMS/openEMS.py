@@ -92,6 +92,9 @@ class openEMS(_RustOpenEMS):
     def SetGaussExcite(self, f0, fc, dc_free=False):
         return self.set_gauss_excite(float(f0), float(fc), bool(dc_free))
 
+    def GetTimeStep(self):
+        return self.get_timestep()
+
     def SetSinusExcite(self, f0):
         return self.set_sinus_excite(float(f0))
 

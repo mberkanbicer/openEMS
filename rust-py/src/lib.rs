@@ -241,6 +241,15 @@ impl PyOpenEMS {
         self.inner.has_excitation()
     }
 
+    /// The solver time step used by the last setup (0 before setup).
+    fn get_timestep(&self) -> f64 {
+        self.inner
+            .fdtd_eng
+            .as_ref()
+            .map(|engine| engine.op.get_timestep())
+            .unwrap_or(0.0)
+    }
+
     /// Set a sinusoidal excitation.
     fn set_sinus_excite(&mut self, f0: f64) {
         self.inner.set_sinus_excite(f0);

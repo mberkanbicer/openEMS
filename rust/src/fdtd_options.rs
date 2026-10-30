@@ -360,7 +360,7 @@ pub fn write_fdtd_element(settings: &FdtdWriteSettings) -> String {
     if settings.time_step > 0.0 {
         attribute(&mut element, "TimeStep", &settings.time_step.to_string());
     }
-    if settings.time_step_factor > 1.0 {
+    if settings.time_step_factor > 0.0 && settings.time_step_factor != 1.0 {
         attribute(
             &mut element,
             "TimeStepFactor",
