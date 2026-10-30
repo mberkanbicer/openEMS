@@ -264,6 +264,67 @@ impl Operator {
         ]
     }
 
+    /// Native `--debug-PEC`: the mesh edges that are metal, as line endpoints
+    /// in world coordinates, with each edge's direction (0, 1, 2 for x, y, z)
+    /// and the mesh length unit.
+    ///
+    /// An EC edge is metal when its `vv` update coefficient is zero, which is
+    /// exactly what `calc_ec_operator` sets for a PEC edge.
+    pub fn pec_edges(&self) -> (Vec<[f64; 3]>, Vec<[usize; 2]>, Vec<u8>, f64) {
+        let mut points: Vec<[f64; 3]> = Vec::new();
+        let mut point_index: HashMap<[usize; 3], usize> = HashMap::new();
+        let mut lines: Vec<[usize; 2]> = Vec::new();
+        let mut directions: Vec<u8> = Vec::new();
+        let delta = self.base.grid_delta;
+        let Some(vv) = self.vv_ptr.as_ref() else {
+            return (points, lines, directions, delta);
+        };
+        let counts = [
+            self.base.num_lines[0] as usize,
+            self.base.num_lines[1] as usize,
+            self.base.num_lines[2] as usize,
+        ];
+        let lines_axis = &self.base.disc_lines;
+        let node = |index: [usize; 3]| -> [f64; 3] {
+            let mut coordinate = [
+                lines_axis[0].as_ref().map(|l| l[index[0]]).unwrap_or(0.0) * delta,
+                lines_axis[1].as_ref().map(|l| l[index[1]]).unwrap_or(0.0) * delta,
+                lines_axis[2].as_ref().map(|l| l[index[2]]).unwrap_or(0.0) * delta,
+            ];
+            if matches!(self.mesh_type, MeshType::Cylindrical { .. }) {
+                let (rho, alpha) = (coordinate[0], coordinate[1]);
+                coordinate = [rho * alpha.cos(), rho * alpha.sin(), coordinate[2]];
+            }
+            coordinate
+        };
+        let mut point = |index: [usize; 3]| -> usize {
+            *point_index.entry(index).or_insert_with(|| {
+                points.push(node(index));
+                points.len() - 1
+            })
+        };
+        for direction in 0..3usize {
+            for i in 0..counts[0] {
+                for j in 0..counts[1] {
+                    for k in 0..counts[2] {
+                        if *vv.get(direction, i, j, k) != 0.0 {
+                            continue;
+                        }
+                        let start = [i, j, k];
+                        let mut end = start;
+                        end[direction] += 1;
+                        if end[direction] >= counts[direction] {
+                            continue;
+                        }
+                        lines.push([point(start), point(end)]);
+                        directions.push(direction as u8);
+                    }
+                }
+            }
+        }
+        (points, lines, directions, delta)
+    }
+
     /// Geometry helper for the current mesh.
     pub fn metric(&self) -> MeshMetric<'_> {
         MeshMetric::new(
@@ -5241,6 +5302,31 @@ mod tests {
             .expect("structure")
             .drawing_tolerance()
             > 0.0);
+    }
+
+    #[test]
+    fn the_pec_edges_are_the_metal_mesh_edges() {
+        let mut op = Operator::new();
+        op.load_csx(SAMPLE_CSX).expect("load_csx");
+        op.calc_ec_operator();
+        let (points, lines, directions, unit) = op.pec_edges();
+        assert!(!lines.is_empty(), "the PEC boundaries and metal box have edges");
+        assert_eq!(directions.len(), lines.len());
+        assert!(directions.iter().all(|direction| *direction < 3));
+        assert!(unit > 0.0);
+        for line in &lines {
+            let start = points[line[0]];
+            let end = points[line[1]];
+            let length = ((start[0] - end[0]).powi(2)
+                + (start[1] - end[1]).powi(2)
+                + (start[2] - end[2]).powi(2))
+            .sqrt();
+            assert!(length > 0.0, "degenerate PEC edge {line:?}");
+        }
+        // The metal box starts at 3 drawing units in SAMPLE_CSX.
+        assert!(points
+            .iter()
+            .any(|point| (point[0] - 3.0 * unit).abs() < 1.0e-9));
     }
 
     #[test]

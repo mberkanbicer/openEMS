@@ -182,3 +182,79 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 }
+
+/// Write the PEC edges as a legacy-VTK `.vtp` PolyData file (native
+/// `--debug-PEC`): one line per metal edge, a `direction` cell array (0, 1, 2
+/// for x, y, z) and the `LengthUnit` field data.
+pub fn write_pec_edges_vtp(
+    path: &str,
+    points: &[[f64; 3]],
+    lines: &[[usize; 2]],
+    directions: &[u8],
+    length_unit: f64,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    writeln!(file, "<?xml version=\"1.0\"?>")?;
+    writeln!(
+        file,
+        "<VTKFile type=\"PolyData\" version=\"1.0\" byte_order=\"LittleEndian\">"
+    )?;
+    writeln!(file, "  <PolyData>")?;
+    writeln!(
+        file,
+        "    <Piece NumberOfPoints=\"{}\" NumberOfLines=\"{}\" NumberOfVerts=\"0\" NumberOfStrips=\"0\" NumberOfPolys=\"0\">",
+        points.len(),
+        lines.len()
+    )?;
+    write!(file, "      <Points><DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">")?;
+    for point in points {
+        write!(file, " {} {} {}", point[0], point[1], point[2])?;
+    }
+    writeln!(file, "</DataArray></Points>")?;
+    write!(file, "      <Lines><DataArray type=\"Int64\" Name=\"connectivity\" format=\"ascii\">")?;
+    for line in lines {
+        write!(file, " {} {}", line[0], line[1])?;
+    }
+    writeln!(file, "</DataArray>")?;
+    write!(file, "<DataArray type=\"Int64\" Name=\"offsets\" format=\"ascii\">")?;
+    for index in 1..=lines.len() {
+        write!(file, " {}", index * 2)?;
+    }
+    writeln!(file, "</DataArray></Lines>")?;
+    write!(file, "      <CellData><DataArray type=\"UInt8\" Name=\"direction\" format=\"ascii\">")?;
+    for direction in directions {
+        write!(file, " {direction}")?;
+    }
+    writeln!(file, "</DataArray></CellData>")?;
+    writeln!(
+        file,
+        "      <FieldData><DataArray type=\"Float64\" Name=\"LengthUnit\" NumberOfTuples=\"1\" format=\"ascii\"> {length_unit} </DataArray></FieldData>"
+    )?;
+    writeln!(file, "    </Piece>")?;
+    writeln!(file, "  </PolyData>")?;
+    writeln!(file, "</VTKFile>")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod pec_edges_tests {
+    use super::*;
+
+    #[test]
+    fn the_pec_edges_are_written_with_direction_and_unit() {
+        let path = std::env::temp_dir().join("openems_pec_edges_test.vtp");
+        let path_text = path.to_string_lossy().to_string();
+        let points = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let lines = [[0usize, 1], [0, 2]];
+        write_pec_edges_vtp(&path_text, &points, &lines, &[0, 1], 1.0e-3).expect("write");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("type=\"PolyData\""), "{text}");
+        assert!(text.contains("NumberOfPoints=\"3\""));
+        assert!(text.contains("NumberOfLines=\"2\""));
+        assert!(text.contains("Name=\"direction\""));
+        assert!(text.contains("Name=\"LengthUnit\""));
+        assert!(text.contains("1e-3") || text.contains("0.001"));
+        let _ = std::fs::remove_file(&path);
+    }
+}

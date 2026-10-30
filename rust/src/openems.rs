@@ -847,22 +847,21 @@ impl OpenEMS {
         }
 
         if self.debug_pec_dump {
-            if let (Some(vv), Some(vi)) = (op.vv_ptr.as_ref(), op.vi_ptr.as_ref()) {
-                let mut values = vec![0.0; cells];
-                for i in 0..dims[0] {
-                    for j in 0..dims[1] {
-                        for k in 0..dims[2] {
-                            let index = (i * dims[1] + j) * dims[2] + k;
-                            if *vv.get(0, i, j, k) == 0.0 && *vi.get(0, i, j, k) == 0.0 {
-                                values[index] = 1.0;
-                            }
-                        }
-                    }
-                }
-                match debug_dump::write_scalar_vtk("PEC_dump.vtk", "PEC", dims, lines, &values) {
-                    Ok(()) => println!("[openEMS] PEC written to 'PEC_dump.vtk'"),
-                    Err(error) => eprintln!("[openEMS] PEC_dump.vtk failed: {error}"),
-                }
+            // Native `--debug-PEC`: the metal mesh edges as a PolyData file,
+            // with each edge's direction and the mesh length unit.
+            let (points, edge_lines, directions, length_unit) = op.pec_edges();
+            match debug_dump::write_pec_edges_vtp(
+                "PEC_dump.vtp",
+                &points,
+                &edge_lines,
+                &directions,
+                length_unit,
+            ) {
+                Ok(()) => println!(
+                    "[openEMS] PEC edges written to 'PEC_dump.vtp' ({} edges)",
+                    edge_lines.len()
+                ),
+                Err(error) => eprintln!("[openEMS] PEC_dump.vtp failed: {error}"),
             }
         }
 

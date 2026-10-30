@@ -400,6 +400,11 @@ impl PyOpenEMS {
         self.inner.debug_csx();
     }
 
+    /// Report the array memory and the peak RSS (native `--debug-memory`).
+    fn set_debug_memory(&mut self, val: bool) {
+        self.inner.set_debug_memory(val);
+    }
+
     /// The native `<FDTD ...>` element for the current solver settings.
     fn fdtd_xml(&self) -> String {
         self.inner.write_fdtd_element()

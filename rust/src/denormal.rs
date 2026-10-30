@@ -12,13 +12,30 @@ pub struct FlushToZero {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn enable() -> Option<u32> {
+fn read_mxcsr() -> u32 {
+    let mut value: u32 = 0;
+    // SAFETY: `stmxcsr` stores the 32-bit control/status word into `value`.
     unsafe {
-        let saved = std::arch::x86_64::_mm_getcsr();
-        // bit 15: flush to zero, bit 6: denormals are zero
-        std::arch::x86_64::_mm_setcsr(saved | (1 << 15) | (1 << 6));
-        Some(saved)
+        std::arch::asm!("stmxcsr [{}]", in(reg) &mut value, options(nostack, preserves_flags));
     }
+    value
+}
+
+#[cfg(target_arch = "x86_64")]
+fn write_mxcsr(value: u32) {
+    // SAFETY: `ldmxcsr` loads a valid MXCSR value; the caller passes one read
+    // from this CPU or that value with the FTZ/DAZ control bits set.
+    unsafe {
+        std::arch::asm!("ldmxcsr [{}]", in(reg) &value, options(nostack, preserves_flags));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn enable() -> Option<u32> {
+    let saved = read_mxcsr();
+    // bit 15: flush to zero, bit 6: denormals are zero
+    write_mxcsr(saved | (1 << 15) | (1 << 6));
+    Some(saved)
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -28,9 +45,7 @@ fn enable() -> Option<u32> {
 
 #[cfg(target_arch = "x86_64")]
 fn restore(saved: u32) {
-    unsafe {
-        std::arch::x86_64::_mm_setcsr(saved);
-    }
+    write_mxcsr(saved);
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -38,7 +53,7 @@ fn restore(_saved: u32) {}
 
 #[cfg(all(test, target_arch = "x86_64"))]
 fn current() -> u32 {
-    unsafe { std::arch::x86_64::_mm_getcsr() }
+    read_mxcsr()
 }
 
 impl FlushToZero {
