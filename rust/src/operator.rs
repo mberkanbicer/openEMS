@@ -206,6 +206,9 @@ pub struct Operator {
     pub r0_axis_metal: Vec<bool>,
     /// Per-z `(vv, vi)` update coefficients of the `rho = 0` Ez edge.
     pub r0_pairs: Vec<(FDTD_FLOAT, FDTD_FLOAT)>,
+    /// Native `CSXCAD` drawing tolerance used by the material lookup: a mesh
+    /// point within this distance of a primitive's surface lies on it.
+    pub drawing_tolerance: f64,
 }
 
 impl Operator {
@@ -227,6 +230,7 @@ impl Operator {
             r0_included: false,
             r0_axis_metal: Vec::new(),
             r0_pairs: Vec::new(),
+            drawing_tolerance: 0.0,
         }
     }
 
@@ -626,6 +630,32 @@ impl Operator {
             is_pec: false,
         };
 
+        // Native `Operator::SetCSXGrid`: a mesh line closer to a primitive's
+        // surface than 1e-3 of the smallest mesh step lies on it. The smallest
+        // value wins, e.g. for a multi grid.
+        let mut min_step = f64::INFINITY;
+        for axis in 0..3usize {
+            for pair in grid_lines[axis].windows(2) {
+                let step = (pair[1] - pair[0]).abs() * delta_unit;
+                if step > 0.0 && step < min_step {
+                    min_step = step;
+                }
+            }
+        }
+        let tolerance = if min_step.is_finite() {
+            1.0e-3 * min_step
+        } else {
+            0.0
+        };
+        if tolerance > 0.0 && (self.drawing_tolerance <= 0.0 || tolerance < self.drawing_tolerance) {
+            self.drawing_tolerance = tolerance;
+        }
+        structure.set_drawing_tolerance(match structure.drawing_tolerance() {
+            0.0 => self.drawing_tolerance,
+            current => current.min(self.drawing_tolerance),
+        });
+        let drawing_tolerance = self.drawing_tolerance;
+
         let params = structure.parameters();
         struct Candidate<'a> {
             priority: i32,
@@ -702,7 +732,7 @@ impl Operator {
                 }
                 if candidate
                     .primitive
-                    .is_inside(coordinate, Some(params))
+                    .is_inside_with_tolerance(coordinate, Some(params), drawing_tolerance)
                     .unwrap_or(false)
                 {
                     winner = Some(&candidate.material);
@@ -5156,6 +5186,27 @@ mod tests {
         assert_eq!(op.base.num_lines, [11, 11, 11]);
         assert!((op.base.grid_delta - 1.0).abs() < 1e-9);
         assert!((op.base.get_background_eps_r() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_the_operator_sets_the_drawing_tolerance_from_the_mesh() {
+        let mut op = Operator::new();
+        op.load_csx(SAMPLE_CSX).expect("load_csx");
+        // Native `Operator::SetCSXGrid`: 1e-3 of the smallest mesh step
+        // (SAMPLE_CSX uses 1.0 drawing units with a unit delta).
+        let expected = 1.0e-3 * op.base.grid_delta;
+        assert!(
+            (op.drawing_tolerance - expected).abs() <= 1.0e-12,
+            "tolerance {} vs expected {}",
+            op.drawing_tolerance,
+            expected
+        );
+        assert!(op
+            .structure
+            .as_ref()
+            .expect("structure")
+            .drawing_tolerance()
+            > 0.0);
     }
 
     #[test]
