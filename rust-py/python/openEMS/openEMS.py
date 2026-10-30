@@ -89,8 +89,8 @@ class openEMS(_RustOpenEMS):
     def SetMaxTime(self, val):
         return self.set_max_time(float(val))
 
-    def SetGaussExcite(self, f0, fc):
-        return self.set_gauss_excite(float(f0), float(fc))
+    def SetGaussExcite(self, f0, fc, dc_free=False):
+        return self.set_gauss_excite(float(f0), float(fc), bool(dc_free))
 
     def SetSinusExcite(self, f0):
         return self.set_sinus_excite(float(f0))
@@ -395,9 +395,29 @@ class openEMS(_RustOpenEMS):
             elif name == "debug_boxes":
                 if val:
                     self.debug_box()
+            elif name == "engine":
+                # The Rust port has one CPU engine. GPU engine names and typos
+                # must fail loudly instead of silently running the CPU engine.
+                engine = str(val).strip().lower()
+                if engine in ("basic", "fastest", "cpu", "sse", "threaded", "multithread"):
+                    pass
+                elif engine in ("gpu", "cuda", "hip", "metal", "gpu-reference"):
+                    raise RuntimeError(
+                        "_SetLibraryArguments: engine {!r} is not available; "
+                        "this build has no GPU engine (CPU only)".format(val)
+                    )
+                else:
+                    raise RuntimeError(
+                        "_SetLibraryArguments: unknown engine {!r}".format(val)
+                    )
+            elif name in ("gpu_device", "gpu_platform", "gpu_plugin"):
+                raise RuntimeError(
+                    "_SetLibraryArguments: {!r} requires a GPU engine, "
+                    "which this build does not have".format(name)
+                )
             else:
-                raise Exception(
-                    "_SetLibraryArguments: unknown option {!r}".format(key)
+                raise RuntimeError(
+                    "_SetLibraryArguments: unknown option {!r}".format(name.replace("_", "-"))
                 )
 
     def _cleanup_sim_path(self, sim_path, verbose=False):
@@ -468,6 +488,10 @@ class openEMS(_RustOpenEMS):
         )
 
     def Write2XML(self, file):
+        # A setup without a structure or without an excitation cannot be read
+        # back; native returns False and leaves the file untouched.
+        if self.__CSX is None or not self.has_excitation():
+            return False
         document = self._document()
         with open(str(file), "w", encoding="utf-8") as handle:
             handle.write(document)

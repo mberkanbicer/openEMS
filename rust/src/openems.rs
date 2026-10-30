@@ -301,12 +301,16 @@ impl OpenEMS {
     }
 
     /// Set cylindrical multi-grid radii.
+    ///
+    /// The setter keeps the native contract (validate and store) so existing
+    /// scripts can configure a model. The Rust port has no cylindrical
+    /// multi-grid operator, so `setup_fdtd()` refuses the run with an explicit
+    /// error instead of silently simulating a single grid (EXCEPTIONS.md
+    /// E-007).
     pub fn set_multi_grid(&mut self, radii: &[f64]) -> Result<(), String> {
         if radii.is_empty() {
             return Err("Invalid multi grid definition".to_string());
         }
-        // the radii are written back to the FDTD setup and used by the
-        // cylindrical multi-grid operator during `setup_fdtd()`
         self.multi_grid = radii.to_vec();
         Ok(())
     }
@@ -480,6 +484,14 @@ impl OpenEMS {
         let mut excitation = Excitation::gauss(f0, fc);
         excitation.set_gauss_dc_free(dc_free);
         self.excitation = Some(Box::new(excitation));
+    }
+
+    /// True when an excitation waveform has been configured.
+    ///
+    /// `Write2XML` refuses an incomplete setup (native behavior); the Python
+    /// façade uses this before writing a file.
+    pub fn has_excitation(&self) -> bool {
+        self.excitation.is_some()
     }
 
     /// Set a sinusoidal excitation.
@@ -931,6 +943,28 @@ impl OpenEMS {
         };
         // Native `ParseFDTDSetup`: solver settings live in the `<FDTD>` element.
         let options = crate::fdtd_options::parse_fdtd_options(&xml);
+        // Options that native accepts but this port does not implement must
+        // fail loudly instead of silently changing the physics. See
+        // `docs/migration/EXCEPTIONS.md` E-007 (cylindrical multi-grid) and
+        // E-008 (cell-constant material averaging).
+        let requested_multi_grid = options
+            .multi_grid
+            .as_ref()
+            .filter(|radii| !radii.is_empty())
+            .cloned()
+            .or_else(|| (!self.multi_grid.is_empty()).then(|| self.multi_grid.clone()));
+        if let Some(radii) = requested_multi_grid {
+            eprintln!(
+                "[openEMS] Setup failed: cylindrical multi-grid is not implemented in the Rust port (MultiGrid={radii:?}); use the native solver (EXCEPTIONS.md E-007)"
+            );
+            return false;
+        }
+        if options.cell_constant_material == Some(true) || self.cell_constant_material {
+            eprintln!(
+                "[openEMS] Setup failed: CellConstantMaterial is not implemented in the Rust port; material averaging is quarter-cell only (EXCEPTIONS.md E-008)"
+            );
+            return false;
+        }
         if let Some(value) = options.nr_ts {
             self.nr_ts = value;
         }
@@ -2561,6 +2595,58 @@ mod pml_setup_tests {
             lines(21),
             lines(21)
         )
+    }
+
+    #[test]
+    fn cylindrical_multigrid_is_rejected_at_setup() {
+        let mut sim = OpenEMS::new();
+        let xml = format!(
+            "<openEMS><FDTD MultiGrid=\"2,3\"/>{}</openEMS>",
+            mesh_xml()
+        );
+        sim.set_csx_xml(xml);
+        sim.set_number_of_time_steps(2);
+        assert!(
+            !sim.setup_fdtd(),
+            "a multi-grid model must not run as a single-grid model"
+        );
+    }
+
+    #[test]
+    fn set_multi_grid_is_recorded_but_setup_rejects_it() {
+        let mut sim = OpenEMS::new();
+        sim.set_csx_xml(mesh_xml());
+        sim.set_number_of_time_steps(2);
+        sim.set_multi_grid(&[2.0e-3])
+            .expect("the native-compatible setter stores the radii");
+        assert_eq!(sim.multi_grid, vec![2.0e-3]);
+        assert!(
+            !sim.setup_fdtd(),
+            "a stored multi-grid radius must stop the run, not be ignored"
+        );
+    }
+
+    #[test]
+    fn cell_constant_material_is_rejected_at_setup() {
+        let mut sim = OpenEMS::new();
+        let xml = format!(
+            "<openEMS><FDTD CellConstantMaterial=\"1\"/>{}</openEMS>",
+            mesh_xml()
+        );
+        sim.set_csx_xml(xml);
+        sim.set_number_of_time_steps(2);
+        assert!(
+            !sim.setup_fdtd(),
+            "CellConstantMaterial must not silently use quarter-cell averaging"
+        );
+    }
+
+    #[test]
+    fn has_excitation_tracks_the_configured_waveform() {
+        let mut sim = OpenEMS::new();
+        assert!(!sim.has_excitation());
+        sim.set_gauss_excite_with_dc(1.0e9, 5.0e8, true);
+        assert!(sim.has_excitation());
     }
 
     #[test]

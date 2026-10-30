@@ -236,6 +236,11 @@ impl PyOpenEMS {
         self.inner.set_gauss_excite_with_dc(f0, fc, dc_free);
     }
 
+    /// True when an excitation waveform has been configured.
+    fn has_excitation(&self) -> bool {
+        self.inner.has_excitation()
+    }
+
     /// Set a sinusoidal excitation.
     fn set_sinus_excite(&mut self, f0: f64) {
         self.inner.set_sinus_excite(f0);
