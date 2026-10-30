@@ -22,6 +22,8 @@
 
 #include "operator_multithread.h"
 
+class GPU_Backend;
+
 class Operator_Ext_Cylinder;
 
 //! This class creates an operator for a cylindrical FDTD.
@@ -43,6 +45,9 @@ public:
 
 	virtual unsigned int GetNumberOfLines(int ny, bool full=false) const;
 
+	//! The first and the last alpha line of a closed mesh are the same line
+	virtual bool GetClosedMeshLines(int ny, unsigned int &first, unsigned int &last) const;
+
 	//! Get the name for the given direction: 0 -> rho, 1 -> alpha, 2 -> z
 	virtual std::string GetDirName(int ny) const;
 
@@ -61,6 +66,9 @@ public:
 
 	//! Get the length of an FDTD edge, including radius corrected alpha-mesh width.
 	virtual double GetEdgeLength(int ny, const unsigned int pos[3], bool dualMesh = false) const;
+
+	//! The smallest mesh step, in alpha at the smallest radius above zero (in drawing units)
+	virtual double GetMinMeshStep() const;
 
 	//! Get the volume of an FDTD cell
 	virtual double GetCellVolume(const unsigned int pos[3], bool dualMesh = false) const;
@@ -89,6 +97,10 @@ public:
 	bool GetClosedAlpha() const {return CC_closedAlpha;}
 	bool GetR0Included() const {return CC_R0_included;}
 
+	//! Create a GPU engine on \a backend (see GPU_Backend::New), which the operator takes over and hands on to its engine, instead of the multithreaded engine.
+	//! A multi-grid sub-grid passes the backend of its parent grid as \a parent instead (see GPU_Backend::NewSubGridBackend()).
+	void SetGPUBackend(GPU_Backend* backend, GPU_Backend* parent=NULL);
+
 	virtual void AddExtension(Operator_Extension* op_ext);
 
 	virtual Engine* CreateEngine();
@@ -115,6 +127,12 @@ protected:
 	virtual double CalcTimestep();
 	bool CC_closedAlpha;
 	bool CC_R0_included;
+
+	bool UseGPU() const {return m_GPU_Backend || m_GPU_Parent;}
+	//! hands the backend on to the engine
+	GPU_Backend* TakeGPUBackend() {GPU_Backend* b = m_GPU_Backend; m_GPU_Backend = NULL; return b;}
+	GPU_Backend* m_GPU_Backend; //!< until CreateEngine()
+	GPU_Backend* m_GPU_Parent;
 	Operator_Ext_Cylinder* m_Cyl_Ext;
 };
 

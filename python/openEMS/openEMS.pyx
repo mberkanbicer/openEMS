@@ -254,15 +254,19 @@ cdef class openEMS:
         """
         self.thisptr.SetMaxTime(val)
 
-    def SetGaussExcite(self, f0, fc):
-        """ SetGaussExcite(f0, fc)
+    def SetGaussExcite(self, f0, fc, dc_free=False):
+        """ SetGaussExcite(f0, fc, dc_free=False)
 
         Set a Gaussian pulse as excitation signal.
 
         :param f0: float -- Center frequency in Hz.
         :param fc: float -- -20dB bandwidth in Hz.
+        :param dc_free: bool -- Use a sine instead of a cosine carrier, so the
+            pulse has no DC part and leaves no static charge behind. The
+            spectrum falls to zero at DC below about f0-fc. With f0=0 the pulse
+            is the derivative of the Gaussian, with its peak at about 0.47*fc.
         """
-        self.thisptr.SetGaussExcite(f0, fc)
+        self.thisptr.SetGaussExcite(f0, fc, dc_free)
 
     def SetSinusExcite(self, f0):
         """ SetSinusExcite(f0)
@@ -584,7 +588,7 @@ cdef class openEMS:
 
     def _SetLibraryArguments(self, arguments):
         allOptions = []
-        integerOptions = ["verbose", "numthreads"]
+        integerOptions = ["verbose", "numthreads", "gpu-device"]
 
         for key, val in arguments.items():
             key = key.replace("_", "-")
@@ -602,8 +606,10 @@ cdef class openEMS:
                 # "True" boolean options are implicit
                 opt = "%s" % key
             elif val is False:
-                # "False" boolean options are ignored
-                opt = ""
+                # "False" boolean options are left out. Not as an empty
+                # argument: that ends the options, the ones after it would
+                # be ignored
+                continue
             elif (val is not True) and (val is not False):
                 # integer and string options are explicit
                 opt = "%s=%s" % (key, val)
@@ -662,6 +668,9 @@ cdef class openEMS:
 
         * verbose (int) -- set the openEMS verbosity level 0..3
         * numThreads (int) -- set the number of threads (default 0 --> max)
+        * engine (str) -- e.g. 'gpu' for the GPU engine
+        * gpu_device (int) -- GPU device of the GPU engine, a number of the
+          device list printed at verbose >= 1 (default: the best device)
         * disable_dumps (bool) -- disable all field dumps for faster simulation
         * debug_material (bool) - dump material distribution to a vtk file for
           debugging.

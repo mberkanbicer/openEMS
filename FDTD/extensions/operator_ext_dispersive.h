@@ -26,6 +26,8 @@
 class Operator_Ext_Dispersive : public Operator_Extension
 {
 	friend class Engine_Ext_Dispersive;
+	friend class HIP_Ext_LorentzMaterial;
+	friend class Metal_Ext_LorentzMaterial;
 public:
 	virtual ~Operator_Ext_Dispersive();
 
@@ -47,7 +49,7 @@ protected:
 	int m_Order;
 
 	//! Dispersive material count
-	std::vector<unsigned int> m_LM_Count;
+	std::vector<size_t> m_LM_Count;
 	//! Index with dispersive material
 	// Array setup: m_LM_pos[N_order][direction][mesh_pos]
 	unsigned int ***m_LM_pos;

@@ -116,11 +116,6 @@ jobs:
           # name: OS name (only a name for humans to read).
           # libc: userland libc, "GNU" or "musl"
           #       (only a name for humans to read)
-          # ancient: true or false.
-          #          true: incompatible with GitHub's actions/checkout due to
-          #                node.js compatibility problem. Manual git checkout
-          #                required.
-          #          false: use standard GitHub's actions/checkout.
           # docker-image: string, image on DockerHub to use
           # full-tests: true or false (default false).
           #             true: also run the full Octave and Python test suites,
@@ -128,48 +123,43 @@ jobs:
           #                   which are a property of the source and not of the
           #                   distribution, so exactly one modern entry should
           #                   carry them; the smoketests above are what covers
-          #                   every entry. The Python suite also needs at least
-          #                   Python 3.6 for its f-strings, which rules out the
-          #                   Ubuntu 14.04 entry.
-          - name: "CentOS 7"
-            libc: "GNU"
-            ancient: true
-            docker-image: "centos:7"
-
-          - name: "Ubuntu 14.04"
-            libc: "GNU"
-            ancient: true
-            docker-image: "ubuntu:14.04"
-
+          #                   every entry.
           - name: "Debian oldstable"
             libc: "GNU"
-            ancient: false
             docker-image: "debian:oldstable"
 
           - name: "Debian"
             libc: "GNU"
-            ancient: false
             docker-image: "debian:latest"
 
           - name: "Ubuntu"
             libc: "GNU"
-            ancient: false
             docker-image: "ubuntu:latest"
             full-tests: true
 
+          # gpu: also build a HIP GPU plugin and check it on a runner without a GPU;
+          # rocm: for AMD, with ROCm from AMD's Python wheels; cuda: for NVIDIA, the
+          # HIP sources compiled as CUDA, with the HIP headers from those wheels
+          - name: "Ubuntu + ROCm"
+            libc: "GNU"
+            docker-image: "ubuntu:latest"
+            gpu: "rocm"
+
+          - name: "Ubuntu + CUDA"
+            libc: "GNU"
+            docker-image: "nvidia/cuda:12.9.1-devel-ubuntu24.04"
+            gpu: "cuda"
+
           - name: "Fedora"
             libc: "GNU"
-            ancient: false
             docker-image: "fedora:latest"
 
           - name: "AlmaLinux 8"
             libc: "GNU"
-            ancient: false
             docker-image: "almalinux:8"
 
           - name: "AlmaLinux 9"
             libc: "GNU"
-            ancient: false
             docker-image: "almalinux:9"
 
           # Waiting for upstream packages:
@@ -178,12 +168,10 @@ jobs:
           #
           #- name: "AlmaLinux Latest"
           #  libc: "GNU"
-          #  ancient: false
           #  docker-image: "almalinux:latest"
 
           - name: "Alpine"
             libc: "musl"
-            ancient: false
             docker-image: "alpine:latest"
 
     container:
@@ -221,8 +209,7 @@ jobs:
       # order, from the project repo to its dependencies. This reduces
       # race conditions due to force pushes (they are harmless but
       # annoying).
-      - if: ${{ ! matrix.os.ancient }}
-        name: Checkout openEMS.git
+      - name: Checkout openEMS.git
         uses: actions/checkout@v4
         with:
           path: openEMS
@@ -230,8 +217,7 @@ jobs:
           # We need tags for "git describe", otherwise build fails.
           fetch-depth: 0
 
-      - if: ${{ ! matrix.os.ancient }}
-        name: ${{ needs.Dependencies.outputs.csxcad_checkout_title }}
+      - name: ${{ needs.Dependencies.outputs.csxcad_checkout_title }}
         uses: actions/checkout@v4
         with:
           repository: "${{ needs.Dependencies.outputs.csxcad_repo }}"
@@ -241,84 +227,12 @@ jobs:
           # We need tags for "git describe", otherwise build fails.
           fetch-depth: 0
 
-      - if: ${{ ! matrix.os.ancient }}
-        name: ${{ needs.Dependencies.outputs.fparser_checkout_title }}
+      - name: ${{ needs.Dependencies.outputs.fparser_checkout_title }}
         uses: actions/checkout@v4
         with:
           repository: "${{ needs.Dependencies.outputs.fparser_repo }}"
           ref: "${{ needs.Dependencies.outputs.fparser_branch }}"
           path: fparser
-
-      - if: ${{ matrix.os.ancient }}
-        name: (legacy) Work around known problems
-        run: |
-          if [ -f /etc/centos-release ]; then
-            # IPv6 on GitHub Actions is broken, causing random network failures
-            # if a CDN rosolves to IPv6.
-            echo "ip_resolve=4" >> /etc/yum.conf
-
-            # CentOS repos are EOL and desupported
-            sed -i 's|^mirrorlist|#mirrorlist|g; s|^#baseurl|baseurl|g; s|mirror.centos.org|vault.centos.org|g' \
-                /etc/yum.repos.d/CentOS-Base.repo
-
-            yum install -y centos-release-scl || true
-            sed -i 's|^mirrorlist|#mirrorlist|g; s|^#baseurl|baseurl|g;
-                    s|^# baseurl|baseurl|g; s|mirror.centos.org|vault.centos.org|g' \
-                /etc/yum.repos.d/CentOS-SCLo-scl.repo \
-                /etc/yum.repos.d/CentOS-SCLo-scl-rh.repo
-          fi
-
-      - if: ${{ matrix.os.ancient }}
-        name: (legacy) Install git
-        run: |
-          if [ -f /etc/centos-release ]; then
-            yum install -y git
-          elif grep -q "ID=ubuntu" /etc/os-release && \
-            grep -q 'VERSION_ID="14.04"' /etc/os-release; then
-              apt-get install -y git
-          fi
-
-      - if: ${{ matrix.os.ancient }}
-        name: (legacy) Checkout openEMS.git
-        run: |
-          git clone "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" openEMS
-          cd "$GITHUB_WORKSPACE/openEMS"
-
-          git fetch --force "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "+refs/heads/*:refs/remotes/origin/*"
-          git fetch --force "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "+refs/pull/*/merge:refs/remotes/origin/pr/*"
-          git checkout "$GITHUB_SHA"
-
-      - if: ${{ matrix.os.ancient }}
-        name: (legacy) ${{ needs.Dependencies.outputs.csxcad_checkout_title }}
-        run: |
-          echo "Clone $REPO.git (branch $BRANCH)"
-          git clone "$GITHUB_SERVER_URL/$REPO.git"
-          cd "$GITHUB_WORKSPACE/$CHECKOUT_PATH"
-
-          git fetch --force "$GITHUB_SERVER_URL/$REPO.git" "+refs/heads/*:refs/remotes/origin/*"
-          git fetch --force "$GITHUB_SERVER_URL/$REPO.git" "+refs/pull/*/merge:refs/remotes/origin/pr/*"
-          git checkout "$BRANCH"
-        env:
-          # convert template variables to shell variables to avoid arbitrary code injection
-          REPO: ${{ needs.Dependencies.outputs.csxcad_repo }}
-          BRANCH: ${{ needs.Dependencies.outputs.csxcad_branch }}
-          CHECKOUT_PATH: CSXCAD
-
-      - if: ${{ matrix.os.ancient }}
-        name: (legacy) ${{ needs.Dependencies.outputs.fparser_checkout_title }}
-        run: |
-          echo "Clone $REPO.git (branch $BRANCH)"
-          git clone "$GITHUB_SERVER_URL/$REPO.git"
-          cd "$GITHUB_WORKSPACE/$CHECKOUT_PATH"
-
-          git fetch --force "$GITHUB_SERVER_URL/$REPO.git" "+refs/heads/*:refs/remotes/origin/*"
-          git fetch --force "$GITHUB_SERVER_URL/$REPO.git" "+refs/pull/*/merge:refs/remotes/origin/pr/*"
-          git checkout "$BRANCH"
-        env:
-          # convert template variables to shell variables to avoid arbitrary code injection
-          REPO: ${{ needs.Dependencies.outputs.fparser_repo }}
-          BRANCH: ${{ needs.Dependencies.outputs.fparser_branch }}
-          CHECKOUT_PATH: fparser
 
       - name: Install dependencies
         shell: sh
@@ -327,8 +241,8 @@ jobs:
 
           if grep -q "ID=fedora" /etc/os-release; then
             dnf install -y git
-            dnf install -y gcc gcc-c++ cmake git boost-devel tinyxml-devel vtk-devel hdf5-devel \
-                           CGAL-devel octave octave-devel python3-pip \
+            dnf install -y gcc gcc-c++ cmake git boost-devel tinyxml-devel hdf5-devel zlib-devel \
+                           octave octave-devel python3-pip python3-devel \
                            python3-setuptools python3-setuptools_scm \
                            python3-Cython python3-numpy python3-h5py python3-matplotlib
 
@@ -344,10 +258,12 @@ jobs:
             dnf config-manager --set-enabled powertools || dnf config-manager --set-enabled crb
 
             dnf install -y git
-            dnf install -y gcc gcc-c++ cmake git boost-devel tinyxml-devel vtk-devel hdf5-devel \
-                           CGAL-devel octave octave-devel python3-pip \
+            dnf install -y gcc gcc-c++ cmake git boost-devel tinyxml-devel hdf5-devel zlib-devel \
+                           octave octave-devel python3-pip python3-devel \
                            python3-setuptools python3-wheel python3-setuptools_scm \
                            python3-Cython python3-numpy python3-h5py python3-matplotlib
+            # for mkoctfile, see Fedora above
+            dnf install -y redhat-rpm-config
 
             # only for CI/CD test builds without networks.
             dnf install -y iproute
@@ -357,70 +273,26 @@ jobs:
             apt-get update
 
             apt-get install -y build-essential git \
-                               libhdf5-dev libtinyxml-dev \
+                               libhdf5-dev libtinyxml-dev zlib1g-dev \
                                octave \
                                python3-pip \
                                python3-setuptools python3-numpy python3-matplotlib python3-h5py
 
-            # VTK9 or VTK7, at least one must succeed (depending on Debian version)
-            # VTK9,  VTK7, or VTK6, at least one must succeed (depending on Debian version)
-            apt-get install -y libvtk9-dev || \
-                apt-get install -y libvtk7-dev || \
-                  apt-get install -y libvtk6-dev
-
             # only for CI/CD test builds without networks.
             apt-get install -y iproute2
 
-            if grep -q 'VERSION_ID="14.04"' /etc/os-release; then
-              # Ubuntu 14.04 has CMake 2 by default, but we require CMake 3
-              apt-get install -y cmake3
+            apt-get install -y libboost-all-dev
+            apt-get install -y cmake
+            # octave-dev (Bookworm+/Ubuntu 22.04+) was renamed from liboctave-dev (Bullseye and older)
+            apt-get install -y octave-dev || apt-get install -y liboctave-dev
+            apt-get install -y python3-setuptools-scm cython3 python3-matplotlib
 
-              # Ubuntu 14.04 ships Boost 1.54 and is required by libcgal-dev,
-              # but we need Boost 1.55, so we install Boost 1.55 first, then
-              # install CGAL from source.
-              apt-get install -y boost1.55 boost1.55-dev
-
-              apt-get install -y liboctave-dev
-
-              # CGAL v4.14.3 was old enough to be compatible with GCC 4.8. Otherwise,
-              # you get: The compiler feature "cxx_decltype_auto" is not known
-              # to CXX compiler "GNU" version 4.8.5.
-              apt-get install -y libgmp-dev libmpfr-dev
-              git clone $GITHUB_SERVER_URL/CGAL/cgal.git --depth=1 --branch=v4.14.3
-              cd cgal && mkdir build && cd build
-              cmake ../ -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$HOME/opt
-              make -j`nproc` && make install
-
-              # Must use Cython 3.0 or lower, since 3.1 uses f-string which is
-              # incompatible with Python 3.4.
-              pip3 install "cython<3.1"
-
-              # Ubuntu 14.04's matplotlib package is ancient, install the
-              # minimum version and its dependencies via pip. Note that the
-              # native build uses Python 3.4 while the venv build (tested
-              # later) uses Python 3.5 without these problems.
-              #
-              # pip's pyparsing is incompatible with Python 3.4
-              apt-get install -y python3-pyparsing
-
-              # same, newer cycler has incompatible type annotation
-              pip3 install "cycler==0.10.0"
-              pip3 install "matplotlib==2.1.0"
-            else
-              apt-get install -y libboost-all-dev
-              apt-get install -y libcgal-dev
-              apt-get install -y cmake
-              # octave-dev (Bookworm+/Ubuntu 22.04+) was renamed from liboctave-dev (Bullseye and older)
-              apt-get install -y octave-dev || apt-get install -y liboctave-dev
-              apt-get install -y python3-setuptools-scm cython3 python3-matplotlib
-
-              # testing Python packages in isolated venv
-              apt-get install -y python3-venv
-            fi
+            # testing Python packages in isolated venv
+            apt-get install -y python3-venv
           elif grep -q "ID=alpine" /etc/os-release; then
             apk add bash \
-                    build-base gmp-dev mpfr-dev git cmake \
-                    boost-dev tinyxml-dev hdf5-dev cgal-dev vtk-dev \
+                    build-base git cmake \
+                    boost-dev tinyxml-dev hdf5-dev zlib-dev \
                     octave octave-dev \
                     python3-dev py3-pip \
                     py3-setuptools py3-setuptools_scm cython \
@@ -428,59 +300,43 @@ jobs:
 
             # only for CI/CD test builds without networks.
             apk add iproute2
-          elif [ -f /etc/centos-release ]; then
-            # "(legacy) Work around known problems" must run before this step
-            yum install -y epel-release
-            yum install -y git
-            yum install -y gcc gcc-c++ gmp-devel mpfr-devel \
-                           cmake3 git tinyxml-devel vtk-devel hdf5-devel octave octave-devel \
-                           python3-devel python3-pip \
-                           python3-setuptools python3-setuptools_scm python3-Cython
-
-            # only for CI/CD test builds without networks.
-            yum install -y iproute
-
-            # use cmake3 instead of default cmake2
-            alternatives --install /usr/local/bin/cmake cmake /usr/bin/cmake3 99
-
-            # To upgrade GCC, one can use GCC 7 from centos-release-scl, required by CGAL.
-            # Even GCC 10+ is provided.
-            # Not used for now, since openEMS is still compatible with GCC 4.8! But we may
-            # need it in the future.
-            # yum install -y devtoolset-7-gcc devtoolset-7-gcc-c++
-            # alternatives --install /usr/local/bin/gcc gcc /opt/rh/devtoolset-7/root/usr/bin/gcc 99
-            # alternatives --install /usr/local/bin/g++ g++ /opt/rh/devtoolset-7/root/usr/bin/g++ 99
-
-            # boost-predef is only available on Boost 1.55 and later.
-            #   /usr/local/include/CGAL/config.h:210:10: fatal error: boost/predef.h:
-            #   No such file or directory
-            # We borrow a copy of Boost 1.58 from rh repo's mariadb backport package.
-            yum install -y rh-mariadb101-boost-devel
-
-            # copy rh repo's Boost to /usr/local because CMake doesn't support CPATH
-            ln -s /opt/rh/rh-mariadb101/root/usr/include/boost /usr/local/include/boost
-            mkdir /usr/local/lib64 && cd /usr/local/lib64
-            for i in /opt/rh/rh-mariadb101/root/usr/lib64/libboost*; do
-                ln -s $i /usr/local/lib64/
-            done
-
-            # setup.py is broken on CentOS 7, installing openEMS shows:
-            # error: Couldn't find a setup script in /tmp/easy_install-8fl5smm_/numpy-2.2.0.tar.gz
-            # Error: Process completed with exit code 1.
-            pip3 install numpy h5py matplotlib --user
-
-            # not package on CentOS
-            # CGAL v4.14.3 was old enough to be compatible with GCC 4.8. Otherwise,
-            # you get: The compiler feature "cxx_decltype_auto" is not known
-            # to CXX compiler "GNU" version 4.8.5.
-            git clone $GITHUB_SERVER_URL/CGAL/cgal.git --depth=1 --branch=v4.14.3
-            cd cgal && mkdir build && cd build
-            cmake ../ -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$HOME/opt
-            make -j`nproc` && make install
           else
             echo "Unknown system!"
             exit 1
           fi
+
+      - name: Install ROCm (AMD's Python wheels)
+        if: matrix.os.gpu == 'rocm'
+        run: |
+          python3 -m venv /opt/rocm-venv
+          /opt/rocm-venv/bin/pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "rocm[devel]==10.0.0"
+          /opt/rocm-venv/bin/rocm-sdk init
+          ROCM_ROOT=$(/opt/rocm-venv/bin/rocm-sdk path --root)
+          echo "ROCm: $ROCM_ROOT"
+          ls $ROCM_ROOT/lib/libamdhip64* $ROCM_ROOT/lib/llvm/bin/clang++
+          echo "ROCM_PATH=$ROCM_ROOT" >> $GITHUB_ENV
+          # clang does not report this layout as a HIP installation by itself
+          echo "HIP_PATH=$ROCM_ROOT" >> $GITHUB_ENV
+          echo "HIP_DEVICE_LIB_PATH=$ROCM_ROOT/lib/llvm/amdgcn/bitcode" >> $GITHUB_ENV
+          echo "OPENEMS_CI_GPU=rocm" >> $GITHUB_ENV
+
+      - name: Install the HIP headers for NVIDIA (AMD's apt repository)
+        if: matrix.os.gpu == 'cuda'
+        run: |
+          # only the headers of one ROCm version, unpacked without dependencies:
+          # hip-runtime-nvidia would pull in NVIDIA's cuda meta package with the driver
+          apt-get install -y curl gnupg
+          curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /usr/share/keyrings/rocm.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.2.4 noble main" \
+            > /etc/apt/sources.list.d/rocm.list
+          apt-get update
+          mkdir -p /tmp/hipdeb && cd /tmp/hipdeb
+          apt-get download hip-dev hip-runtime-nvidia
+          for deb in *.deb; do dpkg -x $deb /opt/hip; done
+          ROCM_ROOT=$(ls -d /opt/hip/opt/rocm-*)
+          ls $ROCM_ROOT/include/hip/hip_runtime.h $ROCM_ROOT/include/hip/hip_version.h $ROCM_ROOT/include/hip/nvidia_detail/nvidia_hip_runtime.h
+          echo "ROCM_PATH=$ROCM_ROOT" >> $GITHUB_ENV
+          echo "OPENEMS_CI_GPU=cuda" >> $GITHUB_ENV
 
       - name: Build and install fparser
         run: |
@@ -524,18 +380,19 @@ jobs:
 
       - name: Build and install openEMS
         run: |
-          # Hack: openEMS requires Boost Predef (1.55+), but CSXCAD requires CGAL, on
-          # Ubuntu 14.04's libcgal-dev requires Boost 1.54. So we install Boost 1.55
-          # after CSXCAD but before openEMS - this uninstalls libcgal-dev (but libcgal
-          # itself is okay)
-          if grep -q 'VERSION_ID="14.04"' /etc/os-release; then
-            apt-get install -y boost1.55-dev
-            apt-get install -y boost1.55
-          fi
-
           cd $GITHUB_WORKSPACE/openEMS
           mkdir build && cd build
-          cmake ../ -DCMAKE_INSTALL_PREFIX=$HOME/opt -DFPARSER_ROOT_DIR=$HOME/opt
+          hip_opts=()
+          if [ "${OPENEMS_CI_GPU:-}" = "cuda" ]; then
+            hip_opts=( -DENABLE_HIP=ON -DOPENEMS_HIP_AS_CUDA=ON )
+          elif [ "${OPENEMS_CI_GPU:-}" = "rocm" ]; then
+            # ROCm's clang takes the newest GCC directory it finds, which need not be
+            # the one with C++ headers: use the GCC of the system's g++
+            hip_opts=( -DENABLE_HIP=ON -DCMAKE_HIP_COMPILER=$ROCM_PATH/lib/llvm/bin/clang++
+                       -DCMAKE_HIP_COMPILER_ROCM_ROOT=$ROCM_PATH
+                       "-DCMAKE_HIP_FLAGS=--gcc-install-dir=$(dirname $(g++ -print-libgcc-file-name))" )
+          fi
+          cmake ../ -DCMAKE_INSTALL_PREFIX=$HOME/opt -DFPARSER_ROOT_DIR=$HOME/opt "${hip_opts[@]}"
           make -j`nproc` && make install
 
           echo "addpath('~/opt/share/openEMS/matlab')" >> ~/.octaverc
@@ -589,6 +446,42 @@ jobs:
         run: |
           python3 -m unittest discover -s $GITHUB_WORKSPACE/openEMS/python/Tests -p "test_*.py" -v
 
+      - name: GPU plugin on a machine without a GPU
+        if: matrix.os.gpu
+        run: |
+          if [ "$OPENEMS_CI_GPU" = "cuda" ]; then vendor=nvidia; else vendor=amd; fi
+          plugin=$HOME/opt/lib/openEMS/plugins/openEMS_gpu_hip_$vendor.so
+          ls -l $plugin
+          readelf -d $plugin | grep NEEDED
+          # libopenEMS itself needs no GPU runtime
+          if readelf -d $HOME/opt/lib/libopenEMS.so | grep -qE "amdhip64|cudart|libcuda"; then
+            echo "libopenEMS links a GPU runtime"; exit 1
+          fi
+          cd /tmp
+          cat > gpu_run.py << 'EOF'
+          import tempfile
+          from CSXCAD import ContinuousStructure
+          from openEMS.openEMS import openEMS
+          fdtd = openEMS(NrTS=10, EndCriteria=0)
+          fdtd.SetGaussExcite(1e9, 1e9)
+          fdtd.SetBoundaryCond(['PEC'] * 6)
+          csx = ContinuousStructure()
+          fdtd.SetCSX(csx)
+          grid = csx.GetGrid()
+          grid.SetDeltaUnit(1e-3)
+          for d in 'xyz':
+              grid.SetLines(d, range(10))
+          csx.AddExcitation('ex', 0, [0, 0, 1]).AddBox([4, 4, 4], [4, 4, 6])
+          fdtd.Run(tempfile.mkdtemp(), verbose=1, engine='gpu')
+          EOF
+          # the plugin loads (the AMD one finds the HIP runtime it was built with
+          # through its RPATH, the NVIDIA one has the CUDA runtime linked in),
+          # finds no device, and the GPU engine fails cleanly
+          python3 gpu_run.py > out.txt 2>&1 || true
+          cat out.txt
+          grep -q "no hip-$vendor device" out.txt
+          grep -q "no GPU backend with a usable device" out.txt
+
       - name: Run Octave test suite
         if: matrix.os.full-tests
         run: |
@@ -601,36 +494,23 @@ jobs:
           cd $GITHUB_WORKSPACE/openEMS/python/Tests
           python3 run_testsuite.py
 
+      - name: Benchmark smoke run
+        if: matrix.os.full-tests
+        run: |
+          # keeps the benchmark working, the timing of a shared runner means nothing
+          cd /tmp
+          python3 $GITHUB_WORKSPACE/openEMS/benchmark/bench.py run --openems $HOME/opt/bin/openEMS \
+                  --size XS --repeat 1 --duration 0.5 --threads 2 --workdir bench
+          python3 $GITHUB_WORKSPACE/openEMS/benchmark/bench.py compare bench/result.json bench/result.json
+
       - name: Create Python venv and install dependencies
         run: |
           cd ~/
 
-          if grep -q "ID=ubuntu" /etc/os-release && \
-            grep -q 'VERSION_ID="14.04"' /etc/os-release; then
-              # Use Python 3.5 instead of the default Python 3.4 because
-              # 3.5 is the latest available version on Ubuntu 14.04, and
-              # also because Python 3.5 is the first Python that supported
-              # type annotation, while Python 3.4 is locked out from most
-              # modern packages.
-              apt-get install -y curl python3.5-dev
-
-              # Ubuntu 14.04 is ancient, and the python3.5-venv package is
-              # broken. So the best approach is to install a bare Python 3.5
-              # interpreter from apt, and bootstrapping pip ourselves.
-              python3.5 -m venv ~/venv --without-pip
-              curl -O https://bootstrap.pypa.io/pip/3.5/get-pip.py
-              source ~/venv/bin/activate
-              python3.5 get-pip.py
-          else
-            python3 -m venv ~/venv
-            source ~/venv/bin/activate
-          fi
+          python3 -m venv ~/venv
+          source ~/venv/bin/activate
 
           pip install --upgrade pip
-
-          if [ -f /etc/centos-release ]; then
-            pip3 install "cython<3.1"
-          fi
 
       - name: Build and install CSXCAD Python module in venv
         run: |
@@ -720,8 +600,15 @@ jobs:
 
           # already installed on the CI/CD system, disable to avoid warning fatigue
           # brew install python3 cmake
-          brew install boost hdf5 cgal vtk octave \
-                       python-setuptools cython numpy python-matplotlib
+          brew install boost hdf5 octave python@3.14
+
+          # Homebrew's default Python is 3.15, for which h5py has no wheels yet
+          # (pip would build it from source and fail): use 3.14 in every
+          # following step, with the Python packages installed by its pip.
+          PYBIN="$(brew --prefix python@3.14)/libexec/bin"
+          echo "$PYBIN" >> $GITHUB_PATH
+          "$PYBIN/pip3" install --break-system-packages \
+                        setuptools setuptools_scm cython numpy matplotlib h5py
 
           echo "export NCPUS=$(python3 -c 'import os; print(os.cpu_count())')" >> ~/.zprofile
           source ~/.zprofile
@@ -842,7 +729,7 @@ jobs:
         run: |
           # remove Python dependencies to see if venv really works
           pip3 uninstall -y CSXCAD openEMS --break-system-packages
-          brew remove python-setuptools cython numpy python-matplotlib
+          pip3 uninstall -y cython numpy matplotlib h5py --break-system-packages
 
           python3 -m venv ~/venv
           source ~/venv/bin/activate
@@ -953,7 +840,7 @@ jobs:
             # patchelf: meson-python >= 0.22 runs it while building a wheel, and
             # PyPI ships no FreeBSD wheels, so the venv stage below builds numpy
             # from source.
-            sudo pkg install -y cmake git boost-libs tinyxml vtk9 hdf5 cgal octave \
+            sudo pkg install -y cmake git boost-libs tinyxml hdf5 octave pkgconf \
                                 python3 patchelf
             # Derive the version prefix from whatever Python FreeBSD ships
             # (e.g. "py311" for 3.11, "py313" for 3.13) so the CI doesn't
@@ -1055,7 +942,7 @@ jobs:
             python3 -m unittest discover -s $GITHUB_WORKSPACE/openEMS/python/Tests -p "test_*.py" -v
 
   Windows:
-    runs-on: windows-latest
+    runs-on: ${{ matrix.toolchain.runner || 'windows-latest' }}
     needs: Dependencies
 
     strategy:
@@ -1076,6 +963,27 @@ jobs:
             CC: "clang-cl"
             CXX: "clang-cl"
 
+          # gpu: "rocm": also build the AMD GPU plugin, with ROCm from AMD's
+          # Python wheels, and check it on a runner without a GPU.
+          # runner: the HIP math headers of ROCm's clang 23 collide with the
+          # STL of MSVC 14.51 (isgreater & co.), so stay on VS 2022 for now
+          - name: "clang + ROCm"
+            CC: "cl"
+            CXX: "cl"
+            gpu: "rocm"
+            runner: "windows-2022"
+
+          # gpu: "cuda+rocm": both GPU plugins, as the Windows package builds
+          # them: openEMS and the NVIDIA plugin (nvcc of the CUDA toolkit, the
+          # HIP headers for NVIDIA) with MSVC, then the AMD plugin alone with
+          # ROCm's clang in a second build that shares the build id.
+          # runner: CUDA 12.9 knows MSVC up to VS 2022
+          - name: "MSVC + CUDA + ROCm"
+            CC: "cl"
+            CXX: "cl"
+            gpu: "cuda+rocm"
+            runner: "windows-2022"
+
     env:
       CC: "${{ matrix.toolchain.CC }}"
       CXX: "${{ matrix.toolchain.CXX }}"
@@ -1088,7 +996,7 @@ jobs:
       VCPKG_ASSET_CACHE_PATH: "${{ github.workspace }}/vcpkg-cache/asset"
       X_VCPKG_ASSET_SOURCES: "x-azurl,file://${{ github.workspace }}/vcpkg-cache/asset,readwrite"
 
-    name: "Windows (${{ matrix.toolchain.name }}, latest)"
+    name: "Windows (${{ matrix.toolchain.name }}, ${{ matrix.toolchain.runner || 'latest' }})"
 
     steps:
       - name: Locate Visual Studio installation
@@ -1157,10 +1065,10 @@ jobs:
         with:
           path: ${{ env.VCPKG_CACHE_PATH }}
           # almost always nonexistent
-          key: "Windows - ${{ matrix.toolchain.name }} - ${{ github.sha }}"
+          key: "Windows - ${{ matrix.toolchain.name }}${{ matrix.toolchain.runner }} - ${{ github.sha }}"
           # use GitHub's fallback feature to pick the latest cache with this prefix
           restore-keys: |
-            Windows - ${{ matrix.toolchain.name }}
+            Windows - ${{ matrix.toolchain.name }}${{ matrix.toolchain.runner }}
 
       - name: Build and install fparser
         run: |
@@ -1192,10 +1100,79 @@ jobs:
           cmake --build ./ --parallel
           cmake --install ./ --parallel 8
 
+      - name: Install ROCm (AMD's Python wheels)
+        if: contains(matrix.toolchain.gpu, 'rocm')
+        run: |
+          python -m venv C:\rocm
+          C:\rocm\Scripts\pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "rocm[devel]==10.0.0"
+          C:\rocm\Scripts\rocm-sdk init
+          if ($LASTEXITCODE -ne 0) { throw "rocm-sdk init failed" }
+          $root = (C:\rocm\Scripts\rocm-sdk path --root).Trim()
+          Write-Host "ROCm: $root"
+          echo "HIP_PATH=$root" >> $env:GITHUB_ENV
+          echo "HIP_DEVICE_LIB_PATH=$root\lib\llvm\amdgcn\bitcode" >> $env:GITHUB_ENV
+
+      - name: Install CUDA and the HIP headers for NVIDIA
+        if: contains(matrix.toolchain.gpu, 'cuda')
+        run: |
+          # the compiler and the runtime only, no driver; the HIP headers for
+          # NVIDIA include cuda_profiler_api.h
+          $installer = "$env:RUNNER_TEMP\cuda.exe"
+          Invoke-WebRequest -Uri "https://developer.download.nvidia.com/compute/cuda/12.9.1/network_installers/cuda_12.9.1_windows_network.exe" -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList "-s", "nvcc_12.9", "cudart_12.9", "cuda_profiler_api_12.9" -Wait
+          $cuda = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"
+          & "$cuda\bin\nvcc.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "nvcc not installed" }
+          echo "CUDA_PATH=$cuda" >> $env:GITHUB_ENV
+          echo "CUDACXX=$cuda\bin\nvcc.exe" >> $env:GITHUB_ENV
+
+          # the HIP headers of one ROCm release from AMD's apt repository, as on
+          # Linux; the headers are the same for Windows, and tar unpacks a .deb
+          $repo = "https://repo.radeon.com/rocm/apt/7.2.4"
+          Invoke-WebRequest -Uri "$repo/dists/noble/main/binary-amd64/Packages" -OutFile "$env:RUNNER_TEMP\Packages"
+          $index = Get-Content -Raw "$env:RUNNER_TEMP\Packages"
+          $hip = "C:\hip"
+          New-Item -ItemType Directory -Force -Path $hip, "$env:RUNNER_TEMP\hipdeb" | Out-Null
+          foreach ($pkg in @("hip-dev", "hip-runtime-nvidia")) {
+            $file = [regex]::Match($index, "(?m)^Package: $pkg\r?\n(?:[^\n]+\n)*?Filename: (\S+)").Groups[1].Value
+            if (-not $file) { throw "$pkg not in the repository" }
+            $deb = "$env:RUNNER_TEMP\hipdeb\$pkg.deb"
+            Invoke-WebRequest -Uri "$repo/$file" -OutFile $deb
+            cd "$env:RUNNER_TEMP\hipdeb"
+            tar -xf $deb
+            $data = Get-ChildItem -Filter "data.tar*" | Select-Object -First 1
+            tar -xf $data.FullName -C $hip
+            Remove-Item data.tar*, control.tar*, debian-binary
+          }
+          $root = (Get-ChildItem "$hip\opt" -Directory -Filter "rocm-*" | Select-Object -First 1).FullName
+          foreach ($h in @("hip_runtime.h", "hip_version.h", "nvidia_detail\nvidia_hip_runtime.h")) {
+            if (-not (Test-Path "$root\include\hip\$h")) { throw "$h missing" }
+          }
+          Write-Host "HIP headers: $root"
+          echo "HIP_NVIDIA_ROOT=$root" >> $env:GITHUB_ENV
+
       - name: Build and install openEMS
         run: |
           & "$env:VS_ROOT_DIR/Common7/Tools/Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64
 
+          $hip_opts = @()
+          if ("${{ matrix.toolchain.gpu }}" -eq "rocm") {
+            # CMake does not mix MSVC with the GNU-like clang for HIP: ROCm's
+            # clang builds all of openEMS (for the MSVC ABI), fparser and
+            # CSXCAD stay with MSVC
+            $rocm = $env:HIP_PATH -replace '\\', '/'
+            $env:CFLAGS = "-D_WIN32_WINNT=0x0601"
+            $env:CXXFLAGS = "-D_WIN32_WINNT=0x0601"
+            $hip_opts = @("-DENABLE_HIP=ON", "-DOPENEMS_HIP_AS_CUDA=OFF", "-DROCM_PATH=$rocm",
+                          "-DCMAKE_C_COMPILER=$rocm/lib/llvm/bin/clang.exe",
+                          "-DCMAKE_CXX_COMPILER=$rocm/lib/llvm/bin/clang++.exe",
+                          "-DCMAKE_HIP_COMPILER=$rocm/lib/llvm/bin/clang++.exe",
+                          "-DCMAKE_HIP_COMPILER_ROCM_ROOT=$rocm")
+          }
+          if ("${{ matrix.toolchain.gpu }}" -match "cuda") {
+            $hip_opts = @("-DENABLE_HIP=ON", "-DOPENEMS_HIP_AS_CUDA=ON",
+                          "-DROCM_PATH=$($env:HIP_NVIDIA_ROOT -replace '\\', '/')")
+          }
           cd "$env:GITHUB_WORKSPACE/openEMS"
           mkdir build && cd build
           cmake ../ -GNinja `
@@ -1205,10 +1182,80 @@ jobs:
                     -DCSXCAD_ROOT_DIR="$HOME/opt" `
                     -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
                     -DVCPKG_HOST_TRIPLET="x64-windows-release" `
-                    -DVCPKG_TARGET_TRIPLET="x64-windows-release"
+                    -DVCPKG_TARGET_TRIPLET="x64-windows-release" `
+                    @hip_opts
+          if ($LASTEXITCODE -ne 0) { throw "cmake failed" }
 
           cmake --build ./ --parallel
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
           cmake --install ./ --parallel 8
+
+          if ("${{ matrix.toolchain.gpu }}" -eq "cuda+rocm") {
+            # the AMD plugin from a second build with ROCm's clang (CMake does not
+            # mix it with MSVC), against the openEMS.dll of the build above: the
+            # same sources, exports and build id
+            $id = (Select-String -Path CMakeCache.txt -Pattern "^OPENEMS_GPU_BUILD_ID:INTERNAL=(.+)$").Matches[0].Groups[1].Value
+            Write-Host "build id: $id"
+            $rocm = $env:HIP_PATH -replace '\\', '/'
+            $env:ROCM_PATH = $env:HIP_PATH
+            $env:CFLAGS = "-D_WIN32_WINNT=0x0601"
+            $env:CXXFLAGS = "-D_WIN32_WINNT=0x0601"
+            cd "$env:GITHUB_WORKSPACE/openEMS"
+            mkdir build-amd && cd build-amd
+            cmake ../ -GNinja `
+                      -DCMAKE_BUILD_TYPE=Release `
+                      -DFPARSER_ROOT_DIR="$HOME/opt" `
+                      -DCSXCAD_ROOT_DIR="$HOME/opt" `
+                      -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+                      -DVCPKG_HOST_TRIPLET="x64-windows-release" `
+                      -DVCPKG_TARGET_TRIPLET="x64-windows-release" `
+                      -DOPENEMS_GPU_BUILD_ID="$id" `
+                      -DENABLE_HIP=ON -DOPENEMS_HIP_AS_CUDA=OFF -DROCM_PATH="$rocm" `
+                      -DCMAKE_C_COMPILER="$rocm/lib/llvm/bin/clang.exe" `
+                      -DCMAKE_CXX_COMPILER="$rocm/lib/llvm/bin/clang++.exe" `
+                      -DCMAKE_HIP_COMPILER="$rocm/lib/llvm/bin/clang++.exe" `
+                      -DCMAKE_HIP_COMPILER_ROCM_ROOT="$rocm"
+            if ($LASTEXITCODE -ne 0) { throw "cmake (AMD plugin) failed" }
+            cmake --build ./ --parallel --target openEMS_gpu_hip_amd
+            if ($LASTEXITCODE -ne 0) { throw "build (AMD plugin) failed" }
+            Copy-Item plugins/openEMS_gpu_hip_amd.dll "$HOME/opt/bin/openEMS/plugins/"
+          }
+
+      - name: GPU plugin on a machine without a GPU
+        if: matrix.toolchain.gpu
+        run: |
+          & "$env:VS_ROOT_DIR/Common7/Tools/Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64
+          $amd = "${{ matrix.toolchain.gpu }}" -match "rocm"
+          $nvidia = "${{ matrix.toolchain.gpu }}" -match "cuda"
+          $plugins = "$HOME/opt/bin/openEMS/plugins"
+          Get-ChildItem $plugins | Format-Table Name, Length
+          Get-ChildItem $plugins -Filter "openEMS_gpu_*.dll" | ForEach-Object { dumpbin /nologo /dependents $_.FullName }
+          # openEMS.dll itself needs no GPU runtime
+          if (dumpbin /nologo /dependents "$HOME/opt/bin/openEMS.dll" | Select-String "amdhip64|cudart|nvcuda") {
+            throw "openEMS.dll links a GPU runtime"
+          }
+          $env:PATH = "$HOME/opt/bin;$env:GITHUB_WORKSPACE/openEMS/build/vcpkg_installed/x64-windows-release/bin;$env:PATH"
+          $xml = "$env:GITHUB_WORKSPACE/openEMS/.github/smoketests/gpu/gpu_engine.xml"
+          cd $env:RUNNER_TEMP
+
+          # without a driver: the NVIDIA plugin (CUDA runtime linked in statically,
+          # it looks for the driver when asked for devices) loads and finds no
+          # device, the AMD plugin cannot load without the HIP runtime and says why
+          $out = & "$HOME/opt/bin/openEMS.exe" $xml --engine=gpu -v 2>&1 | Out-String
+          Write-Host $out
+          if ($nvidia -and $out -notmatch "no hip-nvidia device") { throw "the NVIDIA plugin did not load" }
+          if ($amd -and $out -notmatch "openEMS_gpu_hip_amd.dll: .*library the plugin needs is missing") { throw "no load error for the AMD plugin" }
+          if ($out -notmatch "no GPU backend with a usable device") { throw "the GPU engine did not fail" }
+          if (-not $amd) { exit 0 }
+
+          # with the runtime of the build next to the plugin: it loads and finds no device
+          foreach ($p in @("amdhip64_7.dll", "rocm_kpack.dll", "amd_comgr*.dll")) {
+            Get-ChildItem "$env:HIP_PATH/bin" -Filter $p | Copy-Item -Destination $plugins
+          }
+          $out = & "$HOME/opt/bin/openEMS.exe" $xml --engine=gpu -v 2>&1 | Out-String
+          Write-Host $out
+          if ($out -notmatch "no hip-amd device") { throw "the AMD plugin did not load" }
+          exit 0
 
       - name: Save vcpkg cache
         if: always()  # save even after a build failure.
@@ -1217,4 +1264,4 @@ jobs:
           path: ${{ env.VCPKG_CACHE_PATH }}
           # GitHub cache is immutable and can't be overwritten
           # save a new cache key every time
-          key: Windows - ${{ matrix.toolchain.name }} - ${{ github.sha }}
+          key: Windows - ${{ matrix.toolchain.name }}${{ matrix.toolchain.runner }} - ${{ github.sha }}

@@ -25,7 +25,7 @@
 #include "arraylib/array_ijk.h"
 #include "arraylib/array_nijk.h"
 
-#if defined(WIN32)
+#if defined(_WIN32)
 	#ifdef BUILD_OPENEMS_LIB
 	#define SAR_EXPORT __declspec(dllexport)
 	#else
@@ -138,7 +138,7 @@ protected:
 	size_t m_AirVoxel;
 
 	// output data
-	ArrayLib::ArrayIJK<unsigned int> m_posInOutput;
+	ArrayLib::ArrayIJK<size_t> m_posInOutput;
 	std::vector<unsigned int> m_cellIndices[3];  // list of output indecies into the raw data mesh
 	ArrayLib::ArrayIJK<unsigned char> m_cube_type;
 	ArrayLib::ArrayIJK<float> m_cube_mass;

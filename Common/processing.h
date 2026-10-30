@@ -62,6 +62,8 @@ public:
 	virtual void ShowSnappedCoords();
 
 	void SetProcessInterval(unsigned int interval);
+	//! No regular processing anymore, the steps of AddStep() remain
+	void ClearProcessInterval() {ProcessInterval=0;}
 	void SetProcessStartStopTime(double start, double stop);
 
 	void AddStep(unsigned int step);
@@ -87,6 +89,9 @@ public:
 
 	//! Process data after simulation has finished.
 	virtual void PostProcess();
+
+	//! Wait for data processing still running in the background (e.g. dumps written asynchronously), called before any PostProcess()
+	virtual void FinishAsync() {}
 
 	//! If disabled, Process() will do nothing...
 	virtual void SetEnable(bool val) {Enabled=val;}

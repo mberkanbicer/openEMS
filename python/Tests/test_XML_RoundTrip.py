@@ -113,6 +113,13 @@ class Test_Write2XML(unittest.TestCase):
         self.fdtd.Write2XML(self.fn)
         exc_el = ET.parse(self.fn).getroot().find('FDTD/Excitation')
         self.assertAlmostEqual(float(exc_el.get('fc')), 500e6)
+        self.assertIsNone(exc_el.get('DCFree'))
+
+    def test_gauss_dc_free_in_xml(self):
+        self.fdtd.SetGaussExcite(f0=1e9, fc=500e6, dc_free=True)
+        self.fdtd.Write2XML(self.fn)
+        exc_el = ET.parse(self.fn).getroot().find('FDTD/Excitation')
+        self.assertEqual(int(exc_el.get('DCFree')), 1)
 
     def test_boundary_cond_element_present(self):
         self.fdtd.Write2XML(self.fn)
@@ -141,6 +148,16 @@ class Test_Write2XML(unittest.TestCase):
         root = ET.parse(self.fn).getroot()
         # CSXCAD structure is embedded as a child of the root
         self.assertIsNotNone(root.find('ContinuousStructure'))
+
+    def test_incomplete_setup_fails(self):
+        # used to crash; a setup without either cannot be read back
+        fdtd = openEMS()
+        fdtd.SetCSX(_make_csx())
+        self.assertFalse(fdtd.Write2XML(self.fn))
+        fdtd = openEMS()
+        fdtd.SetGaussExcite(f0=1e9, fc=500e6)
+        self.assertFalse(fdtd.Write2XML(self.fn))
+        self.assertFalse(os.path.exists(self.fn))
 
 
 class Test_ReadFromXML(unittest.TestCase):

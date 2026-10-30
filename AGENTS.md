@@ -63,6 +63,12 @@ current-side equivalents.
   declaration order is not a contract.
 - An extension that touches the engine's fields must work for every engine
   subclass, not just the basic one.
+- For the GPU engine that means a device implementation in every backend (HIP,
+  Metal): one extension without one moves all extensions to the host and copies
+  both fields every half-step, which makes GPU runs slow. A change to an
+  extension's update is made in the host, HIP and Metal versions alike;
+  `python/Tests/GPU_Engine.py` compares them with the CPU, but only on a
+  machine with that GPU (CI has none).
 
 Modifying `Operator`/`Engine` directly is for changes that genuinely belong to
 the core scheme, and those need discussion first.
@@ -128,7 +134,7 @@ not verification.
 
 ## House rules
 
-- **Style**: C++11. Match the file you are editing. **CI rejects trailing
+- **Style**: C++17. Match the file you are editing. **CI rejects trailing
   whitespace.** No drive-by reformatting, no reorganising code you were not
   asked to touch — a diff should contain only what the change actually needs.
 - **Tests**: add a focused test for behaviour that could silently regress —
@@ -149,11 +155,13 @@ not verification.
   rendered into the [openEMS documentation](https://docs.openems.de/), so it
   must stay valid Markdown.
 - **Dependencies**: do not add any. openEMS builds across a wide OS matrix, from
-  CentOS 7 to Alpine, plus macOS and FreeBSD; a new dependency is a discussion,
+  AlmaLinux 8 to Alpine, plus macOS and FreeBSD; a new dependency is a discussion,
   not a commit.
 - **Performance**: the update loops are the hot path. Do not add allocation,
   branching or virtual calls inside them for the sake of tidiness, and measure
-  before claiming a speed-up.
+  before claiming a speed-up: a pull request that claims one includes the
+  `benchmark/bench.py compare` table of master against the branch, run
+  interleaved on one machine (see [benchmark/README.md](benchmark/README.md)).
 - **Brevity**: commit messages, PR descriptions and comments as short as a human
   would write them. See the Brevity section of [AI_POLICY.md](AI_POLICY.md).
 - **Keep the tree clean**: never commit build output, installed files,

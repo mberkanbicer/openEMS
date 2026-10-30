@@ -16,6 +16,7 @@
 */
 
 #include "operator_cylindermultigrid.h"
+#include "engine_gpu_cylindermultigrid.h"
 #include "engine_cylindermultigrid.h"
 #include "extensions/operator_ext_cylinder.h"
 #include "tools/useful.h"
@@ -63,13 +64,16 @@ Operator_CylinderMultiGrid* Operator_CylinderMultiGrid::New(
 
 Engine* Operator_CylinderMultiGrid::CreateEngine()
 {
-	m_Engine = Engine_CylinderMultiGrid::New(this, m_orig_numThreads);
+	if (UseGPU())
+		m_Engine = Engine_GPU_CylinderMultiGrid::New(this, TakeGPUBackend(), m_GPU_Parent);
+	else
+		m_Engine = Engine_CylinderMultiGrid::New(this, m_orig_numThreads);
 	return m_Engine;
 }
 
 double Operator_CylinderMultiGrid::GetNumberCells() const
 {
-	return (numLines[0]-m_Split_Pos)*(numLines[1])*(numLines[2]) + m_InnerOp->GetNumberCells();
+	return (double)(numLines[0]-m_Split_Pos)*numLines[1]*numLines[2] + m_InnerOp->GetNumberCells();
 }
 
 bool Operator_CylinderMultiGrid::SetupCSXGrid(CSRectGrid* grid)

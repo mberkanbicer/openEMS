@@ -28,6 +28,8 @@ class Operator_Ext_Excitation : public Operator_Extension
 	friend class Engine_Ext_Excitation;
 	friend class Engine_Ext_Mur_ABC;
 	friend class Operator;
+	friend class HIP_Ext_Excitation;
+	friend class Metal_Ext_Excitation;
 public:
 	Operator_Ext_Excitation(Operator* op);
 	~Operator_Ext_Excitation();
@@ -40,6 +42,7 @@ public:
 
 	virtual bool IsCylinderCoordsSave(bool closedAlpha, bool R0_included) const {UNUSED(closedAlpha); UNUSED(R0_included); return true;}
 	virtual bool IsCylindricalMultiGridSave(bool child) const {UNUSED(child); return true;}
+	virtual bool IsGPUSave() const {return true;}
 
 	virtual std::string GetExtensionName() const
 	{
@@ -51,11 +54,11 @@ public:
 	virtual void Init();
 	virtual void Reset();
 
-	unsigned int GetVoltCount() const {return Volt_Count;}
-	unsigned int GetVoltCount(int ny) const {return Volt_Count_Dir[ny];}
+	size_t GetVoltCount() const {return Volt_Count;}
+	size_t GetVoltCount(int ny) const {return Volt_Count_Dir[ny];}
 
-	unsigned int GetCurrCount() const {return Curr_Count;}
-	unsigned int GetCurrCount(int ny) const {return Curr_Count_Dir[ny];}
+	size_t GetCurrCount() const {return Curr_Count;}
+	size_t GetCurrCount(int ny) const {return Curr_Count_Dir[ny];}
 
 protected:
 	Operator_Ext_Excitation(Operator* op, Operator_Ext_Excitation* op_ext);
@@ -77,16 +80,16 @@ protected:
 	);
 
 	//E-Field/voltage Excitation
-	unsigned int Volt_Count;
-	unsigned int Volt_Count_Dir[3];
+	size_t Volt_Count;
+	size_t Volt_Count_Dir[3];
 	unsigned int* Volt_index[3];
 	unsigned short* Volt_dir;
 	FDTD_FLOAT* Volt_amp; //represented as edge-voltages!!
 	unsigned int* Volt_delay;
 
 	//H-Field/current Excitation
-	unsigned int Curr_Count;
-	unsigned int Curr_Count_Dir[3];
+	size_t Curr_Count;
+	size_t Curr_Count_Dir[3];
 	unsigned int* Curr_index[3];
 	unsigned short* Curr_dir;
 	FDTD_FLOAT* Curr_amp; //represented as edge-currents!!

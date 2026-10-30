@@ -42,6 +42,8 @@
 class Operator_Ext_Absorbing_BC : public Operator_Extension
 {
 	friend class Engine_Ext_Absorbing_BC;
+	friend class HIP_Ext_Absorbing_BC;
+	friend class Metal_Ext_Absorbing_BC;
 public:
 
 	// This should be a replica of the CSXCAD property, but can also be something
@@ -57,6 +59,8 @@ public:
 	~Operator_Ext_Absorbing_BC();
 
 	virtual Operator_Extension* Clone(Operator* op);
+
+	virtual bool IsGPUSave() const {return true;}
 
 	virtual bool BuildExtension();
 
@@ -77,7 +81,7 @@ protected:
 	Operator_Ext_Absorbing_BC(Operator* op, Operator_Ext_Absorbing_BC* op_ext);
 	void Initialize();
 
-	unsigned int			m_numCells;		// Number of cells in each primitive
+	size_t					m_numCells;		// Number of cells in each primitive
 
 	// Storage for the directions. ny is the normal direction to the sheet
 	int				m_ny,

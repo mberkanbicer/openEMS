@@ -27,10 +27,6 @@
 #include "fparser.hh"
 #include "extensions/operator_ext_excitation.h"
 
-#include "vtkPolyData.h"
-#include "vtkCellArray.h"
-#include "vtkPoints.h"
-#include "vtkXMLPolyDataWriter.h"
 #include "CSPrimBox.h"
 #include "CSPrimCurve.h"
 
@@ -510,17 +506,17 @@ void Operator::SetMaterialAvgMethod(MatAverageMethods method)
 
 double Operator::GetNumberCells() const
 {
-	return (numLines[0])*(numLines[1])*(numLines[2]);
+	return (double)numLines[0]*numLines[1]*numLines[2];
 }
 
 void Operator::ShowStat() const
 {
-	unsigned int OpSize = 12*numLines[0]*numLines[1]*numLines[2]*sizeof(FDTD_FLOAT);
-	unsigned int FieldSize = 6*numLines[0]*numLines[1]*numLines[2]*sizeof(FDTD_FLOAT);
+	size_t OpSize = 12*(size_t)numLines[0]*numLines[1]*numLines[2]*sizeof(FDTD_FLOAT);
+	size_t FieldSize = 6*(size_t)numLines[0]*numLines[1]*numLines[2]*sizeof(FDTD_FLOAT);
 	double MBdiff = 1024*1024;
 
 	cout << "------- Stat: FDTD Operator -------" << endl;
-	cout << "Dimensions\t\t: " << numLines[0] << "x" << numLines[1] << "x" << numLines[2] << " = " <<  numLines[0]*numLines[1]*numLines[2] << " Cells (" << numLines[0]*numLines[1]*numLines[2]/1e6 << " MCells)" << endl;
+	cout << "Dimensions\t\t: " << numLines[0] << "x" << numLines[1] << "x" << numLines[2] << " = " <<  GetNumberCells() << " Cells (" << GetNumberCells()/1e6 << " MCells)" << endl;
 	cout << "Size of Operator\t: " << OpSize << " Byte (" << (double)OpSize/MBdiff << " MiB) " << endl;
 	cout << "Size of Field-Data\t: " << FieldSize << " Byte (" << (double)FieldSize/MBdiff << " MiB) " << endl;
 	cout << "-----------------------------------" << endl;
@@ -575,7 +571,7 @@ void Operator::DumpOperator2File(std::string filename)
 		{
 			ArrayLib::ArrayNIJK<FDTD_FLOAT> exc("exc", numLines);
 
-			for (unsigned int n=0; n<  Op_Ext_Exc->Volt_Count; ++n)
+			for (size_t n=0; n<Op_Ext_Exc->Volt_Count; ++n)
 				exc(Op_Ext_Exc->Volt_dir[n], Op_Ext_Exc->Volt_index[0][n], Op_Ext_Exc->Volt_index[1][n], Op_Ext_Exc->Volt_index[2][n]) =   Op_Ext_Exc->Volt_amp[n];
 			vtk_Writer->AddVectorField("exc_volt",exc);
 		}
@@ -584,7 +580,7 @@ void Operator::DumpOperator2File(std::string filename)
 		{
 			ArrayLib::ArrayNIJK<FDTD_FLOAT> exc("exc", numLines);
 
-			for (unsigned int n=0; n<  Op_Ext_Exc->Curr_Count; ++n)
+			for (size_t n=0; n<Op_Ext_Exc->Curr_Count; ++n)
 				exc(Op_Ext_Exc->Curr_dir[n], Op_Ext_Exc->Curr_index[0][n], Op_Ext_Exc->Curr_index[1][n], Op_Ext_Exc->Curr_index[2][n]) =   Op_Ext_Exc->Curr_amp[n];
 			vtk_Writer->AddVectorField("exc_curr",exc);
 		}
@@ -642,9 +638,8 @@ void Operator::DumpPEC2File(std::string filename , unsigned int *range)
 			stop[n] = range[2*n+1];
 		}
 
-	vtkPolyData* polydata = vtkPolyData::New();
-	vtkCellArray *poly = vtkCellArray::New();
-	vtkPoints *points = vtkPoints::New();
+	std::vector<float> points;
+	std::vector<int64_t> lines;
 
 	int* pointIdx[2];
 	pointIdx[0] = new int[numLines[0]*numLines[1]];
@@ -680,7 +675,6 @@ void Operator::DumpPEC2File(std::string filename , unsigned int *range)
 						rpos[1]=pos[1];
 						rpos[2]=pos[2];
 
-						poly->InsertNextCell(2);
 
 						mesh_idx = rpos[0] + rpos[1]*numLines[0];
 						if (pointIdx[0][mesh_idx]<0)
@@ -690,9 +684,10 @@ void Operator::DumpPEC2File(std::string filename , unsigned int *range)
 							TransformCoordSystem(coord, coord, m_MeshType, CARTESIAN);
 							for (int m=0;m<3;++m)
 								coord[m] *= scaling;
-							pointIdx[0][mesh_idx] = (int)points->InsertNextPoint(coord);
+							pointIdx[0][mesh_idx] = (int)(points.size()/3);
+							points.insert(points.end(), coord, coord+3);
 						}
-						poly->InsertCellPoint(pointIdx[0][mesh_idx]);
+						lines.push_back(pointIdx[0][mesh_idx]);
 
 						++rpos[n];
 						mesh_idx = rpos[0] + rpos[1]*numLines[0];
@@ -703,9 +698,10 @@ void Operator::DumpPEC2File(std::string filename , unsigned int *range)
 							TransformCoordSystem(coord, coord, m_MeshType, CARTESIAN);
 							for (int m=0;m<3;++m)
 								coord[m] *= scaling;
-							pointIdx[n==2][mesh_idx] = (int)points->InsertNextPoint(coord);
+							pointIdx[n==2][mesh_idx] = (int)(points.size()/3);
+							points.insert(points.end(), coord, coord+3);
 						}
-						poly->InsertCellPoint(pointIdx[n==2][mesh_idx]);
+						lines.push_back(pointIdx[n==2][mesh_idx]);
 					}
 				}
 			}
@@ -713,25 +709,8 @@ void Operator::DumpPEC2File(std::string filename , unsigned int *range)
 	delete[] pointIdx[0];
 	delete[] pointIdx[1];
 
-	polydata->SetPoints(points);
-	points->Delete();
-	polydata->SetLines(poly);
-	poly->Delete();
-
-	vtkXMLPolyDataWriter* writer  = vtkXMLPolyDataWriter::New();
-	filename += ".vtp";
-	writer->SetFileName(filename.c_str());
-
-#if VTK_MAJOR_VERSION>=6
-	writer->SetInputData(polydata);
-#else
-	writer->SetInput(polydata);
-#endif
-	writer->Write();
-
-	writer->Delete();
-	polydata->Delete();
-	cout << " done." << endl;
+	if (VTK_File_Writer::WriteLines(filename + ".vtp", points, lines))
+		cout << " done." << endl;
 }
 
 void Operator::DumpMaterial2File(std::string filename)
@@ -834,7 +813,29 @@ bool Operator::SetGeometryCSX(ContinuousStructure* geo)
 	SetBackgroundDensity(0);
 
 	CSRectGrid* grid=CSX->GetGrid();
-	return SetupCSXGrid(CSRectGrid::Clone(grid));
+	if (!SetupCSXGrid(CSRectGrid::Clone(grid)))
+		return false;
+
+	// a mesh line closer to a primitive's surface than this lies on it, e.g. for the single
+	// precision coordinates of an STL file or coordinates rounded in the XML; an operator of a
+	// multi grid sets it again, the smallest wins
+	double tol = 1e-3*GetMinMeshStep();
+	if (tol>0 && (CSX->GetDrawingTolerance()<=0 || tol<CSX->GetDrawingTolerance()))
+		CSX->SetDrawingTolerance(tol);
+	return true;
+}
+
+double Operator::GetMinMeshStep() const
+{
+	double step = 0;
+	for (int n=0;n<3;++n)
+		for (unsigned int i=0;i+1<numLines[n];++i)
+		{
+			double d = discLines[n][i+1]-discLines[n][i];
+			if (d>0 && (step==0 || d<step))
+				step = d;
+		}
+	return step;
 }
 
 void Operator::InitOperator()

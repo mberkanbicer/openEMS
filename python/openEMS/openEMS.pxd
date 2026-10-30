@@ -51,7 +51,7 @@ cdef extern from "openEMS/openems.h":
         int Get_PML_Size(int idx)
         void Set_Mur_PhaseVel(int idx, double val)
 
-        void SetGaussExcite(double f0, double fc)
+        void SetGaussExcite(double f0, double fc, bool dcFree)
         void SetSinusExcite(double f0)
         void SetDiracExcite(double f_max)
         void SetStepExcite(double f_max)
@@ -59,8 +59,8 @@ cdef extern from "openEMS/openems.h":
 
         void SetAbort(bool val)
 
-        int SetupFDTD() nogil
-        void RunFDTD()  nogil
+        int SetupFDTD() nogil except +
+        void RunFDTD()  nogil except +
 
         bool Write2XML(string file)
         bool ReadFromXML(string file)

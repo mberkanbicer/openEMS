@@ -45,19 +45,27 @@ public:
 
 	virtual void Init(std::string name, std::array<IndexType, 3> extent)
 	{
-		if (this->m_ptr != NULL)
-			Base::AllocatorType::free(this->m_ptr, this->m_size);
+		InitView(name, extent, NULL);
+	}
+
+	// Use the external memory at ptr (at least extentN*i*j*k elements) instead
+	// of allocating, e.g. memory shared with a GPU. The array does not free it.
+	// With ptr==NULL, allocate and own the memory like Init().
+	void InitView(std::string name, std::array<IndexType, 3> extent, T* ptr)
+	{
+		this->Reset();
 
 		this->m_name = name;
-		this->m_size = extent[0] * extent[1] * extent[2] * extentN;
+		this->m_size = (size_t)extent[0] * extent[1] * extent[2] * extentN;
 		this->m_bytes = sizeof(T) * this->m_size;
-		this->m_ptr = Base::AllocatorType::alloc(this->m_size);
+		this->m_owner = (ptr==NULL);
+		this->m_ptr = ptr ? ptr : Base::AllocatorType::alloc(this->m_size);
 
 		this->m_extent = {extentN, extent[0], extent[1], extent[2]};
 
 		// N-I-J-K ordering
-		this->m_stride[0] = extent[0] * extent[1] * extent[2];
-		this->m_stride[1] = extent[1] * extent[2];
+		this->m_stride[0] = (size_t)extent[0] * extent[1] * extent[2];
+		this->m_stride[1] = (size_t)extent[1] * extent[2];
 		this->m_stride[2] = extent[2];
 		this->m_stride[3] = 1;
 	}
@@ -78,7 +86,7 @@ public:
 		Init(name, {extent[0], extent[1], extent[2]});
 	}
 
-	IndexType linearIndex(std::array<IndexType, 4> tupleIndex) const
+	size_t linearIndex(std::array<IndexType, 4> tupleIndex) const
 	{
 		return  this->m_stride[0] * tupleIndex[0] +
 		        this->m_stride[1] * tupleIndex[1] +

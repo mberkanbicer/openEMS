@@ -17,6 +17,7 @@
 
 #include "engine.h"
 #include "engine_cylinder.h"
+#include "engine_gpu.h"
 #include "Common/processfields.h"
 #include "operator_cylinder.h"
 #include "extensions/operator_extension.h"
@@ -40,15 +41,31 @@ Operator_Cylinder::Operator_Cylinder() : Operator_Multithread()
 {
 	m_MeshType = CYLINDRICAL;
 	m_Cyl_Ext = NULL;
+	m_GPU_Backend = NULL;
+	m_GPU_Parent = NULL;
 }
 
 Operator_Cylinder::~Operator_Cylinder()
 {
+	delete m_GPU_Backend;
+}
+
+void Operator_Cylinder::SetGPUBackend(GPU_Backend* backend, GPU_Backend* parent)
+{
+	if (backend!=m_GPU_Backend)
+		delete m_GPU_Backend;
+	m_GPU_Backend = backend;
+	m_GPU_Parent = parent;
 }
 
 
 Engine* Operator_Cylinder::CreateEngine()
 {
+	if (UseGPU())
+	{
+		m_Engine = Engine_GPU::New(this, TakeGPUBackend(), m_GPU_Parent);
+		return m_Engine;
+	}
 	//! create a special cylindrical-engine
 	m_Engine = Engine_Cylinder::New(this, m_orig_numThreads);
 	return m_Engine;
@@ -117,6 +134,15 @@ inline unsigned int Operator_Cylinder::GetNumberOfLines(int ny, bool full) const
 		return Operator_Multithread::GetNumberOfLines(ny, true)-2;
 
 	return Operator_Multithread::GetNumberOfLines(ny, full);
+}
+
+bool Operator_Cylinder::GetClosedMeshLines(int ny, unsigned int &first, unsigned int &last) const
+{
+	if (!CC_closedAlpha || (ny!=1))
+		return false;
+	first = 0;
+	last = GetNumberOfLines(1);
+	return true;
 }
 
 std::string Operator_Cylinder::GetDirName(int ny) const
@@ -208,6 +234,34 @@ double Operator_Cylinder::GetEdgeLength(int ny, const unsigned int pos[3], bool 
 	if (ny!=1)
 		return length;
 	return length * GetDiscLine(0,pos[0],dualMesh);
+}
+
+double Operator_Cylinder::GetMinMeshStep() const
+{
+	double step = 0, r_min = 0, da = 0;
+	for (int n=0;n<3;++n)
+		for (unsigned int i=0;i+1<numLines[n];++i)
+		{
+			double d = discLines[n][i+1]-discLines[n][i];
+			if (d<=0)
+				continue;
+			if (n==1)
+			{
+				if (da==0 || d<da)
+					da = d;
+			}
+			else if (step==0 || d<step)
+				step = d;
+		}
+	for (unsigned int i=0;i<numLines[0];++i)
+		if (discLines[0][i]>0)
+		{
+			r_min = discLines[0][i];
+			break;
+		}
+	if (r_min*da>0 && (step==0 || r_min*da<step))
+		step = r_min*da;
+	return step;
 }
 
 double Operator_Cylinder::GetCellVolume(const unsigned int pos[3], bool dualMesh) const

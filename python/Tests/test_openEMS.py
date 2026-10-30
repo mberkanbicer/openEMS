@@ -17,6 +17,8 @@
 #
 
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -163,6 +165,19 @@ class Test_BoundaryConditions(unittest.TestCase):
             self.fdtd.SetBoundaryCond(['PEC', 'PEC', 'PEC', 'PEC', 'PEC', 'UNKNOWN'])
 
 
+class Test_LibraryArguments(unittest.TestCase):
+    def test_false_option_does_not_hide_the_following_ones(self):
+        # an option that is switched off must not end the option list: what
+        # follows it, here an invalid option, still has to be looked at
+        with self.assertRaisesRegex(RuntimeError, 'not-an-option'):
+            openEMS()._SetLibraryArguments({'debug_PEC': False, 'not_an_option': True})
+
+    def test_unknown_engine(self):
+        # a typo must not silently run the default engine
+        with self.assertRaisesRegex(RuntimeError, "'cuda'.*engine"):
+            openEMS()._SetLibraryArguments({'engine': 'cuda'})
+
+
 class Test_Excitation(unittest.TestCase):
     def setUp(self):
         self.fdtd = openEMS()
@@ -297,6 +312,103 @@ class Test_Run(unittest.TestCase):
             self.skipTest('cannot create symlinks')
         self.fdtd.Run(os.path.join(self.tmp.name, 'link'), setup_only=True, verbose=0)
         self.assertInDir(os.path.join(self.tmp.name, 'real'))
+
+    def test_flush_to_zero_restored(self):
+        # the engines flush denormals to zero during the run only, not in the calling process
+        tiny = np.float32(1e-39)   # a float32 denormal
+        if not tiny*np.float32(2) > 0:
+            self.skipTest('denormals are flushed already')
+        csx = self.fdtd.GetCSX()
+        csx.AddExcitation('exc', exc_type=0, exc_val=[0, 0, 1]).AddBox([0, 0, -2], [0, 0, 2])
+        self.fdtd.Run('sim', verbose=0)
+        self.assertGreater(tiny*np.float32(2), 0)
+
+
+_NUM_THREADS_SCRIPT = """
+import os, sys, time
+from CSXCAD import ContinuousStructure
+from openEMS.openEMS import openEMS
+fdtd = openEMS(NrTS=20, EndCriteria=0)
+fdtd.SetGaussExcite(1e9, 1e9)
+fdtd.SetBoundaryCond(['PEC'] * 6)
+csx = ContinuousStructure()
+fdtd.SetCSX(csx)
+grid = csx.GetGrid()
+grid.SetDeltaUnit(1e-3)
+for d in 'xyz':
+    grid.SetLines(d, range(40))
+csx.AddExcitation('ex', 0, [0, 0, 1]).AddBox([10, 10, 10], [10, 10, 12])
+csx.AddDump('Et', dump_type=0, file_type=1).AddBox([0, 0, 0], [39, 39, 39])
+before = len(os.listdir('/proc/self/task'))
+fdtd.Run(sys.argv[1], verbose=0, numThreads=2)
+assert os.path.isfile(os.path.join(sys.argv[1], 'Et.h5'))
+# a joined thread can still be listed for a moment while the kernel tears it down
+for n in range(50):
+    extra = len(os.listdir('/proc/self/task')) - before
+    if extra <= 2:
+        break
+    time.sleep(0.02)
+print(extra)
+"""
+
+
+@unittest.skipUnless(os.path.isdir('/proc/self/task'), 'needs /proc/self/task')
+class Test_NumThreads(unittest.TestCase):
+    def test_dump_threads(self):
+        # the field dump threads stay alive after the run: with numThreads=2 at most
+        # one of them, plus the background dump writer
+        with tempfile.TemporaryDirectory() as tmp:
+            out = subprocess.run([sys.executable, '-c', _NUM_THREADS_SCRIPT, tmp],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 universal_newlines=True, check=True, cwd=tmp)
+        self.assertLessEqual(int(out.stdout.split()[-1]), 2)
+
+
+_GPU_ENGINE_SCRIPT = """
+import sys
+from CSXCAD import ContinuousStructure
+from openEMS.openEMS import openEMS
+fdtd = openEMS(NrTS=10, EndCriteria=0)
+fdtd.SetGaussExcite(1e9, 1e9)
+fdtd.SetBoundaryCond(['PEC'] * 6)
+csx = ContinuousStructure()
+fdtd.SetCSX(csx)
+grid = csx.GetGrid()
+grid.SetDeltaUnit(1e-3)
+for d in 'xyz':
+    grid.SetLines(d, range(10))
+csx.AddExcitation('ex', 0, [0, 0, 1]).AddBox([4, 4, 4], [4, 4, 6])
+fdtd.Run(sys.argv[1], verbose=0, engine='gpu', **eval(sys.argv[2]))
+"""
+
+
+def _run_gpu_engine(tmp, kw, env):
+    return subprocess.run([sys.executable, '-c', _GPU_ENGINE_SCRIPT, os.path.join(tmp, 'sim'), repr(kw)],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          universal_newlines=True, env=env, cwd=tmp)
+
+
+class Test_GPUPlugins(unittest.TestCase):
+    def test_broken_plugin_is_reported(self):
+        # a file named like a plugin that is none: the GPU engine fails, and says which file and why
+        with tempfile.TemporaryDirectory() as tmp:
+            plugins = os.path.join(tmp, 'plugins')
+            os.mkdir(plugins)
+            bogus = os.path.join(plugins, 'openEMS_gpu_bogus' + ('.dll' if os.name == 'nt' else '.so'))
+            open(bogus, 'w').close()
+            env = dict(os.environ, OPENEMS_PLUGIN_PATH=plugins)
+            out = _run_gpu_engine(tmp, {}, env)
+        # a backend built into libopenEMS (Metal, HIP with OPENEMS_GPU_PLUGINS=OFF) may run
+        if ('backend: Metal' in out.stdout) or ('backend: HIP' in out.stdout):
+            self.skipTest('a built-in GPU backend is used')
+        self.assertIn(bogus, out.stderr)
+        self.assertIn('no GPU backend with a usable device', out.stderr)
+
+    def test_unknown_gpu_device(self):
+        # a device number beyond the list is an error that shows the list
+        with tempfile.TemporaryDirectory() as tmp:
+            out = _run_gpu_engine(tmp, {'gpu_device': 99}, os.environ)
+        self.assertIn('--gpu-device=99, but there', out.stderr)
 
 
 if __name__ == '__main__':

@@ -26,6 +26,7 @@
 #endif
 #include <ctime>
 #include <vector>
+#include <climits>
 
 #include "openems_global.h"
 
@@ -60,8 +61,11 @@ public:
 	virtual void RunFDTD();
 
 	void Reset();
+	//! Free the operator, the engine and the processings of a simulation, the setup is kept (called at the end of RunFDTD())
+	void FreeSimulation();
 
-	void SetNumberOfTimeSteps(unsigned int val) {NrTS=val;}
+	//! The run counts the timesteps as int: more than INT_MAX are INT_MAX, a run that long is unlimited anyway
+	void SetNumberOfTimeSteps(unsigned int val) {NrTS = (val>(unsigned int)INT_MAX) ? (unsigned int)INT_MAX : val;}
 	void SetEnableDumps(bool val) {Enable_Dumps=val;}
 	void SetEndCriteria(double val) {endCrit=val;}
 	void SetOverSampling(int val) {m_OverSampling=val;}
@@ -104,7 +108,7 @@ public:
 	//! Check for abort conditions
 	bool CheckAbortCond();
 
-	void SetGaussExcite(double f0, double fc);
+	void SetGaussExcite(double f0, double fc, bool dcFree=false);
 	void SetSinusExcite(double f0);
 	void SetDiracExcite(double f_max);
 	void SetStepExcite(double f_max);
@@ -162,7 +166,7 @@ protected:
 
 	bool m_Abort;
 
-	enum EngineType {EngineType_Basic, EngineType_SSE, EngineType_SSE_Compressed, EngineType_Multithreaded};
+	enum EngineType {EngineType_Basic, EngineType_SSE, EngineType_SSE_Compressed, EngineType_Multithreaded, EngineType_GPU, EngineType_GPU_Reference};
 	EngineType m_engine;
 	unsigned int m_engine_numThreads;
 

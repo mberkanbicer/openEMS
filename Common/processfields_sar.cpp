@@ -33,10 +33,6 @@ ProcessFieldsSAR::ProcessFieldsSAR(Engine_Interface_Base* eng_if) : ProcessField
 
 ProcessFieldsSAR::~ProcessFieldsSAR()
 {
-	for (size_t n = 0; n<m_E_FD_Fields.size(); ++n)
-		delete m_E_FD_Fields.at(n);
-	m_E_FD_Fields.clear();
-
 	for (size_t n = 0; n<m_J_FD_Fields.size(); ++n)
 		delete m_J_FD_Fields.at(n);
 	m_J_FD_Fields.clear();
@@ -92,18 +88,28 @@ void ProcessFieldsSAR::InitProcess()
 
 	if (Enabled==false) return;
 
-	//create data structures...
-	for (size_t n = 0; n<m_FD_Samples.size(); ++n)
-	{
-		m_E_FD_Fields.push_back(new ArrayLib::ArrayNIJK<std::complex<float>>("E_FD", numLines));
-		if (!m_UseCellKappa)
+	// the E field in the frequency domain arrays of ProcessFieldsFD, the J field here
+	if (!m_UseCellKappa)
+		for (size_t n = 0; n<m_FD_Samples.size(); ++n)
 			m_J_FD_Fields.push_back(new ArrayLib::ArrayNIJK<std::complex<float>>("J_FD", numLines));
-	}
+}
+
+ProcessFields::DumpType ProcessFieldsSAR::FieldDumpType() const
+{
+	// Process() switches the dump type to E and J while it evaluates them
+	if ((m_DumpType==E_FIELD_DUMP) || (m_DumpType==J_FIELD_DUMP))
+		return m_DumpType;
+	// a SAR type: computed from E alone with cell conductivity, otherwise from E and J
+	return m_UseCellKappa ? E_FIELD_DUMP : m_DumpType;
 }
 
 int ProcessFieldsSAR::Process()
 {
 	if (Enabled==false) return -1;
+	// with a precomputed evaluation of the E field (GPU engine) the frequency domain E field
+	// is summed like that of an E field dump: on the device or from snapshots, see ProcessFieldsFD
+	if (m_UseCellKappa && m_Gather)
+		return ProcessFieldsFD::Process();
 	if (CheckTimestep()==false) return GetNextInterval();
 
 	if ((m_FD_Interval==0) || (m_Eng_Interface->GetNumberOfTimesteps()%m_FD_Interval!=0))
@@ -123,15 +129,15 @@ int ProcessFieldsSAR::Process()
 		return GetNextInterval();
 	field_td = tmp_field_td.data();
 	T = m_Eng_Interface->GetTime(m_dualTime);
-	unsigned int N;
+	size_t N;
 	for (size_t n = 0; n<m_FD_Samples.size(); ++n)
 	{
 		std::complex<float> exp_jwt_2_dt = std::exp( (std::complex<float>)(-2.0 * I_UNIT * PI * m_FD_Samples.at(n) * T) );
 		exp_jwt_2_dt *= 2; // *2 for single-sided spectrum
 		exp_jwt_2_dt *= Op->GetTimestep() * m_FD_Interval; // multiply with timestep-interval
-		N = m_E_FD_Fields.at(n)->size();
-		field_fd = m_E_FD_Fields.at(n)->data();
-		for (unsigned int ijk=0;ijk<N;++ijk)
+		N = m_FD_Fields.at(n)->size();
+		field_fd = m_FD_Fields.at(n)->data();
+		for (size_t ijk=0;ijk<N;++ijk)
 			field_fd[ijk] += field_td[ijk] * exp_jwt_2_dt;
 	}
 	tmp_field_td.Reset(); // free memory before next calc step
@@ -151,7 +157,7 @@ int ProcessFieldsSAR::Process()
 			exp_jwt_2_dt *= Op->GetTimestep() * m_FD_Interval; // multiply with timestep-interval
 			N = m_J_FD_Fields.at(n)->size();
 			field_fd = m_J_FD_Fields.at(n)->data();
-			for (unsigned int ijk=0;ijk<N;++ijk)
+			for (size_t ijk=0;ijk<N;++ijk)
 				field_fd[ijk] += field_td[ijk] * exp_jwt_2_dt;
 		}
 		tmp_field_td.Reset();
@@ -237,7 +243,7 @@ void ProcessFieldsSAR::DumpFDData()
 		{
 			stringstream ss;
 			ss << "f" << n;
-			if (m_HDF5_Dump_File->WriteVectorField<std::complex<float>>(ss.str(), *m_E_FD_Fields.at(n))==false)
+			if (m_HDF5_Dump_File->WriteVectorField<std::complex<float>>(ss.str(), *m_FD_Fields.at(n))==false)
 				cerr << "ProcessFieldsSAR::DumpFDData: can't dump to file...! " << endl;
 		}
 
@@ -275,9 +281,9 @@ void ProcessFieldsSAR::DumpFDData()
 		for (size_t n = 0; n<m_FD_Samples.size(); ++n)
 		{
 			if (!m_UseCellKappa)
-				SAR_Calc.AddEFieldAndJField(m_FD_Samples.at(n), m_E_FD_Fields.at(n), m_J_FD_Fields.at(n));
+				SAR_Calc.AddEFieldAndJField(m_FD_Samples.at(n), m_FD_Fields.at(n), m_J_FD_Fields.at(n));
 			else
-				SAR_Calc.AddEFieldAndConductivity(m_FD_Samples.at(n), m_E_FD_Fields.at(n), &cell_kappa);
+				SAR_Calc.AddEFieldAndConductivity(m_FD_Samples.at(n), m_FD_Fields.at(n), &cell_kappa);
 		}
 		SAR_Calc.CalcSAR();
 
