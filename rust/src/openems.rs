@@ -22,6 +22,10 @@ use std::sync::Arc;
 /// `exact` (`--exact-endcriteria`) evaluates every excitation Nyquist period;
 /// the default evaluates every four seconds of wall clock, measured from the
 /// previous checkpoint (the first checkpoint is four seconds into the run).
+/// Wall-clock seconds of a run during which the end criteria is evaluated on
+/// the fixed Nyquist schedule (native `EXACT_ENDCRIT_TIME`).
+const EXACT_ENDCRIT_TIME: f64 = 60.0;
+
 const WALL_CLOCK_CHECK_INTERVAL: f64 = 4.0;
 
 fn end_criteria_due(
@@ -31,7 +35,11 @@ fn end_criteria_due(
     now_seconds: f64,
     last_checkpoint: &mut f64,
 ) -> bool {
-    if exact {
+    // Native: a fixed timestep schedule for the first `EXACT_ENDCRIT_TIME`
+    // seconds, so a short run stops at the same timestep on every machine;
+    // only after that the wall-clock progress cadence, unless
+    // `--exact-endcriteria` asks for the fixed schedule for the whole run.
+    if exact || now_seconds <= EXACT_ENDCRIT_TIME {
         nyquist > 0 && ts.is_multiple_of(nyquist)
     } else if now_seconds - *last_checkpoint > WALL_CLOCK_CHECK_INTERVAL {
         *last_checkpoint = now_seconds;
@@ -1931,7 +1939,17 @@ impl OpenEMS {
                 "Exact-endcriteria: evaluating the end criteria every {} timestep(s) (this excitation's Nyquist rate)",
                 nyquist.max(1)
             );
+        } else if self.verbose_level > 0 {
+            println!(
+                "Evaluating the end criteria every {} timestep(s) during the first {} s, with the progress report after that",
+                nyquist.max(1),
+                EXACT_ENDCRIT_TIME as u32
+            );
         }
+
+        // Native `Denormal::FlushToZero`: every engine flushes denormals to
+        // zero during the run and the caller's setting comes back afterwards.
+        let _denormal = crate::denormal::FlushToZero::new();
 
         let mut ts = 0u32;
         let mut change: f64 = 1.0;
@@ -1976,11 +1994,7 @@ impl OpenEMS {
                         exact,
                         ts,
                         nyquist,
-                        if exact {
-                            0.0
-                        } else {
-                            started.elapsed().as_secs_f64()
-                        },
+                        started.elapsed().as_secs_f64(),
                         &mut last_checkpoint,
                     );
                     if seed || due {
@@ -1988,10 +2002,10 @@ impl OpenEMS {
                         if energy > max_energy {
                             max_energy = energy;
                         }
-                        // default mode: only the wall-clock checkpoint updates
-                        // `change`; exact mode also updates it at the seed
-                        let update_change = if exact { true } else { due };
-                        if update_change && max_energy > 0.0 {
+                        // Every due sample updates `change`: the Nyquist
+                        // schedule in the first minute, the wall-clock
+                        // checkpoint afterwards (native energy path).
+                        if due && max_energy > 0.0 {
                             change = energy / max_energy;
                         }
                     }
@@ -2585,6 +2599,22 @@ mod pml_setup_tests {
     }
 
     #[test]
+    fn the_end_criteria_uses_the_nyquist_schedule_in_the_first_minute() {
+        let mut last = 0.0;
+        assert!(end_criteria_due(false, 100, 100, 5.0, &mut last));
+        assert!(!end_criteria_due(false, 150, 100, 5.0, &mut last));
+        // After the first minute the wall-clock cadence takes over.
+        let mut last = 60.0;
+        assert!(!end_criteria_due(false, 150, 100, 61.0, &mut last));
+        assert!(end_criteria_due(false, 150, 100, 65.0, &mut last));
+        assert_eq!(last, 65.0);
+        // --exact-endcriteria keeps the Nyquist schedule for the whole run.
+        let mut last = 0.0;
+        assert!(end_criteria_due(true, 200, 100, 120.0, &mut last));
+        assert!(!end_criteria_due(true, 250, 100, 120.0, &mut last));
+    }
+
+    #[test]
     fn setup_fdtd_rejects_a_pml_larger_than_the_mesh() {
         let mut sim = OpenEMS::new();
         sim.set_csx_xml(mesh_xml());
@@ -2704,15 +2734,20 @@ mod steady_state_wiring_tests {
         assert!(!end_criteria_due(true, 43, 21, 0.0, &mut last));
         // Dirac/Step excitations have a Nyquist of one, i.e. every step
         assert!(end_criteria_due(true, 7, 1, 0.0, &mut last));
-        // default mode: the first check is four seconds into the run, then
-        // every four seconds of wall clock
+        // default mode: within the first minute the fixed Nyquist schedule
+        // (native EXACT_ENDCRIT_TIME), so a short run stops at the same
+        // timestep on every machine
         let mut last = 0.0;
         assert!(!end_criteria_due(false, 100, 21, 3.9, &mut last));
-        assert!(end_criteria_due(false, 100, 21, 4.1, &mut last));
-        assert!(!end_criteria_due(false, 200, 21, 7.0, &mut last));
-        assert!(end_criteria_due(false, 300, 21, 8.5, &mut last));
-        // the constant, not the loop, owns the interval
+        assert!(end_criteria_due(false, 105, 21, 3.9, &mut last)); // 5*21
+        // after the first minute: the wall-clock progress cadence
+        let mut last = 0.0;
+        assert!(end_criteria_due(false, 100, 21, 61.0, &mut last));
+        assert!(!end_criteria_due(false, 105, 21, 63.0, &mut last));
+        assert!(end_criteria_due(false, 110, 21, 65.1, &mut last));
+        // the constants, not the loop, own the intervals
         assert_eq!(WALL_CLOCK_CHECK_INTERVAL, 4.0);
+        assert_eq!(EXACT_ENDCRIT_TIME, 60.0);
     }
 
     #[test]

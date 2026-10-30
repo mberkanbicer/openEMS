@@ -16,6 +16,7 @@ pub mod array_nijk;
 pub mod conducting_sheet;
 pub mod constants;
 pub mod debug_dump;
+pub mod denormal;
 pub mod engine;
 pub mod excitation;
 pub mod extensions;
