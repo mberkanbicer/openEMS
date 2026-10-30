@@ -61,6 +61,20 @@ fn fdtd_tag<'a>(xml: &'a str) -> Option<&'a str> {
     Some(&rest[..end])
 }
 
+/// The `<FDTD ...>...</FDTD>` element, so the excitation and boundary-condition
+/// children are only searched there and not among the CSXCAD properties.
+fn fdtd_element<'a>(xml: &'a str) -> Option<&'a str> {
+    let start = xml.find("<FDTD")?;
+    let rest = &xml[start..];
+    let end = rest.find('>')?;
+    // A self-closing `<FDTD .../>` has no children.
+    if rest[..=end].trim_end().ends_with("/>") {
+        return Some(&rest[..=end]);
+    }
+    let close = rest.find("</FDTD>")?;
+    Some(&rest[..close])
+}
+
 /// Split `name="value"` pairs out of a tag body.
 fn attributes(tag: &str) -> Vec<(String, String)> {
     let bytes = tag.as_bytes();
@@ -242,8 +256,9 @@ pub fn parse_fdtd_options(xml: &str) -> FdtdOptions {
         options.pml_size = Some(pml);
     }
 
-    // `<Excitation ...>` child
-    if let Some(tag) = child_tag(xml, "Excitation") {
+    // `<Excitation ...>` child, inside the FDTD element only.
+    let fdtd = fdtd_element(xml).unwrap_or(xml);
+    if let Some(tag) = child_tag(fdtd, "Excitation") {
         let attributes = attributes(&tag);
         let get = |name: &str| {
             attributes

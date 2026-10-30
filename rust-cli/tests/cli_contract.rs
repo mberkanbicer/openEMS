@@ -87,9 +87,16 @@ fn the_fdtd_element_sets_the_timestep_budget() {
         .expect("run");
     assert_eq!(output.status.code(), Some(0));
     let stats = std::fs::read_to_string(dir.join("openEMS_run_stats.txt")).expect("run stats");
+    // The FDTD element sets the budget; the end criteria may stop the run
+    // earlier on its Nyquist schedule, never later.
+    let timesteps: u32 = stats
+        .lines()
+        .find_map(|line| line.strip_prefix("timesteps = "))
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or_else(|| panic!("unexpected run stats: {stats}"));
     assert!(
-        stats.contains("timesteps = 6"),
-        "unexpected run stats: {stats}"
+        (1..=6).contains(&timesteps),
+        "timestep budget not honoured: {timesteps}"
     );
     let setup = std::fs::read_to_string(dir.join("openEMS_stats.txt")).expect("setup stats");
     assert!(setup.contains("cells = "));
@@ -131,7 +138,7 @@ fn disable_dumps_and_debug_switches_are_accepted() {
     for file in [
         "debugCSX.xml",
         "material_dump.vtk",
-        "PEC_dump.vtk",
+        "PEC_dump.vtp",
         "operator_dump.vtk",
         "box_dump_0.vtk",
     ] {
