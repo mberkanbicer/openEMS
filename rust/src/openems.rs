@@ -951,8 +951,7 @@ impl OpenEMS {
         let options = crate::fdtd_options::parse_fdtd_options(&xml);
         // Options that native accepts but this port does not implement must
         // fail loudly instead of silently changing the physics. See
-        // `docs/migration/EXCEPTIONS.md` E-007 (cylindrical multi-grid) and
-        // E-008 (cell-constant material averaging).
+        // `docs/migration/EXCEPTIONS.md` E-007 (cylindrical multi-grid).
         let requested_multi_grid = options
             .multi_grid
             .as_ref()
@@ -962,12 +961,6 @@ impl OpenEMS {
         if let Some(radii) = requested_multi_grid {
             eprintln!(
                 "[openEMS] Setup failed: cylindrical multi-grid is not implemented in the Rust port (MultiGrid={radii:?}); use the native solver (EXCEPTIONS.md E-007)"
-            );
-            return false;
-        }
-        if options.cell_constant_material == Some(true) || self.cell_constant_material {
-            eprintln!(
-                "[openEMS] Setup failed: CellConstantMaterial is not implemented in the Rust port; material averaging is quarter-cell only (EXCEPTIONS.md E-008)"
             );
             return false;
         }
@@ -1018,6 +1011,11 @@ impl OpenEMS {
             self.pml_size = pml;
         }
         let mut op = Operator::new();
+        op.material_averaging = if self.cell_constant_material {
+            crate::operator::MaterialAveraging::CellCenter
+        } else {
+            crate::operator::MaterialAveraging::QuarterCell
+        };
         if let Err(error) = op.load_csx(&xml) {
             eprintln!("[openEMS] Failed to load CSXCAD geometry: {error}");
             return false;
@@ -2654,7 +2652,7 @@ mod pml_setup_tests {
     }
 
     #[test]
-    fn cell_constant_material_is_rejected_at_setup() {
+    fn cell_constant_material_selects_cell_center_averaging() {
         let mut sim = OpenEMS::new();
         let xml = format!(
             "<openEMS><FDTD CellConstantMaterial=\"1\"/>{}</openEMS>",
@@ -2663,9 +2661,19 @@ mod pml_setup_tests {
         sim.set_csx_xml(xml);
         sim.set_number_of_time_steps(2);
         assert!(
-            !sim.setup_fdtd(),
-            "CellConstantMaterial must not silently use quarter-cell averaging"
+            sim.setup_fdtd(),
+            "CellConstantMaterial must now be implemented, not rejected"
         );
+        assert!(sim.cell_constant_material);
+
+        let mut quarter = OpenEMS::new();
+        quarter.set_csx_xml(format!(
+            "<openEMS><FDTD CellConstantMaterial=\"0\"/>{}</openEMS>",
+            mesh_xml()
+        ));
+        quarter.set_number_of_time_steps(2);
+        assert!(quarter.setup_fdtd());
+        assert!(!quarter.cell_constant_material);
     }
 
     #[test]

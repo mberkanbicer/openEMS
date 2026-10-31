@@ -11,4 +11,4 @@ requires-python = ">=3.8"
 [tool.maturin]
 python-source = "python"
 module-name = "openEMS._openems"
-features = ["pyo3/extension-module"]
+features = ["pyo3/extension-module", "pyo3/abi3-py39"]

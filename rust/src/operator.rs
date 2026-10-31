@@ -41,6 +41,17 @@ pub enum MeshType {
     Cylindrical { closed_alpha: bool },
 }
 
+/// Material averaging method (native `Operator::MatAverageMethod`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MaterialAveraging {
+    /// Native `AverageMatQuarterCell`: four transverse quarter cells.
+    #[default]
+    QuarterCell,
+    /// Native `AverageMatCellCenter`, selected by `CellConstantMaterial="1"`:
+    /// each transverse cell is sampled at its centre.
+    CellCenter,
+}
+
 /// Geometry of one mesh: edge lengths, face areas and cell volumes.
 ///
 /// Mirrors the native `GetEdgeLength` / `GetEdgeArea` / `GetCellVolume`
@@ -199,6 +210,8 @@ pub struct Operator {
     pub structure: Option<csxcad_core::model::Structure>,
     /// Discretisation metric of the mesh (Cartesian or cylindrical).
     pub mesh_type: MeshType,
+    /// Material averaging method (native `MatAverageMethod`).
+    pub material_averaging: MaterialAveraging,
     /// A cylindrical mesh that includes the `rho = 0` axis (native
     /// `CC_R0_included`).
     pub r0_included: bool,
@@ -227,6 +240,7 @@ impl Operator {
             material_grid: None,
             structure: None,
             mesh_type: MeshType::Cartesian,
+            material_averaging: MaterialAveraging::QuarterCell,
             r0_included: false,
             r0_axis_metal: Vec::new(),
             r0_pairs: Vec::new(),
@@ -860,6 +874,7 @@ impl Operator {
         };
 
         let mut material_grid = vec![background; 3 * ncells];
+        let cell_center = self.material_averaging == MaterialAveraging::CellCenter;
         for n in 0..3usize {
             let n_p = (n + 1) % 3;
             let n_pp = (n + 2) % 3;
@@ -909,20 +924,31 @@ impl Operator {
                                 }
                                 loc[n_pp] -= 1;
                             }
-                            let mut coordinate = base_coordinate;
-                            coordinate[n] = base_coordinate[n] + delta * 0.5;
-                            coordinate[n_p] = base_coordinate[n_p]
-                                + if positive_p {
-                                    delta_p * 0.25
-                                } else {
-                                    -delta_p_m * 0.25
-                                };
-                            coordinate[n_pp] = base_coordinate[n_pp]
-                                + if positive_pp {
-                                    delta_pp * 0.25
-                                } else {
-                                    -delta_pp_m * 0.25
-                                };
+                            let mut coordinate = if cell_center {
+                                // Native `AverageMatCellCenter` samples the
+                                // dual (cell-centre) node on every axis.
+                                [
+                                    disc_line_value(&disc_lines[0], counts[0] as usize, loc[0], true),
+                                    disc_line_value(&disc_lines[1], counts[1] as usize, loc[1], true),
+                                    disc_line_value(&disc_lines[2], counts[2] as usize, loc[2], true),
+                                ]
+                            } else {
+                                let mut coordinate = base_coordinate;
+                                coordinate[n] = base_coordinate[n] + delta * 0.5;
+                                coordinate[n_p] = base_coordinate[n_p]
+                                    + if positive_p {
+                                        delta_p * 0.25
+                                    } else {
+                                        -delta_p_m * 0.25
+                                    };
+                                coordinate[n_pp] = base_coordinate[n_pp]
+                                    + if positive_pp {
+                                        delta_pp * 0.25
+                                    } else {
+                                        -delta_pp_m * 0.25
+                                    };
+                                coordinate
+                            };
                             wrap_alpha(&mut coordinate);
                             // native `AverageMatQuarterCell` weights the
                             // quarter cells by `GetNodeArea(ny, loc, true)`;
@@ -966,15 +992,24 @@ impl Operator {
                                 loc[n] -= 1;
                             }
                             let width = MeshMetric::new(&disc_lines, counts, 1.0, mesh_type)
-                                .edge_length(n, loc, false);
+                                .edge_length(n, loc, cell_center);
                             if width <= 0.0 {
                                 continue;
                             }
-                            let mut coordinate = base_coordinate;
-                            coordinate[n] = base_coordinate[n]
-                                + if lower { -delta_m * 0.25 } else { delta * 0.25 };
-                            coordinate[n_p] = base_coordinate[n_p] + delta_p * 0.5;
-                            coordinate[n_pp] = base_coordinate[n_pp] + delta_pp * 0.5;
+                            let mut coordinate = if cell_center {
+                                [
+                                    disc_line_value(&disc_lines[0], counts[0] as usize, loc[0], true),
+                                    disc_line_value(&disc_lines[1], counts[1] as usize, loc[1], true),
+                                    disc_line_value(&disc_lines[2], counts[2] as usize, loc[2], true),
+                                ]
+                            } else {
+                                let mut coordinate = base_coordinate;
+                                coordinate[n] = base_coordinate[n]
+                                    + if lower { -delta_m * 0.25 } else { delta * 0.25 };
+                                coordinate[n_p] = base_coordinate[n_p] + delta_p * 0.5;
+                                coordinate[n_pp] = base_coordinate[n_pp] + delta_pp * 0.5;
+                                coordinate
+                            };
                             wrap_alpha(&mut coordinate);
                             let material = sample(coordinate)
                                 .filter(|material| !material.is_pec)
@@ -5478,6 +5513,49 @@ mod tests {
             assert_eq!(*ii.get(n, 2, 0, 2), 0.0);
             assert_eq!(*ii.get(n, 2, 2, 0), 0.0);
         }
+    }
+
+    #[test]
+    fn cell_center_material_averaging_samples_cell_centres() {
+        // Background eps 2, a thin eps 4 slab over y = 0.4..0.6. For an
+        // x-directed edge at i=1, j=0, k=0, the y cell 0 has its centre
+        // (y=0.5) inside the slab while the quarter-cell sample (y=0.25) is
+        // outside. Cell-centre averaging must therefore include it.
+        let xml = r#"<ContinuousStructure CoordSystem="0">
+            <RectilinearGrid DeltaUnit="1">
+                <XLines>0,1,2,3</XLines>
+                <YLines>0,1,2,3</YLines>
+                <ZLines>0,1,2,3</ZLines>
+            </RectilinearGrid>
+            <BackgroundMaterial Epsilon="2" Mue="1" Sigma="0" Kappa="0"/>
+            <Properties>
+                <Material Name="slab">
+                    <Property Epsilon="4" Mue="1" Kappa="0" Sigma="0"/>
+                    <Primitives>
+                        <Box Priority="1">
+                            <P1 X="0" Y="0.4" Z="0"/>
+                            <P2 X="3" Y="0.6" Z="3"/>
+                        </Box>
+                    </Primitives>
+                </Material>
+            </Properties>
+        </ContinuousStructure>"#;
+
+        let mut quarter = Operator::new();
+        quarter.load_csx(xml).expect("quarter-cell CSX");
+        let mut center = Operator::new();
+        center.material_averaging = MaterialAveraging::CellCenter;
+        center.load_csx(xml).expect("cell-centre CSX");
+
+        let index = |op: &Operator, n: usize, i: usize, j: usize, k: usize| {
+            let ny = op.base.num_lines[1] as usize;
+            let nz = op.base.num_lines[2] as usize;
+            n * (op.base.num_lines[0] as usize) * ny * nz + i * ny * nz + j * nz + k
+        };
+        let q = quarter.material_grid.as_ref().expect("quarter grid")[index(&quarter, 0, 1, 1, 1)].eps_r;
+        let c = center.material_grid.as_ref().expect("centre grid")[index(&center, 0, 1, 1, 1)].eps_r;
+        assert!((q - 2.0).abs() < 1e-12, "quarter eps={q}");
+        assert!((c - 3.0).abs() < 1e-12, "cell-centre eps={c}");
     }
 
     #[test]
