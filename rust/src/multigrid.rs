@@ -819,6 +819,7 @@ impl MultiGridEngine {
 
     /// Advance the two engines by the requested number of native time steps.
     pub fn iterate_ts(&mut self, steps: u32) -> bool {
+        let mut ok = true;
         for _ in 0..steps {
             let number = self.base.num_ts;
             for extension in self.base.extensions.iter_mut() {
@@ -852,20 +853,26 @@ impl MultiGridEngine {
             self.inner.do_post_current_updates();
             self.inner.apply2_current();
 
-            self.sync_currents();
+            if self.sync_currents().is_err() {
+                ok = false;
+            }
 
             // End of step: fill the base overlap from the child.
             for rho in 0..self.split_pos - 1 {
-                let _ = self.interpolate_row(rho, true);
+                if self.interpolate_row(rho, true).is_err() {
+                    ok = false;
+                }
             }
             for rho in 0..self.split_pos.saturating_sub(2) {
-                let _ = self.interpolate_row(rho, false);
+                if self.interpolate_row(rho, false).is_err() {
+                    ok = false;
+                }
             }
 
             self.base.num_ts += 1;
             self.inner.num_ts += 1;
         }
-        true
+        ok
     }
 
     /// Native `Engine_Ext_CylinderMultiGrid::SyncVoltages`.
@@ -898,12 +905,12 @@ impl MultiGridEngine {
     }
 
     /// Native `Engine_Ext_CylinderMultiGrid::SyncCurrents`.
-    pub fn sync_currents(&mut self) {
+    pub fn sync_currents(&mut self) -> Result<(), String> {
         if self.split_pos < 2 {
-            return;
+            return Ok(());
         }
         let rho = self.split_pos - 2;
-        let _ = self.interpolate_row(rho, false);
+        self.interpolate_row(rho, false)
     }
 
     /// Interpolate one rho row of the child into the base overlap.
