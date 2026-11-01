@@ -223,8 +223,12 @@ pub struct InterpolationPair {
 /// (native `Operator_CylinderMultiGrid::SetupInterpolation`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AlphaInterpolation {
+    /// alpha component (native table index 1)
     pub voltage: Vec<InterpolationPair>,
     pub current: Vec<InterpolationPair>,
+    /// rho/z components (native table index 0)
+    pub voltage_rz: Vec<InterpolationPair>,
+    pub current_rz: Vec<InterpolationPair>,
 }
 
 fn alpha_line(lines: &[f64], index: usize, dual: bool) -> f64 {
@@ -333,8 +337,113 @@ impl AlphaInterpolation {
                 weight_pp: v_wpp,
             });
         }
-        Ok(Self { voltage, current })
+        let mut voltage_rz = Vec::with_capacity(base.len());
+        let mut current_rz = Vec::with_capacity(base.len());
+        for a_n in 0..base.len() {
+            let is_odd = a_n % 2;
+            let mut p = a_n / 2;
+            let mut pp = a_n / 2 + is_odd;
+            if a_n == 0 && closed {
+                pp = child.len() - 3;
+            }
+            if !closed && a_n + 2 == base.len() {
+                pp = a_n / 2 - 1;
+            }
+            let p = p.min(child.len() - 1);
+            let pp = pp.max(0).min(child.len() - 1) as usize;
+
+            let (wp, wpp) = if p == pp {
+                let ratio = alpha_delta(base, a_n, true) / alpha_delta(child, p, true);
+                (ratio, ratio)
+            } else {
+                let line_p = alpha_line(child, p, true);
+                let line_pp = alpha_line(child, pp, true);
+                let this_line = alpha_line(base, a_n, true);
+                let base_delta = alpha_delta(base, a_n, true);
+                (
+                    (line_pp - this_line) / (line_pp - line_p)
+                        * base_delta / alpha_delta(child, p, true),
+                    (this_line - line_p) / (line_pp - line_p)
+                        * base_delta / alpha_delta(child, pp, true),
+                )
+            };
+            current_rz.push(InterpolationPair {
+                pos_p: p,
+                pos_pp: pp,
+                weight_p: wp,
+                weight_pp: wpp,
+            });
+
+            let (wp, wpp) = if p == pp {
+                (1.0, 1.0)
+            } else {
+                let line_p = alpha_line(child, p, false);
+                let line_pp = alpha_line(child, pp, false);
+                let this_line = alpha_line(base, a_n, false);
+                (
+                    (line_pp - this_line) / (line_pp - line_p),
+                    (this_line - line_p) / (line_pp - line_p),
+                )
+            };
+            voltage_rz.push(InterpolationPair {
+                pos_p: p,
+                pos_pp: pp,
+                weight_p: wp,
+                weight_pp: wpp,
+            });
+        }
+
+        Ok(Self {
+            voltage,
+            current,
+            voltage_rz,
+            current_rz,
+        })
     }
+}
+
+/// Apply the child-to-base alpha interpolation for one rho row and z index.
+///
+/// Field arrays are component-major `[3*nx*ny*nz]`. `voltage` selects the
+/// voltage table (E field) or the current table (H field).
+pub fn interpolate_child_to_base(
+    base: &mut [f64],
+    child: &[f64],
+    base_dims: [usize; 3],
+    child_dims: [usize; 3],
+    rho: usize,
+    z: usize,
+    table: &AlphaInterpolation,
+    voltage: bool,
+) -> Result<(), String> {
+    let b = base_dims;
+    let c = child_dims;
+    if rho >= b[0] || rho >= c[0] || z >= b[2] || z >= c[2] {
+        return Err("interpolation index outside the grids".to_string());
+    }
+    if base.len() != 3 * b[0] * b[1] * b[2] || child.len() != 3 * c[0] * c[1] * c[2] {
+        return Err("field array size does not match the grid".to_string());
+    }
+    let b_index = |n: usize, j: usize| n * b[0] * b[1] * b[2] + rho * b[1] * b[2] + j * b[2] + z;
+    let c_index = |n: usize, j: usize| n * c[0] * c[1] * c[2] + rho * c[1] * c[2] + j * c[2] + z;
+    let (alpha, rz) = if voltage {
+        (&table.voltage, &table.voltage_rz)
+    } else {
+        (&table.current, &table.current_rz)
+    };
+    for j in 0..b[1] {
+        let pair = alpha.get(j).ok_or("alpha table too short")?;
+        let value = pair.weight_p * child[c_index(1, pair.pos_p)]
+            + pair.weight_pp * child[c_index(1, pair.pos_pp)];
+        base[b_index(1, j)] = value;
+        let pair = rz.get(j).ok_or("rz table too short")?;
+        for n in [0usize, 2] {
+            let value = pair.weight_p * child[c_index(n, pair.pos_p)]
+                + pair.weight_pp * child[c_index(n, pair.pos_pp)];
+            base[b_index(n, j)] = value;
+        }
+    }
+    Ok(())
 }
 
 /// A base/child cylindrical operator pair built from one CSXCAD model.
@@ -617,5 +726,38 @@ mod tests {
             assert!(pair.weight_p.is_finite() && pair.weight_pp.is_finite());
             assert!(pair.pos_p < child.len() && pair.pos_pp < child.len());
         }
+    }
+
+    #[test]
+    fn child_to_base_interpolation_applies_the_weights_and_indexing() {
+        let pair = InterpolationPair {
+            pos_p: 0,
+            pos_pp: 1,
+            weight_p: 0.25,
+            weight_pp: 0.75,
+        };
+        let table = AlphaInterpolation {
+            voltage: vec![pair, pair],
+            current: vec![pair, pair],
+            voltage_rz: vec![pair, pair],
+            current_rz: vec![pair, pair],
+        };
+        let base_dims = [1usize, 2, 1];
+        let child_dims = [1usize, 2, 1];
+        let mut base = vec![0.0; 3 * 1 * 2 * 1];
+        let child = vec![2.0; 3 * 1 * 2 * 1];
+        interpolate_child_to_base(
+            &mut base,
+            &child,
+            base_dims,
+            child_dims,
+            0,
+            0,
+            &table,
+            true,
+        )
+        .expect("interpolate");
+        // 0.25 * 2 + 0.75 * 2 = 2 for every component.
+        assert!(base.iter().all(|v| (*v - 2.0).abs() < 1e-12), "{base:?}");
     }
 }
