@@ -146,32 +146,6 @@ impl<'a> MeshMetric<'a> {
         }
     }
 
-    /// EC geometry for the cylindrical operator: the native operator dump and
-    /// `Calc_ECPos` use the unscaled (no `rho`) edge lengths and node areas.
-    /// Field processing applies the cylindrical metric separately; keeping it
-    /// out of the coefficients is what makes the native `vi`/`iv` independent
-    /// of the rho index.
-    pub fn ec_edge_length(&self, n: usize, pos: [usize; 3], dual: bool) -> f64 {
-        self.base_length(n, pos, dual)
-    }
-
-    pub fn ec_node_area(&self, n: usize, pos: [usize; 3], dual: bool) -> f64 {
-        if n == 2 && self.is_cylindrical() {
-            self.node_area(n, pos, dual)
-        } else {
-            self.base_length((n + 1) % 3, pos, !dual)
-                * self.base_length((n + 2) % 3, pos, !dual)
-        }
-    }
-
-    pub fn ec_edge_area(&self, n: usize, pos: [usize; 3], dual: bool) -> f64 {
-        if n == 0 && self.is_cylindrical() {
-            self.base_length(1, pos, !dual) * self.base_length(2, pos, !dual)
-        } else {
-            self.ec_node_area(n, pos, dual)
-        }
-    }
-
     /// Native `Operator_Cylinder::GetCellVolume`.
     pub fn cell_volume(&self, pos: [usize; 3], dual: bool) -> f64 {
         self.edge_area(2, pos, dual) * self.edge_length(2, pos, dual)
@@ -1164,13 +1138,10 @@ impl Operator {
 
                         // Per-direction edge geometry from the real mesh.
                         let pos = [i, j, k];
-                        // Native cylindrical EC geometry uses the unscaled
-                        // edge lengths/node areas (no rho factor); the rho
-                        // scaling belongs to field processing.
-                        let area = metric.ec_edge_area(n, pos, false);
-                        let delta = metric.ec_edge_length(n, pos, false);
-                        let area_dual = metric.ec_edge_area(n, pos, true);
-                        let delta_dual = metric.ec_edge_length(n, pos, true);
+                        let area = metric.edge_area(n, pos, false);
+                        let delta = metric.edge_length(n, pos, false);
+                        let area_dual = metric.edge_area(n, pos, true);
+                        let delta_dual = metric.edge_length(n, pos, true);
 
                         let c = if delta > 0.0 {
                             (eps_r * EPS0 * area / delta) as FDTD_FLOAT
