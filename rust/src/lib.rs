@@ -15,6 +15,7 @@
 pub mod array_nijk;
 pub mod conducting_sheet;
 pub mod constants;
+pub mod multigrid;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod debug_dump;

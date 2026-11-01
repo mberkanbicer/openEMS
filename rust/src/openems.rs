@@ -959,9 +959,18 @@ impl OpenEMS {
             .cloned()
             .or_else(|| (!self.multi_grid.is_empty()).then(|| self.multi_grid.clone()));
         if let Some(radii) = requested_multi_grid {
-            eprintln!(
-                "[openEMS] Setup failed: cylindrical multi-grid is not implemented in the Rust port (MultiGrid={radii:?}); use the native solver (EXCEPTIONS.md E-007)"
-            );
+            // Stage 1 validates the native radii/level rules; the engine pair is
+            // still pending, so the run stops instead of using a single grid.
+            match crate::multigrid::CylinderMultiGridPlan::new(&radii) {
+                Ok(plan) => eprintln!(
+                    "[openEMS] Setup failed: cylindrical multi-grid plan is valid ({} grids, split {}) but the engine is not wired yet (EXCEPTIONS.md E-007)",
+                    plan.grid_count(),
+                    plan.split_radius()
+                ),
+                Err(error) => eprintln!(
+                    "[openEMS] Setup failed: invalid cylindrical multi-grid radii {radii:?}: {error} (EXCEPTIONS.md E-007)"
+                ),
+            }
             return false;
         }
         if let Some(value) = options.nr_ts {
