@@ -55,6 +55,14 @@ pub struct ProcessIntegral {
     norm_dir: i32,
     enabled: bool,
     header_written: bool,
+    /// Open time-domain output stream.
+    ///
+    /// Native `ProcessIntegral` keeps an `ofstream` member open for the whole
+    /// run. Re-opening the file for every sample (the earlier port) cost
+    /// several milliseconds per time step on Windows because of the
+    /// create/open/close cycle, which dominated the solver runtime whenever a
+    /// probe was present.
+    writer: Option<std::fs::File>,
     /// Sample the current at the half timestep (native `SetDualTime`).
     dual_time: bool,
     /// Nyquist step count of the highest excited frequency (native
@@ -92,6 +100,7 @@ impl ProcessIntegral {
             norm_dir: -1,
             enabled: true,
             header_written: false,
+            writer: None,
             dual_time: false,
             fd_nyquist: 0,
             calculator,
@@ -110,6 +119,8 @@ impl ProcessIntegral {
 
     pub fn set_filename(&mut self, val: &str) {
         self.filename = val.to_string();
+        self.writer = None;
+        self.header_written = false;
     }
 
     pub fn set_weight(&mut self, val: f64) {
@@ -178,6 +189,8 @@ impl ProcessIntegral {
     }
 
     fn write_header(&mut self) {
+        use std::io::Write;
+
         let mut text = String::new();
         text.push_str(&format!(
             "% time-domain {} '{}' by openEMS (Rust)\n",
@@ -197,39 +210,63 @@ impl ProcessIntegral {
             text.push_str(&self.calculator.integral_name(row));
         }
         text.push('\n');
-        if let Err(error) = std::fs::write(&self.filename, text) {
-            eprintln!(
-                "[openEMS] Failed to create integral file '{}': {error}",
-                self.filename
-            );
-        } else {
-            self.header_written = true;
+        match std::fs::File::create(&self.filename) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(text.as_bytes()) {
+                    eprintln!(
+                        "[openEMS] Failed to write the header of '{}': {error}",
+                        self.filename
+                    );
+                    self.writer = None;
+                    return;
+                }
+                // Keep the stream open for the whole run, as the native
+                // implementation does.
+                self.writer = Some(file);
+                self.header_written = true;
+            }
+            Err(error) => {
+                eprintln!(
+                    "[openEMS] Failed to create integral file '{}': {error}",
+                    self.filename
+                );
+                self.writer = None;
+            }
         }
     }
 
-    fn append_td_row(&self, time: f64) {
+    fn append_td_row(&mut self, time: f64) {
         use std::io::Write;
-        let Ok(mut file) = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&self.filename)
-        else {
-            eprintln!(
-                "[openEMS] Failed to append to integral file '{}'",
-                self.filename
-            );
-            return;
-        };
+
+        if self.writer.is_none() {
+            match std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&self.filename)
+            {
+                Ok(file) => self.writer = Some(file),
+                Err(error) => {
+                    eprintln!(
+                        "[openEMS] Failed to append to integral file '{}': {error}",
+                        self.filename
+                    );
+                    return;
+                }
+            }
+        }
         let mut line = format_sample(time, self.precision);
         for value in &self.results {
             line.push('\t');
             line.push_str(&format_sample(value * self.weight, self.precision));
         }
         line.push('\n');
-        if let Err(error) = file.write_all(line.as_bytes()) {
-            eprintln!(
-                "[openEMS] Failed to write integral row to '{}': {error}",
-                self.filename
-            );
+        if let Some(file) = self.writer.as_mut() {
+            if let Err(error) = file.write_all(line.as_bytes()) {
+                eprintln!(
+                    "[openEMS] Failed to write integral row to '{}': {error}",
+                    self.filename
+                );
+            }
         }
     }
 
@@ -331,6 +368,7 @@ impl Processing for ProcessIntegral {
     }
 
     fn init_process(&mut self) {
+        self.writer = None;
         self.header_written = false;
         if self.enabled {
             self.write_header();
@@ -393,6 +431,9 @@ impl Processing for ProcessIntegral {
     }
 
     fn post_process(&mut self) {
+        // Close the time-domain stream before the frequency-domain table is
+        // written next to it.
+        self.writer = None;
         self.dump_fd_data(1.0);
     }
 
@@ -401,6 +442,7 @@ impl Processing for ProcessIntegral {
             row.fill(ComplexPoint::default());
         }
         self.sample_count = 0;
+        self.writer = None;
         self.header_written = false;
         self.fd_interval = 0;
     }

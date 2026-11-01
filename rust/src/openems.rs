@@ -1536,17 +1536,16 @@ impl OpenEMS {
         }
 
         // Native `openems.cpp` writes the sampled excitation waveforms (`et`,
-        // `ht`) before `SetupProcessing`; a probe that reuses those names then
-        // truncates the file when it is initialised.
-        if self.enable_dumps {
-            let dt = self
-                .fdtd_eng
-                .as_ref()
-                .expect("engine checked above")
-                .op
-                .get_timestep();
-            self.dump_excitation_signals(dt);
-        }
+        // `ht`) unconditionally before `SetupProcessing` — even with
+        // `--disable-dumps`, which only disables the field dumps; a probe that
+        // reuses those names then truncates the file when it is initialised.
+        let dt = self
+            .fdtd_eng
+            .as_ref()
+            .expect("engine checked above")
+            .op
+            .get_timestep();
+        self.dump_excitation_signals(dt);
 
         // Native `SetupProcessing`: every `ProbeBox` and `DumpBox` property
         // becomes a processing object that streams its data to a file.
@@ -1669,6 +1668,8 @@ impl OpenEMS {
                             2 => processing.set_dual_mesh(true),
                             _ => {}
                         }
+                        // native `ProcField->SetEnable(Enable_Dumps)`
+                        processing.set_enable(self.enable_dumps);
                         array.add_processing(Box::new(processing));
                         created += 1;
                     }
@@ -1718,6 +1719,8 @@ impl OpenEMS {
                             );
                             continue;
                         }
+                        // native `ProcField->SetEnable(Enable_Dumps)`
+                        processing.set_enable(self.enable_dumps);
                         array.add_processing(Box::new(processing));
                         created += 1;
                     }
@@ -1752,6 +1755,8 @@ impl OpenEMS {
                             );
                             continue;
                         }
+                        // native `ProcField->SetEnable(Enable_Dumps)`
+                        processing.set_enable(self.enable_dumps);
                         array.add_processing(Box::new(processing));
                         created += 1;
                     }
@@ -1790,6 +1795,8 @@ impl OpenEMS {
                             );
                             continue;
                         }
+                        // native `ProcField->SetEnable(Enable_Dumps)`
+                        processing.set_enable(self.enable_dumps);
                         array.add_processing(Box::new(processing));
                         created += 1;
                     }

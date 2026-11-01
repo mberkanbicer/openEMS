@@ -1301,6 +1301,15 @@ pub struct ProcessFieldsTD {
     /// Native `--nativeFieldDumps`: keep the cylindrical `(rho, alpha, z)`
     /// components instead of rotating them into `(x, y, z)`.
     native_field_dumps: bool,
+    /// Native `SetEnable(Enable_Dumps)`: a dump disabled by `--disable-dumps`
+    /// is created but never writes.
+    enabled: bool,
+    /// Reused HDF5 handle for the time-domain dump.
+    ///
+    /// The native writer keeps its file open for the whole run; opening and
+    /// closing the HDF5 file once per timestep (the earlier port) made a dump
+    /// cost several milliseconds per step and dominated the run time.
+    hdf5_writer: Option<HDF5FileWriter>,
 }
 
 impl ProcessFieldsTD {
@@ -1325,6 +1334,8 @@ impl ProcessFieldsTD {
             legacy_fmt: false,
             mesh_type: MeshType::Cartesian,
             native_field_dumps: false,
+            enabled: true,
+            hdf5_writer: None,
         }
     }
 
@@ -1456,6 +1467,14 @@ impl Processing for ProcessFieldsTD {
         self.name.clone()
     }
 
+    fn set_enable(&mut self, val: bool) {
+        self.enabled = val;
+    }
+
+    fn get_enable(&self) -> bool {
+        self.enabled
+    }
+
     fn set_mesh_type(&mut self, mesh_type: MeshType) {
         self.mesh_type = mesh_type;
     }
@@ -1513,6 +1532,11 @@ impl Processing for ProcessFieldsTD {
     }
 
     fn process_fields(&mut self, num_ts: u32, interface: &EngineInterface<'_>) -> i32 {
+        // Native `ProcessFieldsTD::Process`: a disabled dump returns -1 and
+        // writes nothing (`--disable-dumps`).
+        if !self.enabled {
+            return -1;
+        }
         if !self.check_timestep(num_ts) {
             return 0;
         }
@@ -1556,32 +1580,40 @@ impl Processing for ProcessFieldsTD {
         if self.file_type == HDF5_FILETYPE {
             // Native: /FieldData/TD/<8-digit timestep> + a `time` attribute.
             let dataset = format!("{num_ts:08}");
-            let writer = HDF5FileWriter::new(&format!("{}.h5", self.name));
+            let filename = format!("{}.h5", self.name);
+            let dump_type = self.dump_type;
+            let legacy_fmt = self.legacy_fmt;
+            let initialized = self.initialized;
+            let mesh_type = mesh_type_code(self.mesh_type);
+            let grid_delta = interface.meta.grid_delta;
+            let time = ((num_ts as f64 + if self.dual_time { 0.5 } else { 0.0 })
+                * interface.meta.dt) as f32;
+            let writer = self
+                .hdf5_writer
+                .get_or_insert_with(|| HDF5FileWriter::new(&filename));
             let result = (|| -> Result<(), Hdf5Error> {
-                if !self.initialized {
-                    writer.create(self.dump_type, false, self.legacy_fmt)?;
+                if !initialized {
+                    writer.create(dump_type, false, legacy_fmt)?;
                     writer.write_rect_mesh(
                         dims,
                         coordinate_refs,
-                        mesh_type_code(self.mesh_type),
+                        mesh_type,
                         1.0,
-                        interface.meta.grid_delta,
+                        grid_delta,
                     )?;
-                    self.initialized = true;
                 }
                 writer.write_vector_field(
                     "/FieldData/TD",
                     &dataset,
                     &reduced,
                     dims,
-                    self.legacy_fmt,
+                    legacy_fmt,
                 )?;
-                writer.write_time_attribute(
-                    &format!("/FieldData/TD/{dataset}"),
-                    ((num_ts as f64 + if self.dual_time { 0.5 } else { 0.0 }) * interface.meta.dt)
-                        as f32,
-                )
+                writer.write_time_attribute(&format!("/FieldData/TD/{dataset}"), time)
             })();
+            if result.is_ok() {
+                self.initialized = true;
+            }
             if let Err(error) = result {
                 eprintln!(
                     "[openEMS] Failed to write time-domain HDF5 dump '{}': {error}",
@@ -1610,9 +1642,17 @@ impl Processing for ProcessFieldsTD {
         0
     }
 
+    fn post_process(&mut self) {
+        // Flush and close the dump file when the run ends.
+        if let Some(writer) = self.hdf5_writer.as_mut() {
+            writer.close();
+        }
+    }
+
     fn reset(&mut self) {
         self.ps_pos = 0;
         self.initialized = false;
+        self.hdf5_writer = None;
     }
 }
 
@@ -1661,6 +1701,9 @@ pub struct ProcessFieldsFD {
     /// Native `--nativeFieldDumps`: keep the cylindrical `(rho, alpha, z)`
     /// components instead of rotating them into `(x, y, z)`.
     native_field_dumps: bool,
+    /// Native `SetEnable(Enable_Dumps)`: a dump disabled by `--disable-dumps`
+    /// is created but neither accumulates nor writes.
+    enabled: bool,
 }
 
 impl ProcessFieldsFD {
@@ -1694,6 +1737,7 @@ impl ProcessFieldsFD {
             indices: None,
             fd_nyquist: 0,
             native_field_dumps: false,
+            enabled: true,
         }
     }
 
@@ -1883,6 +1927,14 @@ impl Processing for ProcessFieldsFD {
         self.name.clone()
     }
 
+    fn set_enable(&mut self, val: bool) {
+        self.enabled = val;
+    }
+
+    fn get_enable(&self) -> bool {
+        self.enabled
+    }
+
     fn set_mesh_type(&mut self, mesh_type: MeshType) {
         self.mesh_type = mesh_type;
     }
@@ -1935,6 +1987,11 @@ impl Processing for ProcessFieldsFD {
     }
 
     fn process_fields(&mut self, num_ts: u32, interface: &EngineInterface<'_>) -> i32 {
+        // Native `ProcessFieldsFD::Process`: a disabled dump returns -1 and
+        // accumulates nothing (`--disable-dumps`).
+        if !self.enabled {
+            return -1;
+        }
         if self.frequencies.is_empty() {
             return 0;
         }
@@ -2044,6 +2101,11 @@ impl Processing for ProcessFieldsFD {
     }
 
     fn post_process(&mut self) {
+        // Native `ProcessFieldsFD::InitProcess` creates no file when disabled,
+        // so `DumpFDData` has nothing to flush either.
+        if !self.enabled {
+            return;
+        }
         if self.frequencies.is_empty() || self.acc_re.is_empty() {
             return;
         }
@@ -2082,7 +2144,7 @@ impl ProcessFieldsFD {
     }
 
     fn dump_hdf5(&mut self, dims: [usize; 3]) {
-        let writer = HDF5FileWriter::new(&format!("{}.h5", self.name));
+        let mut writer = HDF5FileWriter::new(&format!("{}.h5", self.name));
         let result = (|| -> Result<(), Hdf5Error> {
             writer.create(self.dump_type, false, true)?;
             if let Some(lines) = &self.disc_lines {
@@ -2418,6 +2480,9 @@ pub struct ProcessFieldsSAR {
     indices: Option<[Vec<usize>; 3]>,
     /// Full-grid line counts backing `cell_data`.
     full_lines: Option<[usize; 3]>,
+    /// Native `SetEnable(Enable_Dumps)`: a SAR dump disabled by
+    /// `--disable-dumps` is created but neither accumulates nor writes.
+    enabled: bool,
 }
 
 impl ProcessFieldsSAR {
@@ -2448,6 +2513,7 @@ impl ProcessFieldsSAR {
             bounds: None,
             indices: None,
             full_lines: None,
+            enabled: true,
         }
     }
 
@@ -2844,6 +2910,14 @@ impl Processing for ProcessFieldsSAR {
         self.name.clone()
     }
 
+    fn set_enable(&mut self, val: bool) {
+        self.enabled = val;
+    }
+
+    fn get_enable(&self) -> bool {
+        self.enabled
+    }
+
     fn set_mesh_type(&mut self, mesh_type: MeshType) {
         self.mesh_type = mesh_type;
     }
@@ -2879,6 +2953,11 @@ impl Processing for ProcessFieldsSAR {
     }
 
     fn process_fields(&mut self, num_ts: u32, interface: &EngineInterface<'_>) -> i32 {
+        // Native `ProcessFieldsSAR` inherits the disabled dump short-circuit
+        // of `ProcessFieldsFD::Process` (`--disable-dumps`).
+        if !self.enabled {
+            return -1;
+        }
         if self.frequencies.is_empty() {
             return 0;
         }
@@ -2942,6 +3021,11 @@ impl Processing for ProcessFieldsSAR {
     }
 
     fn post_process(&mut self) {
+        // Native creates no file when the dump is disabled, so nothing is
+        // flushed here either (`--disable-dumps`).
+        if !self.enabled {
+            return;
+        }
         if self.dims.is_none() || self.acc_re.is_empty() {
             return;
         }
@@ -3197,6 +3281,9 @@ impl Processing for SAR {
 pub struct HDF5FileWriter {
     filename: String,
     precision: u32,
+    /// Open handle, reused across writes (the native writer keeps the file
+    /// open for the lifetime of the dump).
+    file: Option<Hdf5File>,
 }
 
 impl HDF5FileWriter {
@@ -3204,7 +3291,21 @@ impl HDF5FileWriter {
         Self {
             filename: filename.to_string(),
             precision: 12,
+            file: None,
         }
+    }
+
+    /// Open handle, opening the file read/write on first use.
+    fn file(&mut self) -> Result<&Hdf5File, Hdf5Error> {
+        if self.file.is_none() {
+            self.file = Some(Hdf5File::open(&self.filename, true)?);
+        }
+        Ok(self.file.as_ref().expect("file opened above"))
+    }
+
+    /// Close (and flush) the file handle.
+    pub fn close(&mut self) {
+        self.file = None;
     }
 
     pub fn get_filename(&self) -> &str {
@@ -3224,7 +3325,7 @@ impl HDF5FileWriter {
     /// `dump_type` follows the native `DumpType` enum, `dual_mesh` records the
     /// interpolation mesh and `legacy_fmt` selects the Octave/MATLAB ordering.
     pub fn create(
-        &self,
+        &mut self,
         dump_type: i32,
         dual_mesh: bool,
         legacy_fmt: bool,
@@ -3236,6 +3337,7 @@ impl HDF5FileWriter {
         if legacy_fmt {
             file.write_bool_attribute("/", "legacy_fmt", true)?;
         }
+        self.file = Some(file);
         Ok(())
     }
 
@@ -3245,14 +3347,14 @@ impl HDF5FileWriter {
     /// metres, so callers pass `1.0`); `mesh_scaling` records the simulation
     /// length unit like the native writer (`Op->GetGridDelta()`).
     pub fn write_rect_mesh(
-        &self,
+        &mut self,
         num_lines: [usize; 3],
         disc_lines: [&[f64]; 3],
         mesh_type: i32,
         scaling: f64,
         mesh_scaling: f64,
     ) -> Result<(), Hdf5Error> {
-        let file = Hdf5File::open(&self.filename, true)?;
+        let file = self.file()?;
         file.create_group("/Mesh")?;
         file.write_i32_attribute("/Mesh", "mesh_type", mesh_type)?;
         file.write_f64_attribute("/Mesh", "mesh_scaling", mesh_scaling)?;
@@ -3279,21 +3381,21 @@ impl HDF5FileWriter {
     }
 
     /// Write a scalar real field as a 1-D dataset.
-    pub fn write_field(&self, field_name: &str, data: &[f64]) -> Result<(), Hdf5Error> {
-        let file = Hdf5File::open(&self.filename, true)?;
+    pub fn write_field(&mut self, field_name: &str, data: &[f64]) -> Result<(), Hdf5Error> {
+        let file = self.file()?;
         file.write_f64_dataset("/", field_name, data)
     }
 
     /// Write a vector field in native `NXYZ` or legacy `NZYX` order.
     pub fn write_vector_field(
-        &self,
+        &mut self,
         group: &str,
         dataset: &str,
         values: &FieldArray,
         dims: [usize; 3],
         legacy_fmt: bool,
     ) -> Result<(), Hdf5Error> {
-        let file = Hdf5File::open(&self.filename, true)?;
+        let file = self.file()?;
         let raw = field_values(values, dims);
         if legacy_fmt {
             let ordered = crate::hdf5::field_to_nzyx(&raw, dims);
@@ -3319,7 +3421,7 @@ impl HDF5FileWriter {
     /// Write one complex field, in the legacy split layout (`<name>_real` /
     /// `<name>_imag`, `NZYX`) or as one compound `NXYZ` dataset.
     pub fn write_complex_field(
-        &self,
+        &mut self,
         group: &str,
         dataset: &str,
         re: &[f32],
@@ -3328,7 +3430,7 @@ impl HDF5FileWriter {
         frequency: f64,
         legacy: bool,
     ) -> Result<(), Hdf5Error> {
-        let file = Hdf5File::open(&self.filename, true)?;
+        let file = self.file()?;
         if !legacy {
             file.write_complex_f32_dataset(
                 group,
@@ -3357,14 +3459,14 @@ impl HDF5FileWriter {
     }
 
     /// Write a dataset attribute with the native time stamp.
-    pub fn write_time_attribute(&self, path: &str, time: f32) -> Result<(), Hdf5Error> {
-        let file = Hdf5File::open(&self.filename, true)?;
+    pub fn write_time_attribute(&mut self, path: &str, time: f32) -> Result<(), Hdf5Error> {
+        let file = self.file()?;
         file.write_f32_attribute_vector(path, "time", &[time])
     }
 
     /// Write the frequency list attribute of a frequency-domain dump.
-    pub fn write_frequency_list(&self, frequencies: &[f64]) -> Result<(), Hdf5Error> {
-        let file = Hdf5File::open(&self.filename, true)?;
+    pub fn write_frequency_list(&mut self, frequencies: &[f64]) -> Result<(), Hdf5Error> {
+        let file = self.file()?;
         let group = "/FieldData/FD";
         file.create_group(group)?;
         let values: Vec<f32> = frequencies.iter().map(|&value| value as f32).collect();
