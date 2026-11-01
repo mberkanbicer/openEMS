@@ -478,6 +478,193 @@ impl GpuContext {
     }
 }
 
+
+/// Persistent GPU field/coefficient buffers for `Engine`.
+///
+/// The engine uploads once, dispatches the E and H kernels per step, and
+/// downloads the fields before the extension phase or an observable read.
+pub struct GpuFields {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    dims: [usize; 3],
+    volt: wgpu::Buffer,
+    curr: wgpu::Buffer,
+    bind_e: wgpu::BindGroup,
+    bind_h: wgpu::BindGroup,
+    pipe_e: wgpu::ComputePipeline,
+    pipe_h: wgpu::ComputePipeline,
+}
+
+fn f32_buffer(device: &wgpu::Device, label: &str, values: &[FDTD_FLOAT],
+              extra: wgpu::BufferUsages) -> wgpu::Buffer {
+    use wgpu::util::DeviceExt;
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: &f32_bytes(values),
+        usage: wgpu::BufferUsages::STORAGE | extra,
+    })
+}
+
+impl GpuFields {
+    pub fn new(
+        context: &GpuContext,
+        volt: &[FDTD_FLOAT],
+        curr: &[FDTD_FLOAT],
+        vv: &[FDTD_FLOAT],
+        vi: &[FDTD_FLOAT],
+        ii: &[FDTD_FLOAT],
+        iv: &[FDTD_FLOAT],
+        dims: [usize; 3],
+    ) -> Option<Self> {
+        let total = dims[0] * dims[1] * dims[2];
+        if volt.len() != 3 * total
+            || curr.len() != 3 * total
+            || vv.len() != 3 * total
+            || vi.len() != 3 * total
+            || ii.len() != 3 * total
+            || iv.len() != 3 * total
+        {
+            return None;
+        }
+        let device = context.device.clone();
+        let queue = context.queue.clone();
+        let volt_buf = f32_buffer(
+            &device,
+            "openems engine volt",
+            volt,
+            wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        );
+        let curr_buf = f32_buffer(
+            &device,
+            "openems engine curr",
+            curr,
+            wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        );
+        let vv_buf = f32_buffer(&device, "openems engine vv", vv, wgpu::BufferUsages::empty());
+        let vi_buf = f32_buffer(&device, "openems engine vi", vi, wgpu::BufferUsages::empty());
+        let ii_buf = f32_buffer(&device, "openems engine ii", ii, wgpu::BufferUsages::empty());
+        let iv_buf = f32_buffer(&device, "openems engine iv", iv, wgpu::BufferUsages::empty());
+        let uniform: [u32; 4] = [dims[0] as u32, dims[1] as u32, dims[2] as u32, 0];
+        use wgpu::util::DeviceExt;
+        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("openems engine dims"),
+            contents: &uniform.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("openems engine kernels"),
+            source: wgpu::ShaderSource::Wgsl(UPDATE_SHADER.into()),
+        });
+        let entries = (0..7u32)
+            .map(|binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: if binding == 6 {
+                        wgpu::BufferBindingType::Uniform
+                    } else if binding <= 1 {
+                        wgpu::BufferBindingType::Storage { read_only: binding == 1 }
+                    } else {
+                        wgpu::BufferBindingType::Storage { read_only: true }
+                    },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .collect::<Vec<_>>();
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("openems engine layout"),
+            entries: &entries,
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("openems engine pipeline layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipe_e = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("openems engine update_e"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("update_e"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let pipe_h = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("openems engine update_h"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("update_h"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let make_bind = |target: &wgpu::Buffer, peer: &wgpu::Buffer| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("openems engine bind group"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: target.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: peer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: vv_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: vi_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: ii_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: iv_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: uniform_buf.as_entire_binding() },
+                ],
+            })
+        };
+        let bind_e = make_bind(&volt_buf, &curr_buf);
+        let bind_h = make_bind(&curr_buf, &volt_buf);
+        Some(Self {
+            device,
+            queue,
+            dims,
+            volt: volt_buf,
+            curr: curr_buf,
+            bind_e,
+            bind_h,
+            pipe_e,
+            pipe_h,
+        })
+    }
+
+    pub fn dispatch_e(&self) {
+        let total = (self.dims[0] * self.dims[1] * self.dims[2]) as u32;
+        self.dispatch(&self.pipe_e, &self.bind_e, total);
+    }
+
+    pub fn dispatch_h(&self) {
+        let cells = ((self.dims[0] - 1) * (self.dims[1] - 1) * (self.dims[2] - 1)) as u32;
+        self.dispatch(&self.pipe_h, &self.bind_h, cells);
+    }
+
+    fn dispatch(&self, pipeline: &wgpu::ComputePipeline, bind: &wgpu::BindGroup, groups: u32) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("openems engine step"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("openems engine pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bind, &[]);
+            pass.dispatch_workgroups(groups.div_ceil(64), 1, 1);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    pub fn download(&self, volt: &mut [FDTD_FLOAT], curr: &mut [FDTD_FLOAT]) -> Option<()> {
+        let bytes = (volt.len() * 4) as u64;
+        let v = readback(&self.device, &self.queue, &self.volt, bytes)?;
+        let c = readback(&self.device, &self.queue, &self.curr, bytes)?;
+        volt.copy_from_slice(&v[..volt.len()]);
+        curr.copy_from_slice(&c[..curr.len()]);
+        Some(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

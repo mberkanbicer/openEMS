@@ -68,6 +68,9 @@ pub struct Engine {
     pub extensions: Vec<Box<dyn EngineExtension>>,
     /// Number of worker threads used by the update kernels (1 = serial).
     pub num_threads: usize,
+    /// Persistent GPU field/coefficient buffers (ADR 0012).
+    #[cfg(feature = "gpu")]
+    pub gpu_fields: Option<crate::gpu::GpuFields>,
 }
 
 impl Engine {
@@ -92,7 +95,72 @@ impl Engine {
             num_ts: 0,
             extensions: Vec::new(),
             num_threads: 1,
+            #[cfg(feature = "gpu")]
+            gpu_fields: None,
         }
+    }
+
+    /// Enable the GPU update path (ADR 0012).
+    ///
+    /// The path is only valid without engine extensions: probes, excitations,
+    /// PML and every other extension mutate the CPU field arrays, so a model
+    /// that needs one falls back to the CPU explicitly instead of silently
+    /// running stale GPU state.
+    #[cfg(feature = "gpu")]
+    pub fn enable_gpu(&mut self) -> Result<(), String> {
+        if !self.extensions.is_empty() {
+            return Err("GPU path requires no extensions; CPU fallback".to_string());
+        }
+        let context =
+            crate::gpu::GpuContext::new().ok_or_else(|| "no GPU adapter available".to_string())?;
+        let vv = self.op.get_vv().ok_or("vv coefficients not initialized")?;
+        let vi = self.op.get_vi().ok_or("vi coefficients not initialized")?;
+        let ii = self.op.get_ii().ok_or("ii coefficients not initialized")?;
+        let iv = self.op.get_iv().ok_or("iv coefficients not initialized")?;
+        // SAFETY: the slices only live for the duration of this call, which
+        // copies the data into GPU buffers.
+        let volt = unsafe {
+            std::slice::from_raw_parts(self.volt_ptr.as_ptr(), self.volt_ptr.len())
+        };
+        let curr = unsafe {
+            std::slice::from_raw_parts(self.curr_ptr.as_ptr(), self.curr_ptr.len())
+        };
+        // SAFETY: the coefficient arrays live for the call and are copied
+        // into GPU buffers.
+        let (vv, vi, ii, iv) = unsafe {
+            (
+                std::slice::from_raw_parts(vv.as_ptr(), vv.len()),
+                std::slice::from_raw_parts(vi.as_ptr(), vi.len()),
+                std::slice::from_raw_parts(ii.as_ptr(), ii.len()),
+                std::slice::from_raw_parts(iv.as_ptr(), iv.len()),
+            )
+        };
+        self.gpu_fields = crate::gpu::GpuFields::new(
+            &context, volt, curr, vv, vi, ii, iv, self.num_lines,
+        )
+        .ok_or_else(|| "GPU buffer size mismatch".to_string())?
+        .into();
+        Ok(())
+    }
+
+    /// Copy the GPU fields back into the CPU arrays (after a step).
+    #[cfg(feature = "gpu")]
+    fn sync_gpu_fields(&mut self) {
+        let Some(gpu) = self.gpu_fields.as_ref() else {
+            return;
+        };
+        let volt_ptr = self.volt_ptr.as_mut_ptr();
+        let curr_ptr = self.curr_ptr.as_mut_ptr();
+        let len = self.volt_ptr.len();
+        // SAFETY: the GPU buffers have the same length; `download` only writes
+        // those elements and the pointers are not aliased by `gpu`.
+        let (volt, curr) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(volt_ptr, len),
+                std::slice::from_raw_parts_mut(curr_ptr, len),
+            )
+        };
+        gpu.download(volt, curr);
     }
 
     /// Set the number of worker threads (clamped to at least one).
@@ -169,6 +237,11 @@ impl Engine {
     /// each cell performs exactly the same arithmetic as the serial kernel,
     /// which keeps the results bit-identical.
     pub fn update_voltages(&mut self) {
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = self.gpu_fields.as_ref() {
+            gpu.dispatch_e();
+            return;
+        }
         let vv = self.op.get_vv().expect("EC coefficients not initialized");
         let vi = self.op.get_vi().expect("EC coefficients not initialized");
 
@@ -320,6 +393,11 @@ impl Engine {
     /// Like the voltage update, this is partitioned over `i` for the threaded
     /// path; it reads only `volt` and writes only `curr`.
     pub fn update_currents(&mut self) {
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = self.gpu_fields.as_ref() {
+            gpu.dispatch_h();
+            return;
+        }
         let ii = self.op.get_ii().expect("EC coefficients not initialized");
         let iv = self.op.get_iv().expect("EC coefficients not initialized");
 
@@ -476,6 +554,10 @@ impl Engine {
 
             self.num_ts += 1;
         }
+        // The CPU arrays are only needed by observables/extensions; sync once
+        // per batch instead of every step (extensions force the CPU path).
+        #[cfg(feature = "gpu")]
+        self.sync_gpu_fields();
         true
     }
 }
@@ -525,5 +607,109 @@ mod tests {
             (energy - expected).abs() / expected < 1e-12,
             "energy {energy} vs native {expected}"
         );
+    }
+
+    #[cfg(feature = "gpu")]
+    fn cavity_operator(n: usize) -> crate::operator::Operator {
+        let lines = (0..n)
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let xml = format!(
+            r#"<ContinuousStructure CoordSystem="0">
+                <RectilinearGrid DeltaUnit="1">
+                    <XLines>{lines}</XLines>
+                    <YLines>{lines}</YLines>
+                    <ZLines>{lines}</ZLines>
+                </RectilinearGrid>
+                <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                <Properties/>
+            </ContinuousStructure>"#
+        );
+        let mut op = crate::operator::Operator::new();
+        op.load_csx(&xml).expect("cavity CSX");
+        op
+    }
+
+    #[cfg(feature = "gpu")]
+    fn seed_fields(engine: &mut Engine) {
+        let [nx, ny, nz] = engine.num_lines;
+        for i in 0..nx {
+            for j in 0..ny {
+                for k in 0..nz {
+                    let phase = 0.11 * (i as f64 + 2.0 * j as f64 + 0.5 * k as f64);
+                    for component in 0..3 {
+                        *engine.volt_ptr.get_mut(component, i, j, k) =
+                            (phase + component as f64).sin() as FDTD_FLOAT;
+                        *engine.curr_ptr.get_mut(component, i, j, k) =
+                            (phase * 0.7 + component as f64).cos() as FDTD_FLOAT;
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn field_diff(a: &Engine, b: &Engine) -> f32 {
+        let left = unsafe { std::slice::from_raw_parts(a.volt_ptr.as_ptr(), a.volt_ptr.len()) };
+        let right = unsafe { std::slice::from_raw_parts(b.volt_ptr.as_ptr(), b.volt_ptr.len()) };
+        left.iter()
+            .zip(right)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_engine_matches_cpu_on_a_cavity() {
+        let n = 48;
+        let steps = 120;
+        let mut cpu = Engine::new(Box::new(cavity_operator(n)));
+        cpu.set_number_of_threads(1);
+        seed_fields(&mut cpu);
+
+        let mut gpu = Engine::new(Box::new(cavity_operator(n)));
+        seed_fields(&mut gpu);
+        if let Err(reason) = gpu.enable_gpu() {
+            eprintln!("skipping the GPU engine test: {reason}");
+            return;
+        }
+
+        let start = std::time::Instant::now();
+        assert!(cpu.iterate_ts(steps));
+        let cpu_time = start.elapsed();
+
+        let start = std::time::Instant::now();
+        assert!(gpu.iterate_ts(steps));
+        let gpu_time = start.elapsed();
+
+        let diff = field_diff(&cpu, &gpu);
+        assert!(diff < 1.0e-5, "CPU/GPU field diff {diff}");
+        eprintln!(
+            "GPU engine vs CPU: {n}^3, {steps} steps, E diff {diff:.2e}, CPU {:.2?}, GPU {:.2?}",
+            cpu_time, gpu_time
+        );
+    }
+
+    #[cfg(feature = "gpu")]
+    struct NoopExtension;
+
+    #[cfg(feature = "gpu")]
+    impl EngineExtension for NoopExtension {
+        fn get_priority(&self) -> i32 {
+            0
+        }
+        fn get_extension_name(&self) -> &'static str {
+            "noop"
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_falls_back_when_an_extension_is_registered() {
+        let mut engine = Engine::new(Box::new(cavity_operator(8)));
+        engine.add_extension(Box::new(NoopExtension));
+        let error = engine.enable_gpu().expect_err("extension must force the CPU path");
+        assert!(error.contains("CPU fallback"), "{error}");
     }
 }
