@@ -15,6 +15,8 @@
 pub mod array_nijk;
 pub mod conducting_sheet;
 pub mod constants;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod debug_dump;
 pub mod denormal;
 pub mod engine;

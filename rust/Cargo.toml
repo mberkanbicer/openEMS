@@ -9,6 +9,9 @@ build = "build.rs"
 [dependencies]
 csxcad-core = { package = "csxcad-core", path = "../../CSXCAD/rust" }
 fparser = { package = "fparser-rs", path = "../../fparser/rust" }
+wgpu = { version = "30", optional = true }
+pollster = { version = "0.3", optional = true }
 
 [features]
 hdf5 = []
+gpu = ["dep:wgpu", "dep:pollster"]
