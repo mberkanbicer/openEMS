@@ -1,0 +1,15 @@
+<openEMS>
+  <FDTD NumberOfTimesteps="5" TimeStepMethod="3">
+    <Excitation Type="0" f0="1e9" fc="2e9"/>
+    <BoundaryCond xmin="MUR" xmax="MUR" ymin="MUR" ymax="MUR" zmin="MUR" zmax="MUR"/>
+  </FDTD>
+  <ContinuousStructure CoordSystem="1">
+    <RectilinearGrid DeltaUnit="0.001">
+      <XLines>0.5,0.6,0.7,0.8,0.9,1.0,1.1</XLines>
+      <YLines>0.0,0.698131700797732,1.396263401595464,2.094395102393195,2.792526803190927,3.490658503988659,4.188790204786391,4.886921905584122,5.585053606381854,6.283185307179586</YLines>
+      <ZLines>0,1,2,3,4</ZLines>
+    </RectilinearGrid>
+    <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+    <Properties/>
+  </ContinuousStructure>
+</openEMS>

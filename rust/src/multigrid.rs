@@ -207,6 +207,137 @@ pub fn check_extensions(extensions: &[(ExtensionKind, bool)]) -> Result<(), Stri
     Ok(())
 }
 
+
+/// A base/child cylindrical operator pair built from one CSXCAD model.
+///
+/// Stage 2 constructs and validates the two native-style operator instances.
+/// The interface interpolation and the multi-grid engine are not wired yet.
+pub struct MultiGridOperatorPair {
+    pub plan: CylinderMultiGridPlan,
+    pub split: GridSplit,
+    pub base: crate::operator::Operator,
+    pub child: crate::operator::Operator,
+}
+
+fn grid_lines(xml: &str, axis: char) -> Result<Vec<f64>, String> {
+    let open = format!("<{axis}Lines");
+    let close = format!("</{axis}Lines>");
+    let start = xml
+        .find(&open)
+        .ok_or_else(|| format!("missing <{axis}Lines>"))?;
+    let body_start = xml[start..]
+        .find('>')
+        .map(|offset| start + offset + 1)
+        .ok_or_else(|| format!("malformed <{axis}Lines>"))?;
+    let end = xml[body_start..]
+        .find(&close)
+        .map(|offset| body_start + offset)
+        .ok_or_else(|| format!("missing {close}"))?;
+    let body = &xml[body_start..end];
+    let mut values = Vec::new();
+    for token in body.split(',') {
+        let value = token
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| format!("non-numeric {axis} line {token:?}"))?;
+        values.push(value);
+    }
+    if values.len() < 2 {
+        return Err(format!("<{axis}Lines> needs at least two values"));
+    }
+    Ok(values)
+}
+
+fn replace_grid_lines(xml: &str, axis: char, values: &[f64]) -> Result<String, String> {
+    let open = format!("<{axis}Lines");
+    let close = format!("</{axis}Lines>");
+    let start = xml
+        .find(&open)
+        .ok_or_else(|| format!("missing <{axis}Lines>"))?;
+    let body_start = xml[start..]
+        .find('>')
+        .map(|offset| start + offset + 1)
+        .ok_or_else(|| format!("malformed <{axis}Lines>"))?;
+    let end = xml[body_start..]
+        .find(&close)
+        .map(|offset| body_start + offset)
+        .ok_or_else(|| format!("missing {close}"))?;
+    let body = values
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(format!(
+        "{}{}{}",
+        &xml[..body_start],
+        body,
+        &xml[end..]
+    ))
+}
+
+/// Build the base and child operator XMLs from the full model.
+///
+/// The base keeps the rho lines up to the split and every second alpha line;
+/// the child starts at the split and keeps all alpha lines (native
+/// `Operator_CylinderMultiGrid::SetGeometryCSX`).
+pub fn split_model_xml(xml: &str, split: GridSplit) -> Result<(String, String), String> {
+    let rho = grid_lines(xml, 'X')?;
+    let alpha = grid_lines(xml, 'Y')?;
+    if split.split_pos == 0 || split.split_pos >= rho.len() {
+        return Err("split position outside the rho lines".to_string());
+    }
+    let base_rho = &rho[..split.split_pos];
+    let base_alpha: Vec<f64> = alpha.iter().copied().step_by(2).collect();
+    let child_rho = &rho[split.split_pos..];
+    if base_alpha.len() < 2 || child_rho.len() < 2 {
+        return Err("split leaves fewer than two lines on one side".to_string());
+    }
+    let base = replace_grid_lines(
+        &replace_grid_lines(xml, 'X', base_rho)?,
+        'Y',
+        &base_alpha,
+    )?;
+    let child = replace_grid_lines(
+        &replace_grid_lines(xml, 'X', child_rho)?,
+        'Y',
+        &alpha,
+    )?;
+    Ok((base, child))
+}
+
+impl MultiGridOperatorPair {
+    pub fn from_xml(xml: &str, plan: &CylinderMultiGridPlan) -> Result<Self, String> {
+        let rho = grid_lines(xml, 'X')?;
+        let alpha = grid_lines(xml, 'Y')?;
+        let closed = (alpha[alpha.len() - 1] - alpha[0] - std::f64::consts::TAU).abs()
+            < 1e-9 * std::f64::consts::TAU.abs().max(1.0);
+        let split = find_grid_split(&rho, plan.split_radius(), alpha.len(), closed)?;
+        let (base_xml, child_xml) = split_model_xml(xml, split)?;
+        let mut base = crate::operator::Operator::new();
+        base.load_csx(&base_xml)
+            .map_err(|error| format!("base operator: {error}"))?;
+        let mut child = crate::operator::Operator::new();
+        child.load_csx(&child_xml)
+            .map_err(|error| format!("child operator: {error}"))?;
+        Ok(Self {
+            plan: plan.clone(),
+            split,
+            base,
+            child,
+        })
+    }
+
+    /// Cells covered by the base and child grids (native `GetNumberCells`).
+    pub fn cell_counts(&self) -> (usize, usize) {
+        let base = &self.base.base.num_lines;
+        let child = &self.child.base.num_lines;
+        (
+            (base[0] * base[1] * base[2]) as usize,
+            (child[0] * child[1] * child[2]) as usize,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +436,36 @@ mod tests {
         assert!(check_extensions(&[(ExtensionKind::Excitation, true)]).is_ok());
         let error = check_extensions(&[(ExtensionKind::Tfsf, false)]).expect_err("TFSF");
         assert!(error.contains("TFSF") && error.contains("base"), "{error}");
+    }
+
+    #[test]
+    fn pair_builds_restricted_base_and_child_operators() {
+        // 13 rho lines, closed alpha with 10 lines (9 after the wrap).
+        let rho = (0..13).map(|v| (v as f64 * 0.1).to_string()).collect::<Vec<_>>().join(",");
+        let alpha = (0..10)
+            .map(|v| (v as f64 * std::f64::consts::TAU / 9.0).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let xml = format!(
+            r#"<ContinuousStructure CoordSystem="1">
+                <RectilinearGrid DeltaUnit="0.001">
+                    <XLines>{rho}</XLines>
+                    <YLines>{alpha}</YLines>
+                    <ZLines>0,1,2,3,4</ZLines>
+                </RectilinearGrid>
+                <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                <Properties/>
+            </ContinuousStructure>"#
+        );
+        let plan = CylinderMultiGridPlan::new(&[0.55]).expect("plan");
+        let pair = MultiGridOperatorPair::from_xml(&xml, &plan).expect("pair");
+        assert_eq!(pair.split.split_pos, 6);
+        assert_eq!(pair.base.base.num_lines[0], 6);
+        assert_eq!(pair.base.base.num_lines[1], 5);
+        assert_eq!(pair.child.base.num_lines[0], 7);
+        // CSXCAD pads a closed alpha mesh with the wrap line.
+        assert_eq!(pair.child.base.num_lines[1], 11);
+        let (base_cells, child_cells) = pair.cell_counts();
+        assert!(base_cells > 0 && child_cells > 0);
     }
 }

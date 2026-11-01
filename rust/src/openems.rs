@@ -962,11 +962,18 @@ impl OpenEMS {
             // Stage 1 validates the native radii/level rules; the engine pair is
             // still pending, so the run stops instead of using a single grid.
             match crate::multigrid::CylinderMultiGridPlan::new(&radii) {
-                Ok(plan) => eprintln!(
-                    "[openEMS] Setup failed: cylindrical multi-grid plan is valid ({} grids, split {}) but the engine is not wired yet (EXCEPTIONS.md E-007)",
-                    plan.grid_count(),
-                    plan.split_radius()
-                ),
+                Ok(plan) => match crate::multigrid::MultiGridOperatorPair::from_xml(&xml, &plan) {
+                    Ok(pair) => {
+                        let (base_cells, child_cells) = pair.cell_counts();
+                        eprintln!(
+                            "[openEMS] Setup failed: cylindrical multi-grid pair built (base {base_cells} cells, child {child_cells} cells, split {}) but the engine is not wired yet (EXCEPTIONS.md E-007)",
+                            pair.split.split_radius
+                        );
+                    }
+                    Err(error) => eprintln!(
+                        "[openEMS] Setup failed: cylindrical multi-grid pair could not be built: {error} (EXCEPTIONS.md E-007)"
+                    ),
+                },
                 Err(error) => eprintln!(
                     "[openEMS] Setup failed: invalid cylindrical multi-grid radii {radii:?}: {error} (EXCEPTIONS.md E-007)"
                 ),
