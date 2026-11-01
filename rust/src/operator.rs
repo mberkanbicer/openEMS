@@ -1353,6 +1353,39 @@ impl Operator {
         }
     }
 
+    /// Zero the EC update coefficients for every rho row below `rows`.
+    ///
+    /// Native `Operator_CylinderMultiGrid::CalcStartStopLines` starts the base
+    /// EC computation at `split_pos - 1`: the overlap rows are never updated by
+    /// the outer grid and are filled by the child-to-base interpolation after
+    /// each time step. Keeping their coefficients at zero makes the base update
+    /// a no-op there, exactly like the native operator.
+    pub fn zero_ec_below_rho(&mut self, rows: usize) {
+        let nx = self.base.num_lines[0] as usize;
+        let ny = self.base.num_lines[1] as usize;
+        let nz = self.base.num_lines[2] as usize;
+        let rows = rows.min(nx);
+        for array in [
+            &mut self.vv_ptr,
+            &mut self.vi_ptr,
+            &mut self.ii_ptr,
+            &mut self.iv_ptr,
+        ] {
+            let Some(field) = array.as_mut() else {
+                continue;
+            };
+            for n in 0..3 {
+                for i in 0..rows {
+                    for j in 0..ny {
+                        for k in 0..nz {
+                            *field.get_mut(n, i, j, k) = FDTD_FLOAT::default();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Compute the FDTD timestep from the EC coefficients.
     /// Mirrors C++ `CalcTimestep`: method 3 selects `Rennings_2` (Var3, the
     /// largest stable step for rectilinear meshes), everything else Var1.
