@@ -68,6 +68,10 @@ struct Args {
     #[arg(long = "numThreads", alias = "num-threads", default_value_t = 0, value_name = "N")]
     num_threads: i32,
 
+    /// Use the GPU update kernels (`--gpu`).
+    #[arg(long = "gpu", action = ArgAction::SetTrue)]
+    gpu: bool,
+
     /// Only run preprocessing; do not simulate.
     #[arg(long = "no-simulation")]
     no_simulation: bool,
@@ -198,6 +202,7 @@ fn main() -> ExitCode {
     } else {
         threads
     });
+    sim.set_gpu(args.gpu);
 
     if args.show_probe_discretization > 0 {
         if let Some(array) = sim.processing_array.as_ref() {

@@ -151,6 +151,49 @@ fn readback(
     Some(values)
 }
 
+fn readback_pair(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    first: &wgpu::Buffer,
+    second: &wgpu::Buffer,
+    bytes: u64,
+) -> Option<(Vec<FDTD_FLOAT>, Vec<FDTD_FLOAT>)> {
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("openems gpu pair readback"),
+        size: 2 * bytes,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("openems gpu pair copy"),
+    });
+    encoder.copy_buffer_to_buffer(first, 0, &staging, 0, bytes);
+    encoder.copy_buffer_to_buffer(second, 0, &staging, bytes, bytes);
+    queue.submit(std::iter::once(encoder.finish()));
+    let slice = staging.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+    receiver.recv().ok()?.ok()?;
+    let data = slice.get_mapped_range().ok()?;
+    let parse = |chunk: &[u8]| {
+        FDTD_FLOAT::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+    };
+    let first_values = data[..bytes as usize]
+        .chunks_exact(4)
+        .map(parse)
+        .collect();
+    let second_values = data[bytes as usize..]
+        .chunks_exact(4)
+        .map(parse)
+        .collect();
+    drop(data);
+    staging.unmap();
+    Some((first_values, second_values))
+}
+
 impl GpuContext {
     /// Create a context on the default high-performance adapter, or `None`
     /// when no adapter is available (the caller must fall back to the CPU).
@@ -657,11 +700,16 @@ impl GpuFields {
 
     pub fn download(&self, volt: &mut [FDTD_FLOAT], curr: &mut [FDTD_FLOAT]) -> Option<()> {
         let bytes = (volt.len() * 4) as u64;
-        let v = readback(&self.device, &self.queue, &self.volt, bytes)?;
-        let c = readback(&self.device, &self.queue, &self.curr, bytes)?;
+        let (v, c) = readback_pair(&self.device, &self.queue, &self.volt, &self.curr, bytes)?;
         volt.copy_from_slice(&v[..volt.len()]);
         curr.copy_from_slice(&c[..curr.len()]);
         Some(())
+    }
+
+    /// Upload host fields into the persistent GPU buffers (host-extension path).
+    pub fn upload(&self, volt: &[FDTD_FLOAT], curr: &[FDTD_FLOAT]) {
+        self.queue.write_buffer(&self.volt, 0, &f32_bytes(volt));
+        self.queue.write_buffer(&self.curr, 0, &f32_bytes(curr));
     }
 }
 

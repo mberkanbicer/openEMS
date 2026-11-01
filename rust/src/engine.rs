@@ -118,15 +118,12 @@ impl Engine {
 
     /// Enable the GPU update path (ADR 0012).
     ///
-    /// The path is only valid without engine extensions: probes, excitations,
-    /// PML and every other extension mutate the CPU field arrays, so a model
-    /// that needs one falls back to the CPU explicitly instead of silently
-    /// running stale GPU state.
+    /// Extension-free models keep the fields resident on the GPU. Models with
+    /// engine extensions use the native host-sync path: the E/H kernels still
+    /// run on the GPU, and the fields are downloaded/uploaded around each
+    /// extension phase so the extension sees the authoritative CPU state.
     #[cfg(feature = "gpu")]
     pub fn enable_gpu(&mut self) -> Result<(), String> {
-        if !self.extensions.is_empty() {
-            return Err("GPU path requires no extensions; CPU fallback".to_string());
-        }
         let context =
             crate::gpu::GpuContext::new().ok_or_else(|| "no GPU adapter available".to_string())?;
         let vv = self.op.get_vv().ok_or("vv coefficients not initialized")?;
@@ -177,6 +174,23 @@ impl Engine {
             )
         };
         gpu.download(volt, curr);
+    }
+
+    /// Upload the CPU fields into the GPU buffers (host-extension path).
+    #[cfg(feature = "gpu")]
+    fn upload_gpu_fields(&self) {
+        let Some(gpu) = self.gpu_fields.as_ref() else {
+            return;
+        };
+        // SAFETY: the slices only live for the upload call, which copies them
+        // into the GPU buffers.
+        let (volt, curr) = unsafe {
+            (
+                std::slice::from_raw_parts(self.volt_ptr.as_ptr(), self.volt_ptr.len()),
+                std::slice::from_raw_parts(self.curr_ptr.as_ptr(), self.curr_ptr.len()),
+            )
+        };
+        gpu.upload(volt, curr);
     }
 
     /// Set the number of worker threads (clamped to at least one).
@@ -566,6 +580,10 @@ impl Engine {
         if self.multi_grid.is_some() {
             return self.iterate_multi_grid(iter_ts);
         }
+        #[cfg(feature = "gpu")]
+        if self.gpu_fields.is_some() && !self.extensions.is_empty() {
+            return self.iterate_ts_gpu_host(iter_ts);
+        }
         for _ in 0..iter_ts {
             // Native `GetNumberOfTimesteps()` is the step index during the
             // update phases; the counter is incremented only at the end.
@@ -592,6 +610,39 @@ impl Engine {
         // per batch instead of every step (extensions force the CPU path).
         #[cfg(feature = "gpu")]
         self.sync_gpu_fields();
+        true
+    }
+
+    /// GPU update path with host engine extensions.
+    ///
+    /// Native `Engine_GPU` runs non-GPU-safe extensions on the host copy and
+    /// synchronizes around the phase. The E/H kernels stay on the device; only
+    /// the extension phases force a transfer.
+    #[cfg(feature = "gpu")]
+    fn iterate_ts_gpu_host(&mut self, iter_ts: u32) -> bool {
+        for _ in 0..iter_ts {
+            let number = self.num_ts;
+            for extension in self.extensions.iter_mut() {
+                extension.set_timestep(number);
+            }
+
+            // The CPU arrays hold the completed previous step.
+            self.do_pre_voltage_updates();
+            self.upload_gpu_fields();
+            self.update_voltages();
+            self.sync_gpu_fields();
+            self.do_post_voltage_updates();
+            self.apply2_voltages();
+
+            self.do_pre_current_updates();
+            self.upload_gpu_fields();
+            self.update_currents();
+            self.sync_gpu_fields();
+            self.do_post_current_updates();
+            self.apply2_current();
+
+            self.num_ts += 1;
+        }
         true
     }
 
@@ -871,24 +922,55 @@ mod tests {
     }
 
     #[cfg(feature = "gpu")]
-    struct NoopExtension;
+    struct BumpExtension;
 
     #[cfg(feature = "gpu")]
-    impl EngineExtension for NoopExtension {
+    impl EngineExtension for BumpExtension {
         fn get_priority(&self) -> i32 {
             0
         }
         fn get_extension_name(&self) -> &'static str {
-            "noop"
+            "bump"
+        }
+        fn do_post_voltage_updates(
+            &mut self,
+            volt: &mut FieldArray,
+            _curr: &FieldArray,
+        ) {
+            *volt.get_mut(0, 1, 1, 1) += 0.5;
         }
     }
 
     #[cfg(feature = "gpu")]
     #[test]
-    fn gpu_falls_back_when_an_extension_is_registered() {
-        let mut engine = Engine::new(Box::new(cavity_operator(8)));
-        engine.add_extension(Box::new(NoopExtension));
-        let error = engine.enable_gpu().expect_err("extension must force the CPU path");
-        assert!(error.contains("CPU fallback"), "{error}");
+    fn gpu_host_extension_path_matches_the_cpu_engine() {
+        let n = 48;
+        let steps = 120;
+        let mut cpu = Engine::new(Box::new(cavity_operator(n)));
+        cpu.add_extension(Box::new(BumpExtension));
+        seed_fields(&mut cpu);
+
+        let mut gpu = Engine::new(Box::new(cavity_operator(n)));
+        gpu.add_extension(Box::new(BumpExtension));
+        seed_fields(&mut gpu);
+        if let Err(reason) = gpu.enable_gpu() {
+            eprintln!("skipping the GPU host-extension test: {reason}");
+            return;
+        }
+
+        let start = std::time::Instant::now();
+        assert!(cpu.iterate_ts(steps));
+        let cpu_time = start.elapsed();
+
+        let start = std::time::Instant::now();
+        assert!(gpu.iterate_ts(steps));
+        let gpu_time = start.elapsed();
+
+        let diff = field_diff(&cpu, &gpu);
+        assert!(diff < 1.0e-5, "CPU/GPU host-extension field diff {diff}");
+        eprintln!(
+            "GPU host extension vs CPU: {n}^3, {steps} steps, E diff {diff:.2e}, CPU {:.2?}, GPU {:.2?}",
+            cpu_time, gpu_time
+        );
     }
 }

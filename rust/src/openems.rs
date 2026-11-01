@@ -105,6 +105,8 @@ pub struct OpenEMS {
     pub engine: String,
     /// Run setup only (`--no-simulation`).
     pub no_simulation: bool,
+    /// Use the GPU update kernels (`--gpu`).
+    pub use_gpu: bool,
     /// Write `openEMS_stats.txt` and `openEMS_run_stats.txt`.
     pub dump_statistics: bool,
     /// Evaluate the energy end criterion on the Nyquist cadence instead of
@@ -160,6 +162,7 @@ impl OpenEMS {
             verbose_level: 0,
             engine: "fastest".to_string(),
             no_simulation: false,
+            use_gpu: false,
             dump_statistics: false,
             exact_end_criteria: false,
             debug_material_dump: false,
@@ -561,6 +564,15 @@ impl OpenEMS {
         if level > 0 {
             println!("[openEMS] Verbose level set to {}", level);
         }
+    }
+
+    /// Request the GPU update path (`--gpu`).
+    ///
+    /// The setup fails when the GPU feature is not compiled in or no adapter is
+    /// available; it never silently runs the CPU path after an explicit GPU
+    /// request.
+    pub fn set_gpu(&mut self, enabled: bool) {
+        self.use_gpu = enabled;
     }
 
     /// Select the engine (`fastest`, `basic`, `sse`, `sse-compressed`,
@@ -1495,6 +1507,27 @@ impl OpenEMS {
                     interpolation,
                 },
             );
+        }
+        #[cfg(feature = "gpu")]
+        if self.use_gpu {
+            if engine.is_multi_grid() {
+                eprintln!(
+                    "[openEMS] Setup failed: the GPU path does not support cylindrical multi-grid"
+                );
+                return false;
+            }
+            if let Err(reason) = engine.enable_gpu() {
+                eprintln!("[openEMS] Setup failed: GPU requested but unavailable: {reason}");
+                return false;
+            }
+            if self.verbose_level > 0 {
+                println!("[openEMS] GPU update path enabled");
+            }
+        }
+        #[cfg(not(feature = "gpu"))]
+        if self.use_gpu {
+            eprintln!("[openEMS] Setup failed: GPU requested but this build has no gpu feature");
+            return false;
         }
         self.fdtd_eng = Some(Box::new(engine));
         self.fdtd_op = None; // operator is owned by the engine
@@ -3147,6 +3180,30 @@ mod pml_setup_tests {
             beta_error < 1.0e-2,
             "multi-grid coax beta differs from k0: {beta_error:.3e}"
         );
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_setup_flag_uses_the_gpu_engine_with_extensions() {
+        if crate::gpu::GpuContext::new().is_none() {
+            eprintln!("skipping the high-level GPU test: no adapter available");
+            return;
+        }
+        let mut sim = OpenEMS::new();
+        let xml = cylindrical_mesh_xml("").replace("zmax=\"PEC\"", "zmax=\"MUR\"");
+        sim.set_csx_xml(xml);
+        sim.set_gpu(true);
+        assert!(sim.setup_fdtd(), "GPU setup with a Mur extension");
+        let engine = sim.fdtd_eng.as_ref().expect("engine");
+        assert!(engine.gpu_fields.is_some(), "the GPU buffers must be active");
+        assert!(
+            engine
+                .extensions
+                .iter()
+                .any(|extension| extension.get_extension_name().contains("Mur")),
+            "the Mur extension is registered"
+        );
+        assert!(sim.run_fdtd(), "the host-sync GPU run completes");
     }
 
     #[test]
