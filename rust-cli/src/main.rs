@@ -123,6 +123,7 @@ fn show_options() {
     println!("  --engine arg                  Engine type: fastest, basic, sse, sse-compressed,");
     println!("                                multithreaded (default: fastest)");
     println!("  --numThreads arg              Force the number of worker threads (0 = automatic)");
+    println!("  --gpu                         Use the GPU update kernels (requires the 'gpu' build)");
     println!("  --no-simulation               Only run preprocessing; do not simulate");
     println!("  --dump-statistics             Write 'openEMS_run_stats.txt' and 'openEMS_stats.txt'");
     println!("  --exact-endcriteria           Evaluate the end criterion on a fixed schedule");
