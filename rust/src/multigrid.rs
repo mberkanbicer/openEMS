@@ -208,6 +208,135 @@ pub fn check_extensions(extensions: &[(ExtensionKind, bool)]) -> Result<(), Stri
 }
 
 
+
+/// One base alpha index mapped to two child samples with weights
+/// (native `m_interpol_*_2p/2pp` tables).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InterpolationPair {
+    pub pos_p: usize,
+    pub pos_pp: usize,
+    pub weight_p: f64,
+    pub weight_pp: f64,
+}
+
+/// Child-to-base interpolation tables for the alpha direction
+/// (native `Operator_CylinderMultiGrid::SetupInterpolation`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlphaInterpolation {
+    pub voltage: Vec<InterpolationPair>,
+    pub current: Vec<InterpolationPair>,
+}
+
+fn alpha_line(lines: &[f64], index: usize, dual: bool) -> f64 {
+    if !dual {
+        lines[index]
+    } else if index + 1 < lines.len() {
+        0.5 * (lines[index] + lines[index + 1])
+    } else {
+        lines[index] + 0.5 * (lines[index] - lines[index - 1])
+    }
+}
+
+fn alpha_delta(lines: &[f64], index: usize, dual: bool) -> f64 {
+    if !dual {
+        if index + 1 < lines.len() {
+            lines[index + 1] - lines[index]
+        } else {
+            lines[index] - lines[index - 1]
+        }
+    } else if index == 0 {
+        lines[1] - lines[0]
+    } else {
+        alpha_line(lines, index, true) - alpha_line(lines, index - 1, true)
+    }
+}
+
+impl AlphaInterpolation {
+    /// Build the native tables. `base` is the coarse operator's alpha mesh and
+    /// `child` the fine one; `closed` marks a full 2*pi range.
+    pub fn new(base: &[f64], child: &[f64], closed: bool) -> Result<Self, String> {
+        if base.len() < 2 || child.len() < 3 {
+            return Err("interpolation needs at least two base and three child lines".to_string());
+        }
+        let mut voltage = Vec::with_capacity(base.len());
+        let mut current = Vec::with_capacity(base.len());
+        for a_n in 0..base.len() {
+            let is_odd = a_n % 2;
+            let is_even = 1 - is_odd;
+
+            let mut i_p = a_n / 2;
+            let mut i_pp = a_n / 2 + is_odd;
+            if !closed && a_n == 1 {
+                i_p = 2;
+            }
+            if !closed && a_n + 2 == base.len() {
+                i_pp = a_n / 2 - 1;
+            }
+            let i_p = i_p.min(child.len() - 1);
+            let i_pp = i_pp.min(child.len() - 1);
+            let (i_wp, i_wpp) = if i_p == i_pp {
+                let ratio = alpha_delta(base, a_n, true) / alpha_delta(child, i_p, true);
+                (ratio, ratio)
+            } else {
+                let line_p = alpha_line(child, i_p, false);
+                let line_pp = alpha_line(child, i_pp, false);
+                let this_line = alpha_line(base, a_n, false);
+                let base_delta = alpha_delta(base, a_n, true);
+                (
+                    (line_pp - this_line) / (line_pp - line_p)
+                        * base_delta / alpha_delta(child, i_p, true),
+                    (this_line - line_p) / (line_pp - line_p)
+                        * base_delta / alpha_delta(child, i_pp, true),
+                )
+            };
+            current.push(InterpolationPair {
+                pos_p: i_p,
+                pos_pp: i_pp,
+                weight_p: i_wp,
+                weight_pp: i_wpp,
+            });
+
+            let mut v_p = a_n / 2;
+            let mut v_pp = (a_n / 2 + is_odd) as isize - is_even as isize;
+            if a_n == 0 && closed {
+                v_pp = child.len() as isize - 3;
+            } else if a_n == 0 && !closed {
+                v_pp = 1;
+            }
+            if !closed && a_n + 2 == base.len() {
+                v_pp = a_n as isize / 2 - 1;
+            }
+            if !closed && a_n + 1 == base.len() {
+                v_p = 0;
+                v_pp = 0;
+            }
+            let v_p = v_p.min(child.len() - 1);
+            let v_pp = v_pp.max(0).min(child.len() as isize - 1) as usize;
+            let (v_wp, v_wpp) = if v_p == v_pp {
+                (0.0, 0.0)
+            } else {
+                let line_p = alpha_line(child, v_p, true);
+                let line_pp = alpha_line(child, v_pp, true);
+                let this_line = alpha_line(base, a_n, true);
+                let base_delta = alpha_delta(base, a_n, false);
+                (
+                    (line_pp - this_line) / (line_pp - line_p)
+                        * base_delta / alpha_delta(child, v_p, false),
+                    (this_line - line_p) / (line_pp - line_p)
+                        * base_delta / alpha_delta(child, v_pp, false),
+                )
+            };
+            voltage.push(InterpolationPair {
+                pos_p: v_p,
+                pos_pp: v_pp,
+                weight_p: v_wp,
+                weight_pp: v_wpp,
+            });
+        }
+        Ok(Self { voltage, current })
+    }
+}
+
 /// A base/child cylindrical operator pair built from one CSXCAD model.
 ///
 /// Stage 2 constructs and validates the two native-style operator instances.
@@ -467,5 +596,26 @@ mod tests {
         assert_eq!(pair.child.base.num_lines[1], 11);
         let (base_cells, child_cells) = pair.cell_counts();
         assert!(base_cells > 0 && child_cells > 0);
+    }
+
+    #[test]
+    fn alpha_interpolation_tables_match_the_native_positions() {
+        let base: Vec<f64> = (0..5).map(|i| i as f64 * 2.0).collect();
+        let child: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let table = AlphaInterpolation::new(&base, &child, true).expect("table");
+        assert_eq!(table.voltage.len(), 5);
+        assert_eq!(table.current.len(), 5);
+        // Current: p = a/2, pp = a/2 + odd.
+        assert_eq!(table.current[0].pos_p, 0);
+        assert_eq!(table.current[0].pos_pp, 0);
+        assert_eq!(table.current[1].pos_p, 0);
+        assert_eq!(table.current[1].pos_pp, 1);
+        // Voltage: pp = a/2 + odd - even; index 0 wraps to child_len-3.
+        assert_eq!(table.voltage[0].pos_pp, 7);
+        assert_eq!(table.voltage[1].pos_pp, 1);
+        for pair in table.voltage.iter().chain(table.current.iter()) {
+            assert!(pair.weight_p.is_finite() && pair.weight_pp.is_finite());
+            assert!(pair.pos_p < child.len() && pair.pos_pp < child.len());
+        }
     }
 }
