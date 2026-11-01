@@ -275,6 +275,11 @@ fn logical_alpha_count(lines: &[f64], closed: bool) -> usize {
     }
 }
 
+/// Public form of [`logical_alpha_count`] for the high-level setup.
+pub fn physical_alpha_count(lines: &[f64], closed: bool) -> usize {
+    logical_alpha_count(lines, closed)
+}
+
 impl AlphaInterpolation {
     /// Build the native tables from the base and child azimuthal lines.
     ///
@@ -662,13 +667,10 @@ impl MultiGridOperatorPair {
 /// barriers. The updates never read the other engine's fields during a phase,
 /// so running the phases sequentially gives the same field results.
 pub struct MultiGridEngine {
-    pub base: crate::engine::Engine,
-    pub inner: crate::engine::Engine,
+    /// Base engine with the full mesh and the inner engine attached.
+    pub engine: crate::engine::Engine,
     pub split_pos: usize,
     pub interpolation: AlphaInterpolation,
-    closed_alpha: bool,
-    /// Physical base alpha lines (the closed-mesh padding plane is excluded).
-    alpha_count: usize,
 }
 
 impl MultiGridEngine {
@@ -806,150 +808,81 @@ impl MultiGridEngine {
         if let Some(extension) = child_extension {
             inner_engine.add_extension(Box::new(extension));
         }
+        let link = crate::engine::MultiGridLink {
+            split_pos,
+            alpha_count,
+            interpolation: interpolation.clone(),
+        };
+        base_engine.enable_multi_grid(inner_engine, link);
 
         Ok(Self {
-            base: base_engine,
-            inner: inner_engine,
+            engine: base_engine,
             split_pos,
             interpolation,
-            closed_alpha: closed,
-            alpha_count,
         })
     }
 
     /// Advance the two engines by the requested number of native time steps.
     pub fn iterate_ts(&mut self, steps: u32) -> bool {
-        let mut ok = true;
-        for _ in 0..steps {
-            let number = self.base.num_ts;
-            for extension in self.base.extensions.iter_mut() {
-                extension.set_timestep(number);
-            }
-            for extension in self.inner.extensions.iter_mut() {
-                extension.set_timestep(number);
-            }
-
-            // Voltage half-step: both engines, then the interface sync.
-            self.base.do_pre_voltage_updates();
-            self.base.update_voltages();
-            self.base.do_post_voltage_updates();
-            self.base.apply2_voltages();
-
-            self.inner.do_pre_voltage_updates();
-            self.inner.update_voltages();
-            self.inner.do_post_voltage_updates();
-            self.inner.apply2_voltages();
-
-            self.sync_voltages();
-
-            // Current half-step.
-            self.base.do_pre_current_updates();
-            self.base.update_currents();
-            self.base.do_post_current_updates();
-            self.base.apply2_current();
-
-            self.inner.do_pre_current_updates();
-            self.inner.update_currents();
-            self.inner.do_post_current_updates();
-            self.inner.apply2_current();
-
-            if self.sync_currents().is_err() {
-                ok = false;
-            }
-
-            // End of step: fill the base overlap from the child.
-            for rho in 0..self.split_pos - 1 {
-                if self.interpolate_row(rho, true).is_err() {
-                    ok = false;
-                }
-            }
-            for rho in 0..self.split_pos.saturating_sub(2) {
-                if self.interpolate_row(rho, false).is_err() {
-                    ok = false;
-                }
-            }
-
-            self.base.num_ts += 1;
-            self.inner.num_ts += 1;
-        }
-        ok
+        self.engine.iterate_ts(steps)
     }
 
     /// Native `Engine_Ext_CylinderMultiGrid::SyncVoltages`.
     pub fn sync_voltages(&mut self) {
-        if self.split_pos == 0 {
-            return;
-        }
-        let rho = self.split_pos - 1;
-        let nz = self.base.num_lines[2].min(self.inner.num_lines[2]);
-        let inner_ny = self.inner.num_lines[1];
-        // Native loops `a < numLines[1] - 1`, which skips the duplicated seam
-        // plane of a closed mesh.
-        for a in (0..self.alpha_count.saturating_sub(1)).step_by(2) {
-            let h = a / 2;
-            if h >= inner_ny {
-                break;
-            }
-            let a_next = (a + 1).min(self.alpha_count - 1);
-            for z in 0..nz {
-                // Native `SyncVoltages` zeroes the normal (rho) component of
-                // the child at the interface and copies the tangential ones.
-                *self.inner.volt_ptr.get_mut(0, rho, h, z) = 0.0;
-                *self.inner.volt_ptr.get_mut(2, rho, h, z) =
-                    *self.base.volt_ptr.get(2, rho, a, z);
-                *self.inner.volt_ptr.get_mut(1, rho, h, z) =
-                    *self.base.volt_ptr.get(1, rho, a, z)
-                        + *self.base.volt_ptr.get(1, rho, a_next, z);
-            }
-        }
+        let link = self
+            .engine
+            .multi_grid
+            .clone()
+            .expect("multi-grid link missing");
+        self.engine.multi_grid_sync_voltages(&link);
     }
 
     /// Native `Engine_Ext_CylinderMultiGrid::SyncCurrents`.
     pub fn sync_currents(&mut self) -> Result<(), String> {
-        if self.split_pos < 2 {
-            return Ok(());
-        }
-        let rho = self.split_pos - 2;
-        self.interpolate_row(rho, false)
+        let link = self
+            .engine
+            .multi_grid
+            .clone()
+            .ok_or("multi-grid link missing")?;
+        self.engine.multi_grid_sync_currents(&link)
     }
 
     /// Interpolate one rho row of the child into the base overlap.
     pub fn interpolate_row(&mut self, rho: usize, voltage: bool) -> Result<(), String> {
-        let nz = self.base.num_lines[2].min(self.inner.num_lines[2]);
-        for z in 0..nz {
-            if voltage {
-                interpolate_child_to_base(
-                    &mut self.base.volt_ptr,
-                    &self.inner.volt_ptr,
-                    rho,
-                    z,
-                    self.alpha_count,
-                    &self.interpolation,
-                    true,
-                )?;
-            } else {
-                interpolate_child_to_base(
-                    &mut self.base.curr_ptr,
-                    &self.inner.curr_ptr,
-                    rho,
-                    z,
-                    self.alpha_count,
-                    &self.interpolation,
-                    false,
-                )?;
-            }
-        }
-        Ok(())
+        let link = self
+            .engine
+            .multi_grid
+            .clone()
+            .ok_or("multi-grid link missing")?;
+        self.engine.multi_grid_interpolate_row(&link, rho, voltage)
+    }
+
+    /// Base engine (full mesh).
+    pub fn base(&self) -> &crate::engine::Engine {
+        &self.engine
+    }
+
+    pub fn base_mut(&mut self) -> &mut crate::engine::Engine {
+        &mut self.engine
+    }
+
+    /// Inner (child) engine.
+    pub fn inner(&self) -> Option<&crate::engine::Engine> {
+        self.engine.inner.as_deref()
+    }
+
+    pub fn inner_mut(&mut self) -> Option<&mut crate::engine::Engine> {
+        self.engine.inner.as_deref_mut()
     }
 
     /// Whether the base mesh closes the full azimuth.
     pub fn closed_alpha(&self) -> bool {
-        self.closed_alpha
+        self.engine.op.closed_alpha()
     }
 
     /// Timestep shared by both grids.
     pub fn timestep(&self) -> f64 {
-        self.base.op.get_timestep()
+        self.engine.op.get_timestep()
     }
 }
 
@@ -1191,11 +1124,11 @@ mod tests {
         let split_pos = engine.split_pos;
         let rho_row = split_pos - 1;
 
-        for a in 0..engine.base.num_lines[1] {
-            for k in 0..engine.base.num_lines[2] {
-                *engine.base.volt_ptr.get_mut(0, rho_row, a, k) = 10.0 + a as f32;
-                *engine.base.volt_ptr.get_mut(1, rho_row, a, k) = 100.0 + a as f32;
-                *engine.base.volt_ptr.get_mut(2, rho_row, a, k) = 1000.0 + a as f32;
+        for a in 0..engine.base().num_lines[1] {
+            for k in 0..engine.base().num_lines[2] {
+                *engine.base_mut().volt_ptr.get_mut(0, rho_row, a, k) = 10.0 + a as f32;
+                *engine.base_mut().volt_ptr.get_mut(1, rho_row, a, k) = 100.0 + a as f32;
+                *engine.base_mut().volt_ptr.get_mut(2, rho_row, a, k) = 1000.0 + a as f32;
             }
         }
         engine.sync_voltages();
@@ -1203,15 +1136,15 @@ mod tests {
         let h = 2usize;
         let a = 2 * h;
         let k = 1usize;
-        assert_eq!(*engine.inner.volt_ptr.get(0, rho_row, h, k), 0.0);
+        assert_eq!(*engine.inner().unwrap().volt_ptr.get(0, rho_row, h, k), 0.0);
         assert_eq!(
-            *engine.inner.volt_ptr.get(2, rho_row, h, k),
-            *engine.base.volt_ptr.get(2, rho_row, a, k)
+            *engine.inner().unwrap().volt_ptr.get(2, rho_row, h, k),
+            *engine.base().volt_ptr.get(2, rho_row, a, k)
         );
         assert_eq!(
-            *engine.inner.volt_ptr.get(1, rho_row, h, k),
-            *engine.base.volt_ptr.get(1, rho_row, a, k)
-                + *engine.base.volt_ptr.get(1, rho_row, a + 1, k)
+            *engine.inner().unwrap().volt_ptr.get(1, rho_row, h, k),
+            *engine.base().volt_ptr.get(1, rho_row, a, k)
+                + *engine.base().volt_ptr.get(1, rho_row, a + 1, k)
         );
     }
 
@@ -1290,20 +1223,26 @@ mod tests {
         if let Some(extension) = reference_extension {
             reference_engine.add_extension(Box::new(extension));
         }
-        assert_eq!(reference_engine.num_lines, multi.base.num_lines);
+        assert_eq!(reference_engine.num_lines, multi.base().num_lines);
 
-        seed_tem(
-            &mut multi.base.volt_ptr,
-            &mut multi.base.curr_ptr,
-            multi.base.op.as_ref(),
-            multi.base.num_lines,
-        );
-        seed_tem(
-            &mut multi.inner.volt_ptr,
-            &mut multi.inner.curr_ptr,
-            multi.inner.op.as_ref(),
-            multi.inner.num_lines,
-        );
+        {
+            let base = multi.base_mut();
+            seed_tem(
+                &mut base.volt_ptr,
+                &mut base.curr_ptr,
+                base.op.as_ref(),
+                base.num_lines,
+            );
+        }
+        {
+            let inner = multi.inner_mut().expect("inner engine");
+            seed_tem(
+                &mut inner.volt_ptr,
+                &mut inner.curr_ptr,
+                inner.op.as_ref(),
+                inner.num_lines,
+            );
+        }
         seed_tem(
             &mut reference_engine.volt_ptr,
             &mut reference_engine.curr_ptr,
@@ -1316,7 +1255,7 @@ mod tests {
         multi.iterate_ts(5);
         reference_engine.iterate_ts(5);
 
-        let [nx, ny, nz] = multi.base.num_lines;
+        let [nx, ny, nz] = multi.base().num_lines;
         let mut max_volt_ref: f64 = 0.0;
         let mut max_volt_diff: f64 = 0.0;
         let mut max_curr_ref: f64 = 0.0;
@@ -1325,11 +1264,11 @@ mod tests {
             for i in 0..nx {
                 for j in 0..ny {
                     for k in 0..nz {
-                        let a = *multi.base.volt_ptr.get(n, i, j, k) as f64;
+                        let a = *multi.base().volt_ptr.get(n, i, j, k) as f64;
                         let b = *reference_engine.volt_ptr.get(n, i, j, k) as f64;
                         max_volt_ref = max_volt_ref.max(b.abs());
                         max_volt_diff = max_volt_diff.max((a - b).abs());
-                        let a = *multi.base.curr_ptr.get(n, i, j, k) as f64;
+                        let a = *multi.base().curr_ptr.get(n, i, j, k) as f64;
                         let b = *reference_engine.curr_ptr.get(n, i, j, k) as f64;
                         max_curr_ref = max_curr_ref.max(b.abs());
                         max_curr_diff = max_curr_diff.max((a - b).abs());
@@ -1365,7 +1304,7 @@ mod tests {
             }
             best_k
         };
-        let multi_peak = peak(&multi.base);
+        let multi_peak = peak(multi.base());
         let reference_peak = peak(&reference_engine);
         println!(
             "multi-grid TEM peak: multi z={multi_peak}, reference z={reference_peak}"
@@ -1383,7 +1322,7 @@ mod tests {
         let mut acc_multi = 0.0f64;
         let mut acc_reference = 0.0f64;
         for i in 1..nx {
-            acc_multi += *multi.base.volt_ptr.get(0, i, 0, multi_peak) as f64;
+            acc_multi += *multi.base().volt_ptr.get(0, i, 0, multi_peak) as f64;
             acc_reference += *reference_engine.volt_ptr.get(0, i, 0, multi_peak) as f64;
             volts_multi.push(acc_multi);
             volts_reference.push(acc_reference);
@@ -1402,7 +1341,7 @@ mod tests {
         );
 
         // The inner engine advanced with the same timestep.
-        assert_eq!(multi.inner.num_ts, 5);
-        assert!(multi.inner.volt_ptr.get(0, 1, 1, 1).is_finite());
+        assert_eq!(multi.inner().expect("inner").num_ts, 5);
+        assert!(multi.inner().expect("inner").volt_ptr.get(0, 1, 1, 1).is_finite());
     }
 }

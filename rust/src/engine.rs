@@ -55,6 +55,16 @@ impl<T> SendPtr<T> {
     }
 }
 
+/// Interface data of a cylindrical multi-grid link
+/// (native `Operator_CylinderMultiGrid` tables plus the split position).
+#[derive(Clone, Debug)]
+pub struct MultiGridLink {
+    pub split_pos: usize,
+    /// Physical base azimuthal lines (the closed-mesh padding plane is excluded).
+    pub alpha_count: usize,
+    pub interpolation: crate::multigrid::AlphaInterpolation,
+}
+
 /// The basic FDTD engine.
 /// Time-steps the equivalent-circuit coefficients over the field arrays.
 pub struct Engine {
@@ -68,6 +78,10 @@ pub struct Engine {
     pub extensions: Vec<Box<dyn EngineExtension>>,
     /// Number of worker threads used by the update kernels (1 = serial).
     pub num_threads: usize,
+    /// Inner (child) engine of a cylindrical multi-grid.
+    pub inner: Option<Box<Engine>>,
+    /// Split/interpolation data shared by the base and inner engines.
+    pub multi_grid: Option<MultiGridLink>,
     /// Persistent GPU field/coefficient buffers (ADR 0012).
     #[cfg(feature = "gpu")]
     pub gpu_fields: Option<crate::gpu::GpuFields>,
@@ -95,6 +109,8 @@ impl Engine {
             num_ts: 0,
             extensions: Vec::new(),
             num_threads: 1,
+            inner: None,
+            multi_grid: None,
             #[cfg(feature = "gpu")]
             gpu_fields: None,
         }
@@ -530,8 +546,26 @@ impl Engine {
         }
     }
 
+    /// Attach the inner (child) engine and the interface tables.
+    ///
+    /// The base engine keeps the full mesh, so probes and dumps can sample it
+    /// unchanged; the overlap rows are filled from the child every step.
+    pub fn enable_multi_grid(&mut self, mut inner: Engine, link: MultiGridLink) {
+        inner.set_number_of_threads(self.num_threads as i32);
+        self.inner = Some(Box::new(inner));
+        self.multi_grid = Some(link);
+    }
+
+    /// True for a base engine that drives an inner multi-grid engine.
+    pub fn is_multi_grid(&self) -> bool {
+        self.multi_grid.is_some()
+    }
+
     /// Iterate a number of timesteps.
     pub fn iterate_ts(&mut self, iter_ts: u32) -> bool {
+        if self.multi_grid.is_some() {
+            return self.iterate_multi_grid(iter_ts);
+        }
         for _ in 0..iter_ts {
             // Native `GetNumberOfTimesteps()` is the step index during the
             // update phases; the counter is incremented only at the end.
@@ -559,6 +593,151 @@ impl Engine {
         #[cfg(feature = "gpu")]
         self.sync_gpu_fields();
         true
+    }
+
+    /// Native `Engine_CylinderMultiGrid` + `Engine_Ext_CylinderMultiGrid`
+    /// barrier order, run sequentially (the phases never read the other
+    /// engine's fields, so the ordering is equivalent).
+    fn iterate_multi_grid(&mut self, iter_ts: u32) -> bool {
+        let Some(link) = self.multi_grid.clone() else {
+            return false;
+        };
+        if self.inner.is_none() {
+            return false;
+        }
+        let mut ok = true;
+        for _ in 0..iter_ts {
+            let number = self.num_ts;
+            for extension in self.extensions.iter_mut() {
+                extension.set_timestep(number);
+            }
+            if let Some(inner) = self.inner.as_mut() {
+                for extension in inner.extensions.iter_mut() {
+                    extension.set_timestep(number);
+                }
+            }
+
+            // Voltage half-step: both engines, then the interface sync.
+            self.do_pre_voltage_updates();
+            self.update_voltages();
+            self.do_post_voltage_updates();
+            self.apply2_voltages();
+            if let Some(inner) = self.inner.as_mut() {
+                inner.do_pre_voltage_updates();
+                inner.update_voltages();
+                inner.do_post_voltage_updates();
+                inner.apply2_voltages();
+            }
+            self.multi_grid_sync_voltages(&link);
+
+            // Current half-step.
+            self.do_pre_current_updates();
+            self.update_currents();
+            self.do_post_current_updates();
+            self.apply2_current();
+            if let Some(inner) = self.inner.as_mut() {
+                inner.do_pre_current_updates();
+                inner.update_currents();
+                inner.do_post_current_updates();
+                inner.apply2_current();
+            }
+            if self.multi_grid_sync_currents(&link).is_err() {
+                ok = false;
+            }
+
+            // End of step: fill the base overlap from the child.
+            for rho in 0..link.split_pos.saturating_sub(1) {
+                if self.multi_grid_interpolate_row(&link, rho, true).is_err() {
+                    ok = false;
+                }
+            }
+            for rho in 0..link.split_pos.saturating_sub(2) {
+                if self.multi_grid_interpolate_row(&link, rho, false).is_err() {
+                    ok = false;
+                }
+            }
+
+            self.num_ts += 1;
+            if let Some(inner) = self.inner.as_mut() {
+                inner.num_ts += 1;
+            }
+        }
+        ok
+    }
+
+    /// Native `Engine_Ext_CylinderMultiGrid::SyncVoltages`.
+    pub fn multi_grid_sync_voltages(&mut self, link: &MultiGridLink) {
+        if link.split_pos == 0 {
+            return;
+        }
+        let rho = link.split_pos - 1;
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let nz = self.num_lines[2].min(inner.num_lines[2]);
+        let inner_ny = inner.num_lines[1];
+        for a in (0..link.alpha_count.saturating_sub(1)).step_by(2) {
+            let h = a / 2;
+            if h >= inner_ny {
+                break;
+            }
+            let a_next = (a + 1).min(link.alpha_count - 1);
+            for z in 0..nz {
+                // Native zeroes the normal (rho) component and copies the
+                // tangential components from the base.
+                *inner.volt_ptr.get_mut(0, rho, h, z) = 0.0;
+                *inner.volt_ptr.get_mut(2, rho, h, z) =
+                    *self.volt_ptr.get(2, rho, a, z);
+                *inner.volt_ptr.get_mut(1, rho, h, z) =
+                    *self.volt_ptr.get(1, rho, a, z)
+                        + *self.volt_ptr.get(1, rho, a_next, z);
+            }
+        }
+    }
+
+    /// Native `Engine_Ext_CylinderMultiGrid::SyncCurrents`.
+    pub fn multi_grid_sync_currents(&mut self, link: &MultiGridLink) -> Result<(), String> {
+        if link.split_pos < 2 {
+            return Ok(());
+        }
+        self.multi_grid_interpolate_row(link, link.split_pos - 2, false)
+    }
+
+    /// Interpolate one child rho row into the base overlap.
+    pub fn multi_grid_interpolate_row(
+        &mut self,
+        link: &MultiGridLink,
+        rho: usize,
+        voltage: bool,
+    ) -> Result<(), String> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Err("multi-grid base has no inner engine".to_string());
+        };
+        let nz = self.num_lines[2].min(inner.num_lines[2]);
+        for z in 0..nz {
+            if voltage {
+                crate::multigrid::interpolate_child_to_base(
+                    &mut self.volt_ptr,
+                    &inner.volt_ptr,
+                    rho,
+                    z,
+                    link.alpha_count,
+                    &link.interpolation,
+                    true,
+                )?;
+            } else {
+                crate::multigrid::interpolate_child_to_base(
+                    &mut self.curr_ptr,
+                    &inner.curr_ptr,
+                    rho,
+                    z,
+                    link.alpha_count,
+                    &link.interpolation,
+                    false,
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 

@@ -942,6 +942,107 @@ impl OpenEMS {
     /// Mirrors C++ `SetupFDTD` (operator setup portion).
     ///
     /// A CSXCAD geometry is required. There is no fabricated fallback grid.
+    /// Native `Operator::AddExtension` list for one operator side.
+    fn operator_extension_registry(&self, op: &Operator) -> OperatorExtensionRegistry {
+        // Build every operator-side extension through one ordered registry,
+        // mirroring `Operator::AddExtension` + `BuildExtension`. Physics that
+        // needs to rewrite the operator happens here, after the boundary
+        // conditions and before the operator is moved into the engine.
+        let mut registry = OperatorExtensionRegistry::new();
+        if let Some(signal) = self.excitation.as_deref() {
+            let period = signal.signal_period();
+            if period > 0 {
+                registry.add(Box::new(SteadyStateOperatorExtension { period_ts: period }));
+            }
+            registry.add(Box::new(ExcitationOperatorExtension {
+                signal: Arc::new(signal.clone()),
+            }));
+            registry.add(Box::new(TfsfOperatorExtension {
+                signal: Arc::new(signal.clone()),
+            }));
+        }
+        if op.base.m_bc.iter().any(|&boundary| boundary == BC_PML) {
+            registry.add(Box::new(UpmlOperatorExtension {
+                pml_size: self.pml_size,
+            }));
+        }
+        // Conducting sheets need the boundary-layer sizes: edges inside a Mur
+        // or PML layer fall back to PEC, as in the native operator.
+        let has_conducting_sheet = op.structure.as_ref().is_some_and(|structure| {
+            (0..structure.property_count()).any(|index| {
+                structure
+                    .property_by_index(index)
+                    .is_some_and(|property| property.conducting_sheet().is_some())
+            })
+        });
+        if has_conducting_sheet {
+            let mut boundary_size = [0u32; 6];
+            for face in 0..6 {
+                if op.base.m_bc[face] == BC_PML {
+                    boundary_size[face] = self.pml_size[face];
+                } else if op.base.m_bc[face] == BC_MUR {
+                    boundary_size[face] = 1;
+                }
+            }
+            let f_max = self
+                .excitation
+                .as_ref()
+                .map(|signal| signal.f_max)
+                .unwrap_or(0.0);
+            registry.add(Box::new(ConductingSheetOperatorExtension {
+                f_max,
+                boundary_size,
+            }));
+        }
+        // Lorentz and Debye materials need the finished EC coefficients to size
+        // their Drude/Lorentz elements. Native adds Lorentz first.
+        let has_lorentz = op.structure.as_ref().is_some_and(|structure| {
+            (0..structure.property_count()).any(|index| {
+                structure
+                    .property_by_index(index)
+                    .is_some_and(|property| property.lorentz_material().is_some())
+            })
+        });
+        if has_lorentz {
+            registry.add(Box::new(LorentzOperatorExtension));
+        }
+        let has_debye = op.structure.as_ref().is_some_and(|structure| {
+            (0..structure.property_count()).any(|index| {
+                structure
+                    .property_by_index(index)
+                    .is_some_and(|property| property.debye_material().is_some())
+            })
+        });
+        if has_debye {
+            registry.add(Box::new(DebyeOperatorExtension));
+        }
+        // Lumped RLC loads rewrite the EC capacitance/conductance and add an
+        // ADE that runs after the sheet model, as in the native setup order.
+        let has_lumped_element = op.structure.as_ref().is_some_and(|structure| {
+            (0..structure.property_count()).any(|index| {
+                structure
+                    .property_by_index(index)
+                    .is_some_and(|property| property.lumped_element().is_some())
+            })
+        });
+        if has_lumped_element {
+            let f_max = self
+                .excitation
+                .as_ref()
+                .map(|signal| signal.f_max)
+                .unwrap_or(0.0);
+            registry.add(Box::new(LumpedRLCOperatorExtension { f_max }));
+        }
+        registry.add(Box::new(MurOperatorExtension {
+            phase_velocity: self.mur_v_ph,
+        }));
+        registry
+    }
+
+    /// Initialize the FDTD operator from a CSX geometry.
+    /// Mirrors C++ `SetupFDTD` (operator setup portion).
+    ///
+    /// A CSXCAD geometry is required. There is no fabricated fallback grid.
     pub fn setup_fdtd(&mut self) -> bool {
         let Some(xml) = self.csx_xml.clone() else {
             eprintln!("[openEMS] Setup failed: no CSXCAD geometry was provided");
@@ -949,37 +1050,26 @@ impl OpenEMS {
         };
         // Native `ParseFDTDSetup`: solver settings live in the `<FDTD>` element.
         let options = crate::fdtd_options::parse_fdtd_options(&xml);
-        // Options that native accepts but this port does not implement must
-        // fail loudly instead of silently changing the physics. See
-        // `docs/migration/EXCEPTIONS.md` E-007 (cylindrical multi-grid).
+        // Cylindrical multi-grid (E-007): validate the native radii/level rules
+        // now; the child operator and engine are built after the base setup.
         let requested_multi_grid = options
             .multi_grid
             .as_ref()
             .filter(|radii| !radii.is_empty())
             .cloned()
             .or_else(|| (!self.multi_grid.is_empty()).then(|| self.multi_grid.clone()));
-        if let Some(radii) = requested_multi_grid {
-            // Stage 1 validates the native radii/level rules; the engine pair is
-            // still pending, so the run stops instead of using a single grid.
-            match crate::multigrid::CylinderMultiGridPlan::new(&radii) {
-                Ok(plan) => match crate::multigrid::MultiGridOperatorPair::from_xml(&xml, &plan) {
-                    Ok(pair) => {
-                        let (base_cells, child_cells) = pair.cell_counts();
-                        eprintln!(
-                            "[openEMS] Setup failed: cylindrical multi-grid pair built (base {base_cells} cells, child {child_cells} cells, split {}) but the engine is not wired yet (EXCEPTIONS.md E-007)",
-                            pair.split.split_radius
-                        );
-                    }
-                    Err(error) => eprintln!(
-                        "[openEMS] Setup failed: cylindrical multi-grid pair could not be built: {error} (EXCEPTIONS.md E-007)"
-                    ),
-                },
-                Err(error) => eprintln!(
-                    "[openEMS] Setup failed: invalid cylindrical multi-grid radii {radii:?}: {error} (EXCEPTIONS.md E-007)"
-                ),
-            }
-            return false;
-        }
+        let multi_grid_plan = match requested_multi_grid {
+            Some(radii) => match crate::multigrid::CylinderMultiGridPlan::new(&radii) {
+                Ok(plan) => Some(plan),
+                Err(error) => {
+                    eprintln!(
+                        "[openEMS] Setup failed: invalid cylindrical multi-grid radii {radii:?}: {error}"
+                    );
+                    return false;
+                }
+            },
+            None => None,
+        };
         if let Some(value) = options.nr_ts {
             self.nr_ts = value;
         }
@@ -1158,6 +1248,103 @@ impl OpenEMS {
             self.write_debug_dumps(&op);
         }
 
+        // Cylindrical multi-grid: build the inner operator and its interface
+        // tables before the extension registries, so both sides get their own
+        // geometry-dependent extensions (native `SetGeometryCSX`).
+        if multi_grid_plan.is_some() && !op.is_cylindrical() {
+            eprintln!(
+                "[openEMS] Setup failed: cylindrical multi-grid requires CoordSystem=\"1\" (cylindrical)"
+            );
+            return false;
+        }
+        let mut multi_grid_child: Option<(
+            Operator,
+            crate::multigrid::GridSplit,
+            crate::multigrid::AlphaInterpolation,
+            usize,
+        )> = None;
+        if let Some(plan) = multi_grid_plan.as_ref() {
+            let Some(rho) = op.base.disc_lines[0].clone() else {
+                eprintln!("[openEMS] Setup failed: multi-grid base has no rho lines");
+                return false;
+            };
+            let split = match crate::multigrid::find_grid_split(
+                &rho,
+                plan.split_radius(),
+                op.base.num_lines[1] as usize,
+                op.closed_alpha(),
+            ) {
+                Ok(split) => split,
+                Err(error) => {
+                    eprintln!(
+                        "[openEMS] Setup failed: invalid cylindrical multi-grid split: {error}"
+                    );
+                    return false;
+                }
+            };
+            // Native Mur is only multi-grid safe along z and on the base's
+            // outer rho face; reject the other faces instead of dropping them.
+            if [op.base.m_bc[0], op.base.m_bc[2], op.base.m_bc[3]]
+                .iter()
+                .any(|&bc| bc == BC_MUR)
+            {
+                eprintln!(
+                    "[openEMS] Setup failed: Mur on the rho-min or alpha faces is not supported by a cylindrical multi-grid"
+                );
+                return false;
+            }
+            let (_, child_xml) = match crate::multigrid::split_model_xml(&xml, split) {
+                Ok(model) => model,
+                Err(error) => {
+                    eprintln!(
+                        "[openEMS] Setup failed: could not split the multi-grid model: {error}"
+                    );
+                    return false;
+                }
+            };
+            let mut child = Operator::new();
+            if let Err(error) = child.load_csx(&child_xml) {
+                eprintln!("[openEMS] Setup failed: child operator: {error}");
+                return false;
+            }
+            child.base.d_t = op.base.d_t;
+            child.calc_ec_operator();
+            // Native `Operator_CylinderMultiGrid::SetBoundaryCondition`: the
+            // child's outer rho face is always PEC.
+            child.base.m_bc = op.base.m_bc;
+            child.base.m_bc[1] = 0;
+            child.apply_electric_bc();
+            child.apply_magnetic_bc();
+            child.build_r0_coefficients();
+            // Native computes the base EC only from split_pos - 1 outwards.
+            op.zero_ec_below_rho(split.split_pos - 1);
+
+            let Some(base_alpha) = op.base.disc_lines[1].clone() else {
+                eprintln!("[openEMS] Setup failed: multi-grid base has no alpha lines");
+                return false;
+            };
+            let Some(child_alpha) = child.base.disc_lines[1].clone() else {
+                eprintln!("[openEMS] Setup failed: multi-grid child has no alpha lines");
+                return false;
+            };
+            let interpolation = match crate::multigrid::AlphaInterpolation::new(
+                &base_alpha,
+                &child_alpha,
+                op.closed_alpha(),
+            ) {
+                Ok(table) => table,
+                Err(error) => {
+                    eprintln!(
+                        "[openEMS] Setup failed: could not build the multi-grid interpolation: {error}"
+                    );
+                    return false;
+                }
+            };
+            let alpha_count =
+                crate::multigrid::physical_alpha_count(&base_alpha, op.closed_alpha());
+            multi_grid_child = Some((child, split, interpolation, alpha_count));
+        }
+
         // Build every operator-side extension through one ordered registry,
         // mirroring `Operator::AddExtension` + `BuildExtension`. Physics that
         // needs to rewrite the operator happens here, after the boundary
@@ -1250,7 +1437,12 @@ impl OpenEMS {
         registry.add(Box::new(MurOperatorExtension {
             phase_velocity: self.mur_v_ph,
         }));
-        let mut engine_extensions = match registry.build(&mut op) {
+        let multi_grid = multi_grid_child.is_some();
+        let mut engine_extensions = match if multi_grid {
+            registry.build_multi_grid(&mut op, false)
+        } else {
+            registry.build(&mut op)
+        } {
             Ok(extensions) => extensions,
             Err(error) => {
                 eprintln!("[openEMS] Failed to build an operator extension: {error}");
@@ -1277,6 +1469,32 @@ impl OpenEMS {
         engine.set_number_of_threads(self.num_threads);
         for extension in engine_extensions {
             engine.add_extension(extension);
+        }
+        if let Some((mut child, split, interpolation, alpha_count)) = multi_grid_child {
+            let mut child_registry = self.operator_extension_registry(&child);
+            let mut child_extensions = match child_registry.build_multi_grid(&mut child, true) {
+                Ok(extensions) => extensions,
+                Err(error) => {
+                    eprintln!("[openEMS] Failed to build a child-grid extension: {error}");
+                    return false;
+                }
+            };
+            if let Some(cylinder) = child.build_cylinder_extension() {
+                child_extensions.push(Box::new(cylinder));
+            }
+            let mut inner = Engine::new(Box::new(child));
+            inner.set_number_of_threads(self.num_threads);
+            for extension in child_extensions {
+                inner.add_extension(extension);
+            }
+            engine.enable_multi_grid(
+                inner,
+                crate::engine::MultiGridLink {
+                    split_pos: split.split_pos,
+                    alpha_count,
+                    interpolation,
+                },
+            );
         }
         self.fdtd_eng = Some(Box::new(engine));
         self.fdtd_op = None; // operator is owned by the engine
@@ -2638,8 +2856,37 @@ mod pml_setup_tests {
         )
     }
 
+    fn cylindrical_mesh_xml(extra_fdtd: &str) -> String {
+        let rho = (0..9)
+            .map(|index| (0.1 + index as f64 * 0.1).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let alpha = (0..9)
+            .map(|index| (index as f64 * std::f64::consts::TAU / 8.0).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let z = (0..9)
+            .map(|index| (index as f64 * 0.1).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"<openEMS><FDTD NumberOfTimesteps="2" {extra_fdtd}/>
+                <BoundaryCond xmin="PEC" xmax="PEC" ymin="PEC" ymax="PEC" zmin="PEC" zmax="PEC"/>
+                <ContinuousStructure CoordSystem="1">
+                    <RectilinearGrid DeltaUnit="0.001">
+                        <XLines>{rho}</XLines>
+                        <YLines>{alpha}</YLines>
+                        <ZLines>{z}</ZLines>
+                    </RectilinearGrid>
+                    <BackgroundMaterial Epsilon="1" Mue="1" Sigma="0" Kappa="0"/>
+                    <Properties></Properties>
+                </ContinuousStructure>
+            </openEMS>"#
+        )
+    }
+
     #[test]
-    fn cylindrical_multigrid_is_rejected_at_setup() {
+    fn multigrid_on_a_cartesian_mesh_is_rejected() {
         let mut sim = OpenEMS::new();
         let xml = format!(
             "<openEMS><FDTD MultiGrid=\"2,3\"/>{}</openEMS>",
@@ -2649,12 +2896,12 @@ mod pml_setup_tests {
         sim.set_number_of_time_steps(2);
         assert!(
             !sim.setup_fdtd(),
-            "a multi-grid model must not run as a single-grid model"
+            "a Cartesian model must not be split as a cylindrical multi-grid"
         );
     }
 
     #[test]
-    fn set_multi_grid_is_recorded_but_setup_rejects_it() {
+    fn set_multi_grid_on_a_cartesian_mesh_is_rejected() {
         let mut sim = OpenEMS::new();
         sim.set_csx_xml(mesh_xml());
         sim.set_number_of_time_steps(2);
@@ -2663,7 +2910,257 @@ mod pml_setup_tests {
         assert_eq!(sim.multi_grid, vec![2.0e-3]);
         assert!(
             !sim.setup_fdtd(),
-            "a stored multi-grid radius must stop the run, not be ignored"
+            "a stored multi-grid radius must not silently run as a single grid"
+        );
+    }
+
+    #[test]
+    fn cylindrical_multigrid_setup_builds_the_inner_engine() {
+        let mut sim = OpenEMS::new();
+        sim.set_csx_xml(cylindrical_mesh_xml("MultiGrid=\"0.55\""));
+        sim.set_number_of_time_steps(2);
+        assert!(sim.setup_fdtd(), "the cylindrical multi-grid must set up");
+        let engine = sim.fdtd_eng.as_ref().expect("engine");
+        assert!(engine.is_multi_grid());
+        assert_eq!(engine.num_lines, [9, 10, 9]);
+        let inner = engine.inner.as_ref().expect("inner engine");
+        assert_eq!(inner.num_lines, [5, 6, 9]);
+    }
+
+    #[test]
+    fn cylindrical_multigrid_runs_both_grids() {
+        let mut sim = OpenEMS::new();
+        let xml = cylindrical_mesh_xml("MultiGrid=\"0.55\"")
+            .replace("NumberOfTimesteps=\"2\"", "NumberOfTimesteps=\"3\"");
+        sim.set_csx_xml(xml);
+        assert!(sim.setup_fdtd());
+        assert!(sim.run_fdtd(), "the multi-grid run must complete");
+        let engine = sim.fdtd_eng.as_ref().expect("engine");
+        assert_eq!(engine.num_ts, 3);
+        assert_eq!(engine.inner.as_ref().expect("inner").num_ts, 3);
+    }
+
+    fn coax_model_xml(multigrid: Option<f64>, u1: &str, u2: &str, u1p: &str) -> String {
+        let rho = (0..14)
+            .map(|index| (100.0 + index as f64 * 10.0).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let alpha = (0..17)
+            .map(|index| (index as f64 * std::f64::consts::TAU / 16.0).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let z = (0..101)
+            .map(|index| (index as f64 * 10.0).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let multi = multigrid
+            .map(|radius| format!(" MultiGrid=\"{radius}\""))
+            .unwrap_or_default();
+        format!(
+            r#"<openEMS>
+                <FDTD NumberOfTimesteps="220" TimeStepMethod="3"{multi}>
+                    <Excitation Type="0" f0="5e8" fc="5e8"/>
+                    <BoundaryCond xmin="PEC" xmax="PEC" ymin="PEC" ymax="PEC" zmin="PEC" zmax="PEC"/>
+                </FDTD>
+                <ContinuousStructure CoordSystem="1">
+                    <RectilinearGrid DeltaUnit="0.001">
+                        <XLines>{rho}</XLines>
+                        <YLines>{alpha}</YLines>
+                        <ZLines>{z}</ZLines>
+                    </RectilinearGrid>
+                    <BackgroundMaterial Epsilon="1" Mue="1" Kappa="0" Sigma="0"/>
+                    <Properties>
+                        <Excitation ID="0" Name="excite" Number="0" Enabled="1" Frequency="0" Delay="0" Type="0" Excite="1,0,0" PropDir="0,0,0">
+                            <Primitives>
+                                <Box Priority="0"><P1 X="100" Y="0" Z="0"/><P2 X="230" Y="{tau}" Z="0"/></Box>
+                            </Primitives>
+                            <Weight X="1/rho" Y="0" Z="0"/>
+                        </Excitation>
+                        <ProbeBox ID="1" Name="{u1}" Type="0" Weight="1" NormDir="-1" StartTime="0" StopTime="0">
+                            <Primitives>
+                                <Box Priority="0"><P1 X="100" Y="0" Z="100"/><P2 X="230" Y="0" Z="100"/></Box>
+                            </Primitives>
+                        </ProbeBox>
+                        <ProbeBox ID="2" Name="{u2}" Type="0" Weight="1" NormDir="-1" StartTime="0" StopTime="0">
+                            <Primitives>
+                                <Box Priority="0"><P1 X="100" Y="0" Z="600"/><P2 X="230" Y="0" Z="600"/></Box>
+                            </Primitives>
+                        </ProbeBox>
+                        <ProbeBox ID="3" Name="{u1p}" Type="0" Weight="1" NormDir="-1" StartTime="0" StopTime="0">
+                            <Primitives>
+                                <Box Priority="0"><P1 X="100" Y="0" Z="100"/><P2 X="160" Y="0" Z="100"/></Box>
+                            </Primitives>
+                        </ProbeBox>
+                    </Properties>
+                </ContinuousStructure>
+            </openEMS>"#,
+            tau = std::f64::consts::TAU
+        )
+    }
+
+    fn read_probe(path: &str) -> Vec<(f64, f64)> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('%'))
+            .filter_map(|line| {
+                let mut columns = line.split_whitespace();
+                Some((
+                    columns.next()?.parse::<f64>().ok()?,
+                    columns.next()?.parse::<f64>().ok()?,
+                ))
+            })
+            .collect()
+    }
+
+    fn dft_at(samples: &[(f64, f64)], frequency: f64) -> (f64, f64) {
+        let mut real = 0.0f64;
+        let mut imag = 0.0f64;
+        for (time, value) in samples {
+            let angle = -std::f64::consts::TAU * frequency * time;
+            real += value * angle.cos();
+            imag += value * angle.sin();
+        }
+        (real, imag)
+    }
+
+    #[test]
+    fn cylindrical_multigrid_coax_probe_parity() {
+        let suffix = format!("mgcoax_{}", std::process::id());
+        let single_u1 = format!("{suffix}_single_u1");
+        let single_u2 = format!("{suffix}_single_u2");
+        let single_u1p = format!("{suffix}_single_u1p");
+        let multi_u1 = format!("{suffix}_multi_u1");
+        let multi_u2 = format!("{suffix}_multi_u2");
+        let multi_u1p = format!("{suffix}_multi_u1p");
+
+        let mut single = OpenEMS::new();
+        single.set_csx_xml(coax_model_xml(None, &single_u1, &single_u2, &single_u1p));
+        assert!(single.setup_fdtd(), "single-grid coax setup");
+        assert!(single.run_fdtd(), "single-grid coax run");
+
+        let mut multi = OpenEMS::new();
+        multi.set_csx_xml(coax_model_xml(
+            Some(160.0),
+            &multi_u1,
+            &multi_u2,
+            &multi_u1p,
+        ));
+        assert!(multi.setup_fdtd(), "multi-grid coax setup");
+        assert!(multi.run_fdtd(), "multi-grid coax run");
+
+        let s1 = read_probe(&single_u1);
+        let s2 = read_probe(&single_u2);
+        let s1p = read_probe(&single_u1p);
+        let m1 = read_probe(&multi_u1);
+        let m2 = read_probe(&multi_u2);
+        let m1p = read_probe(&multi_u1p);
+        for path in [
+            &single_u1,
+            &single_u2,
+            &single_u1p,
+            &multi_u1,
+            &multi_u2,
+            &multi_u1p,
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+        assert!(!s1.is_empty() && s1.len() == m1.len(), "probe samples");
+        assert_eq!(s1.len(), s2.len());
+        assert_eq!(m1.len(), m2.len());
+
+        let peak_single = s1.iter().map(|(_, v)| v.abs()).fold(0.0f64, f64::max);
+        let peak_multi = m1.iter().map(|(_, v)| v.abs()).fold(0.0f64, f64::max);
+        assert!(peak_single > 0.0 && peak_multi > 0.0);
+
+        let mut max_u1 = 0.0f64;
+        let mut max_u2 = 0.0f64;
+        let peak_s2 = s2.iter().map(|(_, v)| v.abs()).fold(0.0f64, f64::max);
+        for (single, multi) in s1.iter().zip(m1.iter()) {
+            max_u1 = max_u1.max((single.1 - multi.1).abs());
+        }
+        for (single, multi) in s2.iter().zip(m2.iter()) {
+            max_u2 = max_u2.max((single.1 - multi.1).abs());
+        }
+        let u1_error = max_u1 / peak_single;
+        let u2_error = max_u2 / peak_s2;
+        println!(
+            "multi-grid coax probe parity: u1 {u1_error:.3e}, u2 {u2_error:.3e}"
+        );
+        assert!(
+            u1_error < 1.0e-3,
+            "multi-grid coax u1 differs from single grid: {u1_error:.3e}"
+        );
+        assert!(
+            u2_error < 1.0e-3,
+            "multi-grid coax u2 differs from single grid: {u2_error:.3e}"
+        );
+
+        // Phase delay between the two voltage probes: compare the wrapped
+        // phase with the ideal TEM value -k0 * d (the coax gate's beta = k0).
+        let frequency = 0.5e9;
+        let (sr1, si1) = dft_at(&s1, frequency);
+        let (sr2, si2) = dft_at(&s2, frequency);
+        let (mr1, mi1) = dft_at(&m1, frequency);
+        let (mr2, mi2) = dft_at(&m2, frequency);
+        let phase_single = (si2 * sr1 - sr2 * si1).atan2(sr2 * sr1 + si2 * si1);
+        let phase_multi = (mi2 * mr1 - mr2 * mi1).atan2(mr2 * mr1 + mi2 * mi1);
+        let phase_error = (phase_multi - phase_single).abs();
+        assert!(
+            phase_error < 1.0e-2,
+            "multi-grid coax phase differs from single grid: {phase_error:.3e} rad"
+        );
+
+        let k0 = std::f64::consts::TAU * frequency / crate::constants::C0;
+        let distance = 0.5; // 600 mm - 100 mm
+        let expected = -k0 * distance;
+        let wrapped = phase_multi
+            + std::f64::consts::TAU
+                * ((expected - phase_multi) / std::f64::consts::TAU).round();
+        let beta_error = (wrapped - expected).abs() / (k0 * distance);
+
+        // Radial TEM profile: the partial-gap voltage must follow the
+        // logarithmic distribution of the ideal coaxial line.
+        let (srp, sip) = dft_at(&s1p, frequency);
+        let (mrp, mip) = dft_at(&m1p, frequency);
+        let profile_single = (srp * srp + sip * sip).sqrt() / (sr1 * sr1 + si1 * si1).sqrt();
+        let profile_multi = (mrp * mrp + mip * mip).sqrt() / (mr1 * mr1 + mi1 * mi1).sqrt();
+        let expected_profile = (160.0f64 / 100.0).ln() / (230.0f64 / 100.0).ln();
+        let profile_error = (profile_multi - profile_single).abs() / expected_profile;
+        let analytic_profile_error =
+            (profile_multi - expected_profile).abs() / expected_profile;
+        println!(
+            "multi-grid coax phase: single {phase_single:.4} rad, multi {phase_multi:.4} rad, beta error {beta_error:.3e}"
+        );
+        println!(
+            "multi-grid coax profile: single {profile_single:.4}, multi {profile_multi:.4}, analytic {expected_profile:.4}, errors {profile_error:.3e}/{analytic_profile_error:.3e}"
+        );
+        assert!(
+            profile_error < 1.0e-3,
+            "multi-grid coax profile differs from single grid: {profile_error:.3e}"
+        );
+        assert!(
+            analytic_profile_error < 1.0e-2,
+            "multi-grid coax profile differs from the log distribution: {analytic_profile_error:.3e}"
+        );
+        assert!(
+            beta_error < 1.0e-2,
+            "multi-grid coax beta differs from k0: {beta_error:.3e}"
+        );
+    }
+
+    #[test]
+    fn cylindrical_multigrid_rejects_mur_on_alpha() {
+        let mut sim = OpenEMS::new();
+        let xml = cylindrical_mesh_xml("MultiGrid=\"0.55\"").replace(
+            "ymin=\"PEC\" ymax=\"PEC\"",
+            "ymin=\"MUR\" ymax=\"MUR\"",
+        );
+        sim.set_csx_xml(xml);
+        sim.set_number_of_time_steps(2);
+        assert!(
+            !sim.setup_fdtd(),
+            "Mur on the alpha faces is not multi-grid safe"
         );
     }
 

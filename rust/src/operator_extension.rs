@@ -29,6 +29,14 @@ pub trait OperatorExtension {
         true
     }
 
+    /// Native `Operator_Extension::IsCylindricalMultiGridSave`.
+    ///
+    /// `child` selects the inner (child) grid. The default is the native
+    /// default: not safe in a cylindrical multi-grid.
+    fn multigrid_safe(&self, _child: bool) -> bool {
+        false
+    }
+
     /// Build the engine extension(s) from the finished operator.
     ///
     /// Returning an empty vector is allowed (for example a Mur extension with
@@ -90,6 +98,46 @@ impl OperatorExtensionRegistry {
         }
         Ok(engine_extensions)
     }
+
+    /// Build the extensions for one side of a cylindrical multi-grid.
+    ///
+    /// The base rejects any active extension that native marks unsafe; the
+    /// child silently skips them (native clones only the child-safe ones).
+    /// An unsafe factory that builds nothing (for example TFSF without a TFSF
+    /// property) is harmless and does not block setup.
+    pub fn build_multi_grid(
+        &mut self,
+        operator: &mut Operator,
+        child: bool,
+    ) -> Result<Vec<Box<dyn EngineExtension>>, String> {
+        self.sort();
+        let mut engine_extensions = Vec::new();
+        for extension in self.extensions.iter_mut() {
+            if !extension.is_active() {
+                continue;
+            }
+            if child {
+                if !extension.multigrid_safe(true) {
+                    eprintln!(
+                        "[openEMS] cylindrical multi-grid child: skipping {} (not multi-grid-child safe)",
+                        extension.name()
+                    );
+                    continue;
+                }
+                engine_extensions.extend(extension.build(operator)?);
+                continue;
+            }
+            let built = extension.build(operator)?;
+            if !built.is_empty() && !extension.multigrid_safe(false) {
+                return Err(format!(
+                    "{} is not safe in a cylindrical multi-grid",
+                    extension.name()
+                ));
+            }
+            engine_extensions.extend(built);
+        }
+        Ok(engine_extensions)
+    }
 }
 
 impl std::fmt::Debug for OperatorExtensionRegistry {
@@ -109,6 +157,10 @@ pub struct MurOperatorExtension {
 impl OperatorExtension for MurOperatorExtension {
     fn name(&self) -> &'static str {
         "Mur"
+    }
+
+    fn multigrid_safe(&self, _child: bool) -> bool {
+        true
     }
 
     fn priority(&self) -> i32 {
@@ -133,6 +185,10 @@ pub struct UpmlOperatorExtension {
 impl OperatorExtension for UpmlOperatorExtension {
     fn name(&self) -> &'static str {
         "UPML"
+    }
+
+    fn multigrid_safe(&self, child: bool) -> bool {
+        !child
     }
 
     fn priority(&self) -> i32 {
@@ -163,6 +219,10 @@ impl OperatorExtension for SteadyStateOperatorExtension {
         "SteadyState"
     }
 
+    fn multigrid_safe(&self, _child: bool) -> bool {
+        true
+    }
+
     fn priority(&self) -> i32 {
         ENG_EXT_PRIO_STEADYSTATE
     }
@@ -188,6 +248,10 @@ pub struct ExcitationOperatorExtension {
 impl OperatorExtension for ExcitationOperatorExtension {
     fn name(&self) -> &'static str {
         "Excitation"
+    }
+
+    fn multigrid_safe(&self, _child: bool) -> bool {
+        true
     }
 
     fn priority(&self) -> i32 {
@@ -394,6 +458,10 @@ impl OperatorExtension for ConductingSheetOperatorExtension {
         "ConductingSheet"
     }
 
+    fn multigrid_safe(&self, _child: bool) -> bool {
+        true
+    }
+
     fn priority(&self) -> i32 {
         ENG_EXT_PRIO_DEFAULT
     }
@@ -416,6 +484,10 @@ pub struct LumpedRLCOperatorExtension {
 impl OperatorExtension for LumpedRLCOperatorExtension {
     fn name(&self) -> &'static str {
         "LumpedRLC"
+    }
+
+    fn multigrid_safe(&self, _child: bool) -> bool {
+        true
     }
 
     fn priority(&self) -> i32 {
@@ -441,6 +513,10 @@ impl OperatorExtension for TfsfOperatorExtension {
         "TFSF"
     }
 
+    fn multigrid_safe(&self, _child: bool) -> bool {
+        false
+    }
+
     fn priority(&self) -> i32 {
         crate::extensions::ENG_EXT_PRIO_TFSF
     }
@@ -462,6 +538,10 @@ impl OperatorExtension for DebyeOperatorExtension {
         "Debye"
     }
 
+    fn multigrid_safe(&self, _child: bool) -> bool {
+        true
+    }
+
     fn priority(&self) -> i32 {
         crate::extensions::ENG_EXT_PRIO_DISPERSIVE_DEBYE
     }
@@ -481,6 +561,10 @@ pub struct LorentzOperatorExtension;
 impl OperatorExtension for LorentzOperatorExtension {
     fn name(&self) -> &'static str {
         "Lorentz"
+    }
+
+    fn multigrid_safe(&self, _child: bool) -> bool {
+        true
     }
 
     fn priority(&self) -> i32 {
