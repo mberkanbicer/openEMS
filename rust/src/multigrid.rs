@@ -2,10 +2,10 @@
 //!
 //! Mirrors the native `Operator_CylinderMultiGrid` split/level rules, the
 //! `Operator_Extension::IsCylindricalMultiGridSave` compatibility matrix and
-//! the `Engine_CylinderMultiGrid` barrier order. The engine is implemented and
-//! unit-tested here, but `setup_fdtd` still rejects multi-grid radii until the
-//! high-level extension/probe wiring and the `coax_cylindrical` validation are
-//! in place.
+//! the `Engine_CylinderMultiGrid` barrier order. The high-level setup builds
+//! the pair, attaches the inner engine and samples the base (full) mesh from
+//! the probes and dumps; the coaxial probe/phase gate matches the single-grid
+//! solver (E-007 closed 2026-11-01).
 
 /// Native `CYLIDINDERMULTIGRID_LIMIT`.
 pub const MULTIGRID_LIMIT: usize = 20;
