@@ -1954,10 +1954,9 @@ mod tests {
             }
             assert!(engine.iterate_ts(1));
             let passes = engine.gpu_last_batch_passes();
-            // Two PML pre phases (one dispatch each, independent of the slab
-            // count) plus the fused E and H kernels (which also run the post
-            // phases).
-            assert_eq!(passes, 4, "{slabs} slabs must cost 4 passes, got {passes}");
+            // The fused E and H kernels also run the PML pre and post phases,
+            // so a PML-only model costs one pass per half step.
+            assert_eq!(passes, 2, "{slabs} slabs must cost 2 passes, got {passes}");
             assert!(
                 engine
                     .gpu_fields

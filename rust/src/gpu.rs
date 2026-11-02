@@ -277,6 +277,9 @@ struct PmlDims {
 @group(0) @binding(13) var<storage, read_write> pml_flux: array<f32>;
 @group(0) @binding(14) var<storage, read> pml_slabs: array<vec4<u32>>;
 @group(0) @binding(15) var<uniform> pml_dims: PmlDims;
+// Pre-phase coefficients (`vv`/`vvfo` for E, `ii`/`iifo` for H).
+@group(0) @binding(16) var<storage, read> pml_pre_a: array<f32>;
+@group(0) @binding(17) var<storage, read> pml_pre_b: array<f32>;
 
 // Returns (slab index, absolute element index, 0, 0), or `0xffffffff` in `x`
 // when the cell is outside every slab. The absolute index includes the
@@ -298,6 +301,23 @@ fn pml_hit(i: u32, j: u32, k: u32) -> vec4<u32> {
         base = base + n;
     }
     return vec4<u32>(0xffffffffu, 0u, 0u, 0u);
+}
+
+fn pml_pre_phase(i: u32, j: u32, k: u32) {
+    let hit = pml_hit(i, j, k);
+    if (hit.x == 0xffffffffu) { return; }
+    let ext = pml_slabs[hit.x * 2u + 1u].xyz;
+    let slab_n = ext.x * ext.y * ext.z;
+    let plane = pml_dims.global.x * pml_dims.global.y * pml_dims.global.z;
+    let base = idx(0u, i, j, k);
+    for (var c = 0u; c < 3u; c = c + 1u) {
+        let t = hit.y + c * slab_n;
+        let g = base + c * plane;
+        let help = pml_pre_a[t] * field[g] - pml_pre_b[t] * pml_flux[t];
+        let flux_old = pml_flux[t];
+        field[g] = flux_old;
+        pml_flux[t] = help;
+    }
 }
 
 fn pml_post_phase(i: u32, j: u32, k: u32) {
@@ -325,6 +345,9 @@ fn update_e_pml(@builtin(global_invocation_id) gid: vec3<u32>) {
     let rem = t % (dims.ny * dims.nz);
     let j = rem / dims.nz;
     let k = rem % dims.nz;
+    // The E update reads only `peer` (curr), so the pre phase can run on the
+    // same cell before it without a global barrier.
+    pml_pre_phase(i, j, k);
     let si = select(0u, 1u, i > 0u);
     let sj = select(0u, 1u, j > 0u);
     let sk = select(0u, 1u, k > 0u);
@@ -359,6 +382,8 @@ fn update_h_pml(@builtin(global_invocation_id) gid: vec3<u32>) {
     let rem = t % (dims.ny * dims.nz);
     let j = rem / dims.nz;
     let k = rem % dims.nz;
+    // The H update reads only `peer` (volt), so the pre phase is same-cell.
+    pml_pre_phase(i, j, k);
     if (i + 1u < dims.nx && j + 1u < dims.ny && k + 1u < dims.nz) {
         let v2_ijk = peer[idx(2u, i, j, k)];
         let v2_ijp1k = peer[idx(2u, i, j + 1u, k)];
@@ -1597,6 +1622,11 @@ struct UpmlBinds {
     curr_flux: wgpu::Buffer,
     table: wgpu::Buffer,
     dims: wgpu::Buffer,
+    /// Pre-phase coefficients (`vv`/`vvfo` for E, `ii`/`iifo` for H).
+    vv: wgpu::Buffer,
+    vvfo: wgpu::Buffer,
+    ii: wgpu::Buffer,
+    iifo: wgpu::Buffer,
 }
 
 impl UpmlBinds {
@@ -2515,6 +2545,10 @@ impl GpuFields {
             curr_flux: curr_flux_buf,
             table: table_buf,
             dims: uniform,
+            vv: vv_buf,
+            vvfo: vvfo_buf,
+            ii: ii_buf,
+            iifo: iifo_buf,
         });
         true
     }
@@ -2539,6 +2573,10 @@ impl GpuFields {
         let curr_flux = upml.curr_flux.clone();
         let table = upml.table.clone();
         let pml_dims = upml.dims.clone();
+        let vv = upml.vv.clone();
+        let vvfo = upml.vvfo.clone();
+        let ii = upml.ii.clone();
+        let iifo = upml.iifo.clone();
         let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("openems pml engine kernels"),
             source: wgpu::ShaderSource::Wgsl(UPDATE_SHADER.into()),
@@ -2571,6 +2609,18 @@ impl GpuFields {
                     ty: wgpu::BufferBindingType::Storage {
                         read_only: binding != 13,
                     },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            });
+        }
+        for binding in 16..18u32 {
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
                     min_binding_size: None,
                 },
@@ -2615,7 +2665,9 @@ impl GpuFields {
             let make_bind = |field: &wgpu::Buffer,
                              peer: &wgpu::Buffer,
                              coeff: &wgpu::Buffer,
-                             flux: &wgpu::Buffer| {
+                             flux: &wgpu::Buffer,
+                             pre_a: &wgpu::Buffer,
+                             pre_b: &wgpu::Buffer| {
                 self.device
                     .create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("openems pml engine bind group"),
@@ -2665,12 +2717,20 @@ impl GpuFields {
                                 binding: 15,
                                 resource: pml_dims.as_entire_binding(),
                             },
+                            wgpu::BindGroupEntry {
+                                binding: 16,
+                                resource: pre_a.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 17,
+                                resource: pre_b.as_entire_binding(),
+                            },
                         ],
                     })
             };
             (
-                make_bind(&self.volt, &self.curr, &vvfn, &volt_flux),
-                make_bind(&self.curr, &self.volt, &iifn, &curr_flux),
+                make_bind(&self.volt, &self.curr, &vvfn, &volt_flux, &vv, &vvfo),
+                make_bind(&self.curr, &self.volt, &iifn, &curr_flux, &ii, &iifo),
             )
         };
         self.pml_engine = Some(PmlEngine {
@@ -4112,8 +4172,10 @@ impl GpuFields {
                 if let Some(lorentz) = self.lorentz.as_ref() {
                     passes += lorentz.record(&mut encoder, 0);
                 }
-                if let Some(upml) = self.upml.as_ref() {
-                    passes += upml.record(&mut encoder, 0);
+                if self.pml_engine.is_none() {
+                    if let Some(upml) = self.upml.as_ref() {
+                        passes += upml.record(&mut encoder, 0);
+                    }
                 }
                 if let Some(pml) = self.pml_engine.as_ref() {
                     record_dispatch(&mut encoder, &pml.pipe_e, &pml.bind_e, volt_cells);
@@ -4155,8 +4217,10 @@ impl GpuFields {
                 if let Some(source) = self.source.as_ref() {
                     passes += source.record(&mut encoder, source.volt.as_ref(), step);
                 }
-                if let Some(upml) = self.upml.as_ref() {
-                    passes += upml.record(&mut encoder, 2);
+                if self.pml_engine.is_none() {
+                    if let Some(upml) = self.upml.as_ref() {
+                        passes += upml.record(&mut encoder, 2);
+                    }
                 }
                 if let Some(lorentz) = self.lorentz.as_ref() {
                     passes += lorentz.record(&mut encoder, 1);
