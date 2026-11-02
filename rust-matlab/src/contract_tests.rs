@@ -514,6 +514,9 @@ fn setup_uses_a_transferred_structure() {
     assert_eq!(openems_set_csx(solver, csx), 1);
     assert_no_error("set_csx");
     assert_eq!(openems_get_csx(solver), csx, "GetCSX pointer identity");
+    // Native SetupFDTD aborts (exit 3) without a defined excitation; the
+    // MATLAB flow always calls SetGaussExcite first.
+    openems_set_gauss_excite(solver, 1e9, 5e8);
 
     // The transferred structure is the geometry the operator is built from.
     assert_eq!(openems_setup_fdtd(solver), 1);
@@ -567,6 +570,7 @@ fn setting_the_same_csx_twice_keeps_one_owner() {
     assert_eq!(openems_set_csx(solver, csx), 1);
     assert_no_error("idempotent set_csx");
     assert_eq!(openems_get_csx(solver), csx);
+    openems_set_gauss_excite(solver, 1e9, 5e8);
     assert_eq!(openems_setup_fdtd(solver), 1);
 
     // Dropping the solver releases it exactly once.
@@ -586,6 +590,7 @@ fn geometry_has_a_single_slot_like_native() {
     openems_set_csx_xml(solver, xml.as_ptr());
     assert!(openems_get_csx(solver).is_null());
     assert_no_error("xml replaces the structure");
+    openems_set_gauss_excite(solver, 1e9, 5e8);
     assert_eq!(openems_setup_fdtd(solver), 1, "the XML geometry is used");
 
     // A null XML pointer is native `SetCSX(NULL)`.

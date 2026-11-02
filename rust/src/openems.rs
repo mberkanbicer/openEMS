@@ -1170,10 +1170,23 @@ impl OpenEMS {
             op.init_data_storage(num_lines_usize);
         }
 
-        // Set up excitation (default Gaussian pulse if none specified).
+        // Native rejects a setup without an excitation instead of inventing
+        // one: `ParseFDTDSetup` fails when the `<FDTD>` element carries no
+        // readable `<Excitation>` child (openems.cpp:1058-1063, CLI exit 1)
+        // and `SetupFDTD` aborts when no excitation was defined at all
+        // (openems.cpp:1326-1330, exit 3). An `<Excitation>` child with an
+        // unknown type leaves the signal undefined and fails as well
+        // (excitation.cpp:124-128, exit 2). The earlier port silently
+        // substituted a 1 GHz/0.5 GHz Gaussian pulse here (RM-184).
         if self.excitation.is_none() {
-            let exc = Excitation::gauss(1.0e9, 5.0e8);
-            self.excitation = Some(Box::new(exc));
+            if crate::fdtd_options::fdtd_element_present(&xml) {
+                eprintln!(
+                    "Excitation::setupExcitation: Error, can't read openEMS excitation settings... "
+                );
+            } else {
+                eprintln!("openEMS::SetupFDTD: Error, excitation is not defined! Abort!");
+            }
+            return false;
         }
 
         // Compute the stable timestep (CFL condition) unless fixed explicitly.
@@ -2487,6 +2500,8 @@ mod tests {
     fn test_setup_and_run() {
         let mut sim = OpenEMS::new();
         sim.set_number_of_time_steps(10);
+        // Native requires an explicit excitation; setup fails without one.
+        sim.set_gauss_excite(1.0e9, 5.0e8);
         sim.set_csx_xml(
             r#"<ContinuousStructure CoordSystem="0">
                 <RectilinearGrid DeltaUnit="0.001">
@@ -2518,12 +2533,14 @@ mod tests {
     fn timestep_factor_scales_the_cfl_step() {
         let mut reference = OpenEMS::new();
         reference.set_number_of_time_steps(1);
+        reference.set_gauss_excite(1.0e9, 5.0e8);
         reference.set_csx_xml(SMALL_CSX.to_string());
         assert!(reference.setup_fdtd());
         let dt_reference = reference.fdtd_eng.as_ref().unwrap().op.get_timestep();
 
         let mut halved = OpenEMS::new();
         halved.set_number_of_time_steps(1);
+        halved.set_gauss_excite(1.0e9, 5.0e8);
         halved.set_time_step_factor(0.5);
         halved.set_csx_xml(SMALL_CSX.to_string());
         assert!(halved.setup_fdtd());
@@ -2558,6 +2575,7 @@ mod tests {
         sim.set_number_of_time_steps(1_000);
         sim.set_time_step(1.0e-12);
         sim.set_max_time(5.0e-12);
+        sim.set_gauss_excite(1.0e9, 5.0e8);
         sim.set_csx_xml(SMALL_CSX.to_string());
         assert!(sim.setup_fdtd());
         assert!(sim.run_fdtd());
@@ -2621,6 +2639,40 @@ mod tests {
             sim.fdtd_eng.is_none(),
             "no engine or fallback grid may be created"
         );
+    }
+
+    /// Native rejects a setup without an excitation instead of inventing one:
+    /// `SetupFDTD` aborts with code 3 for a library caller that never defined
+    /// a waveform (openems.cpp:1326-1330). The earlier port silently
+    /// substituted a 1 GHz/0.5 GHz Gaussian pulse here (RM-184).
+    #[test]
+    fn setup_without_an_excitation_fails_like_native() {
+        let mut sim = OpenEMS::new();
+        sim.set_csx_xml(SMALL_CSX.to_string());
+        assert!(
+            !sim.setup_fdtd(),
+            "a setup without any excitation must abort"
+        );
+        assert!(sim.fdtd_eng.is_none(), "no engine may be fabricated");
+    }
+
+    /// Native `ParseFDTDSetup` fails when the `<FDTD>` element carries no
+    /// `<Excitation>` child (openems.cpp:1058-1063, CLI exit 1); an unknown
+    /// excitation type leaves the signal undefined and fails later in
+    /// `buildExcitationSignal` (excitation.cpp:124-128).
+    #[test]
+    fn setup_fails_when_the_fdtd_element_has_no_excitation_child() {
+        let mut sim = OpenEMS::new();
+        let xml = format!(
+            "<openEMS><FDTD NumberOfTimesteps=\"2\"/>{}</openEMS>",
+            SMALL_CSX
+        );
+        sim.set_csx_xml(xml);
+        assert!(
+            !sim.setup_fdtd(),
+            "a project file without an <Excitation> child must fail to parse"
+        );
+        assert!(sim.fdtd_eng.is_none());
     }
 
     #[test]
@@ -2725,6 +2777,7 @@ mod processing_wiring_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut sim = OpenEMS::new();
         sim.set_number_of_time_steps(10);
+        sim.set_gauss_excite(1.0e9, 5.0e8);
         sim.set_csx_xml(
             r#"<ContinuousStructure CoordSystem="0">
                 <RectilinearGrid DeltaUnit="0.001">
@@ -2910,7 +2963,7 @@ mod pml_setup_tests {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            r#"<openEMS><FDTD NumberOfTimesteps="2" {extra_fdtd}/>
+            r#"<openEMS><FDTD NumberOfTimesteps="2" {extra_fdtd}><Excitation Type="0" f0="1e9" fc="5e8"/></FDTD>
                 <BoundaryCond xmin="PEC" xmax="PEC" ymin="PEC" ymax="PEC" zmin="PEC" zmax="PEC"/>
                 <ContinuousStructure CoordSystem="1">
                     <RectilinearGrid DeltaUnit="0.001">
@@ -2928,6 +2981,7 @@ mod pml_setup_tests {
     #[test]
     fn multigrid_on_a_cartesian_mesh_is_rejected() {
         let mut sim = OpenEMS::new();
+        sim.set_gauss_excite(1.0e9, 5.0e8);
         let xml = format!(
             "<openEMS><FDTD MultiGrid=\"2,3\"/>{}</openEMS>",
             mesh_xml()
@@ -3231,6 +3285,7 @@ mod pml_setup_tests {
     #[test]
     fn cell_constant_material_selects_cell_center_averaging() {
         let mut sim = OpenEMS::new();
+        sim.set_gauss_excite(1.0e9, 5.0e8);
         let xml = format!(
             "<openEMS><FDTD CellConstantMaterial=\"1\"/>{}</openEMS>",
             mesh_xml()
@@ -3244,6 +3299,7 @@ mod pml_setup_tests {
         assert!(sim.cell_constant_material);
 
         let mut quarter = OpenEMS::new();
+        quarter.set_gauss_excite(1.0e9, 5.0e8);
         quarter.set_csx_xml(format!(
             "<openEMS><FDTD CellConstantMaterial=\"0\"/>{}</openEMS>",
             mesh_xml()
@@ -3264,6 +3320,7 @@ mod pml_setup_tests {
     #[test]
     fn setup_fdtd_accepts_pml_and_defaults_to_eight_cells() {
         let mut sim = OpenEMS::new();
+        sim.set_gauss_excite(1.0e9, 5.0e8);
         sim.set_csx_xml(mesh_xml());
         for face in 0..6 {
             sim.set_bc_type(face, BC_PML);
@@ -3279,6 +3336,7 @@ mod pml_setup_tests {
     #[test]
     fn the_memory_report_lists_the_operator_arrays() {
         let mut sim = OpenEMS::new();
+        sim.set_gauss_excite(1.0e9, 5.0e8);
         sim.set_csx_xml(mesh_xml());
         sim.set_number_of_time_steps(2);
         sim.set_debug_memory(true);
@@ -3314,6 +3372,7 @@ mod pml_setup_tests {
     #[test]
     fn setup_fdtd_rejects_a_pml_larger_than_the_mesh() {
         let mut sim = OpenEMS::new();
+        sim.set_gauss_excite(1.0e9, 5.0e8);
         sim.set_csx_xml(mesh_xml());
         for face in 0..6 {
             sim.set_bc_type(face, BC_PML);

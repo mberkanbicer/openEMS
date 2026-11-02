@@ -75,6 +75,15 @@ fn fdtd_element<'a>(xml: &'a str) -> Option<&'a str> {
     Some(&rest[..close])
 }
 
+/// Whether the document carries a `<FDTD>` element.
+///
+/// Native `ParseFDTDSetup` refuses a project file without one ("Can't read
+/// openEMS FDTD Settings..."), while a library caller may pass a CSX-only
+/// document and configure the solver through the setters instead.
+pub fn fdtd_element_present(xml: &str) -> bool {
+    fdtd_element(xml).is_some()
+}
+
 /// Split `name="value"` pairs out of a tag body.
 fn attributes(tag: &str) -> Vec<(String, String)> {
     let bytes = tag.as_bytes();

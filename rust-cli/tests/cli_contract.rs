@@ -22,9 +22,13 @@ fn write_case(dir: &PathBuf, nr_ts: u32) -> PathBuf {
         .map(|index| index.to_string())
         .collect::<Vec<_>>()
         .join(",");
+    // Native `ParseFDTDSetup` rejects an `<FDTD>` element without an
+    // `<Excitation>` child, so every valid fixture carries one.
     let xml = format!(
         r#"<openEMS>
-            <FDTD NumberOfTimesteps="{nr_ts}" EndCriteria="1e-6"/>
+            <FDTD NumberOfTimesteps="{nr_ts}" EndCriteria="1e-6">
+                <Excitation Type="0" f0="2e9" fc="2e9"/>
+            </FDTD>
             <ContinuousStructure CoordSystem="0">
                 <RectilinearGrid DeltaUnit="1e-3">
                     <XLines>{lines}</XLines>
@@ -43,6 +47,35 @@ fn write_case(dir: &PathBuf, nr_ts: u32) -> PathBuf {
     let path = dir.join("case.xml");
     std::fs::write(&path, xml).expect("write case");
     path
+}
+
+/// Native `ParseFDTDSetup` fails when the `<FDTD>` element carries no
+/// `<Excitation>` child (openems.cpp:1058-1063) and the process exits 1
+/// (main.cpp:50-53). The solver must not invent a default pulse (RM-184).
+#[test]
+fn a_project_without_an_excitation_child_exits_one() {
+    let dir = case_dir("noexcite");
+    let case = write_case(&dir, 6);
+    let xml = std::fs::read_to_string(&case).expect("read case");
+    let stripped = xml.replace(
+        "<Excitation Type=\"0\" f0=\"2e9\" fc=\"2e9\"/>\n            ",
+        "",
+    );
+    assert_ne!(stripped, xml, "the fixture must contain the child");
+    let path = dir.join("no_excitation.xml");
+    std::fs::write(&path, stripped).expect("write stripped case");
+
+    let output = Command::new(binary()).arg(&path).output().expect("run");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("can't read openEMS excitation settings"),
+        "native parse message missing: {stderr}"
+    );
+    assert!(
+        stderr.contains("ParseFDTDSetup failed."),
+        "native main message missing: {stderr}"
+    );
 }
 
 #[test]
