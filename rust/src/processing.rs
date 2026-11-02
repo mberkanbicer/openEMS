@@ -553,6 +553,45 @@ impl ProcessingArray {
             .collect()
     }
 
+    /// Number of steps until at least one processing is next due.
+    ///
+    /// Returns `1` when any processing has no interval (an explicit step list
+    /// or an every-step sampler), so the caller never skips work, and
+    /// `u32::MAX` when the array is empty.
+    pub fn steps_until_due(&self, num_ts: u32) -> u32 {
+        let mut best = u32::MAX;
+        for proc in &self.processings {
+            let interval = proc.get_process_interval();
+            if interval == 0 {
+                return 1;
+            }
+            let remainder = num_ts % interval;
+            let due = if remainder == 0 {
+                interval
+            } else {
+                interval - remainder
+            };
+            best = best.min(due);
+        }
+        best
+    }
+
+    /// Whether any processing reads the fields at `num_ts`.
+    ///
+    /// The GPU path uses this to decide whether the host arrays must be
+    /// refreshed before `process_fields`.
+    pub fn is_due(&self, num_ts: u32) -> bool {
+        self.processings.iter().any(|proc| {
+            let interval = proc.get_process_interval();
+            interval == 0 || num_ts.is_multiple_of(interval)
+        })
+    }
+
+    /// Whether any processing is registered.
+    pub fn is_empty(&self) -> bool {
+        self.processings.is_empty()
+    }
+
     /// Initialize all processings.
     pub fn init_all(&mut self) {
         for proc in self.processings.iter_mut() {

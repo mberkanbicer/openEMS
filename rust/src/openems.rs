@@ -2275,6 +2275,18 @@ impl OpenEMS {
         // zero during the run and the caller's setting comes back afterwards.
         let _denormal = crate::denormal::FlushToZero::new();
 
+        // A device-resident GPU field only needs a host copy when a consumer
+        // asks for it, so the run loop batches up to the next probe/dump
+        // interval or end-criteria sample instead of stepping one at a time.
+        #[cfg(feature = "gpu")]
+        let gpu_active = self
+            .fdtd_eng
+            .as_ref()
+            .map(|engine| engine.gpu_fields.is_some())
+            .unwrap_or(false);
+        #[cfg(not(feature = "gpu"))]
+        let gpu_active = false;
+
         let mut ts = 0u32;
         let mut change: f64 = 1.0;
         let mut max_energy: f64 = 0.0;
@@ -2292,19 +2304,77 @@ impl OpenEMS {
         }
 
         while ts < ts_limit && change > end_crit && !self.check_abort_cond() {
-            // Execute one timestep (voltage + current updates with extensions).
-            self.fdtd_eng.as_mut().unwrap().iterate_ts(1);
+            let ts_before = ts;
+            // Steps that may run without a host copy: up to the next
+            // processing interval, the next end-criteria sample, or the
+            // excitation's max-energy sample.
+            let batch = if gpu_active {
+                let mut next = u32::MAX;
+                if let Some(ref pa) = processing {
+                    if !pa.is_empty() {
+                        next = next.min(pa.steps_until_due(ts));
+                    }
+                }
+                if nyquist > 0 {
+                    let remainder = ts % nyquist;
+                    let boundary = if remainder == 0 {
+                        nyquist
+                    } else {
+                        nyquist - remainder
+                    };
+                    next = next.min(boundary);
+                } else {
+                    next = 1;
+                }
+                if !max_excite_sampled {
+                    if let Some(target) = max_excite_ts {
+                        if target > ts {
+                            next = next.min(target - ts);
+                        }
+                    }
+                }
+                let remaining = ts_limit.saturating_sub(ts).max(1);
+                next.min(remaining).max(1)
+            } else {
+                1
+            };
+            // Execute the timestep(s) (voltage + current updates with extensions).
+            self.fdtd_eng.as_mut().unwrap().iterate_ts(batch);
             ts = self.fdtd_eng.as_ref().unwrap().get_number_of_timesteps();
+
+            // Progress reporting every 100 steps, including each boundary a
+            // batch may have crossed.
+            for mark in (ts_before / 100 + 1)..=(ts / 100) {
+                let step = mark * 100;
+                if std::env::var_os("OPENEMS_DEBUG_ENERGY").is_some() {
+                    println!(
+                        "[openEMS] Timestep: {step} || Energy change: {change:.3e} ({:.2} dB)",
+                        -10.0 * change.max(1e-300).log10()
+                    );
+                } else {
+                    println!("[openEMS] Timestep: {}", step);
+                }
+            }
 
             // Invoke Process on all registered processings with field access.
             if let Some(ref mut pa) = processing {
-                let engine = self.fdtd_eng.as_ref().expect("engine checked above");
-                let interface = EngineInterface {
-                    meta: &engine_meta,
-                    volt: &engine.volt_ptr,
-                    curr: &engine.curr_ptr,
-                };
-                pa.process_fields(ts, &interface);
+                if !pa.is_empty() && pa.is_due(ts) {
+                    // The GPU keeps the fields on the device; refresh the host
+                    // arrays only when a probe or dump reads them.
+                    #[cfg(feature = "gpu")]
+                    if gpu_active {
+                        if let Some(engine) = self.fdtd_eng.as_mut() {
+                            engine.sync_fields();
+                        }
+                    }
+                    let engine = self.fdtd_eng.as_ref().expect("engine checked above");
+                    let interface = EngineInterface {
+                        meta: &engine_meta,
+                        volt: &engine.volt_ptr,
+                        curr: &engine.curr_ptr,
+                    };
+                    pa.process_fields(ts, &interface);
+                }
             }
 
             // Steady-state end criterion: the extension metric when a periodic
@@ -2322,6 +2392,12 @@ impl OpenEMS {
                         &mut last_checkpoint,
                     );
                     if seed || due {
+                        #[cfg(feature = "gpu")]
+                        if gpu_active {
+                            if let Some(engine) = self.fdtd_eng.as_mut() {
+                                engine.sync_fields();
+                            }
+                        }
                         let energy = self.fdtd_eng.as_ref().unwrap().fast_energy();
                         if energy > max_energy {
                             max_energy = energy;
@@ -2336,18 +2412,6 @@ impl OpenEMS {
                     if seed {
                         max_excite_sampled = true;
                     }
-                }
-            }
-
-            // Progress reporting every 100 steps.
-            if ts.is_multiple_of(100) {
-                if std::env::var_os("OPENEMS_DEBUG_ENERGY").is_some() {
-                    println!(
-                        "[openEMS] Timestep: {ts} || Energy change: {change:.3e} ({:.2} dB)",
-                        -10.0 * change.max(1e-300).log10()
-                    );
-                } else {
-                    println!("[openEMS] Timestep: {}", ts);
                 }
             }
         }

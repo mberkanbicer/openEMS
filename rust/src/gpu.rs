@@ -194,6 +194,40 @@ fn readback_pair(
     Some((first_values, second_values))
 }
 
+/// Copy one buffer into a persistent staging buffer and decode it into `out`.
+///
+/// The staging buffer is allocated once per [`GpuFields`] instance; the earlier
+/// path created a fresh map-read buffer for every download, which added a
+/// multi-megabyte allocation to every host sync.
+fn readback_into(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source: &wgpu::Buffer,
+    staging: &wgpu::Buffer,
+    out: &mut [FDTD_FLOAT],
+) -> Option<()> {
+    let bytes = (out.len() * 4) as u64;
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("openems gpu copy"),
+    });
+    encoder.copy_buffer_to_buffer(source, 0, staging, 0, bytes);
+    queue.submit(std::iter::once(encoder.finish()));
+    let slice = staging.slice(..bytes);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+    receiver.recv().ok()?.ok()?;
+    let data = slice.get_mapped_range().ok()?;
+    for (value, chunk) in out.iter_mut().zip(data.chunks_exact(4)) {
+        *value = FDTD_FLOAT::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+    drop(data);
+    staging.unmap();
+    Some(())
+}
+
 impl GpuContext {
     /// Create a context on the default high-performance adapter, or `None`
     /// when no adapter is available (the caller must fall back to the CPU).
@@ -536,6 +570,15 @@ pub struct GpuFields {
     bind_h: wgpu::BindGroup,
     pipe_e: wgpu::ComputePipeline,
     pipe_h: wgpu::ComputePipeline,
+    /// Persistent map-read staging buffer for `volt` downloads.
+    staging_volt: wgpu::Buffer,
+    /// Persistent map-read staging buffer for `curr` downloads.
+    staging_curr: wgpu::Buffer,
+    /// Persistent map-read staging buffer for a `volt`+`curr` pair download.
+    staging_pair: wgpu::Buffer,
+    /// Reused little-endian upload scratch, so a host-phase upload does not
+    /// allocate a new byte vector per field.
+    upload_scratch: std::cell::RefCell<Vec<u8>>,
 }
 
 fn f32_buffer(device: &wgpu::Device, label: &str, values: &[FDTD_FLOAT],
@@ -659,6 +702,22 @@ impl GpuFields {
         };
         let bind_e = make_bind(&volt_buf, &curr_buf);
         let bind_h = make_bind(&curr_buf, &volt_buf);
+        let staging = |label: &str, len: usize| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: (len * 4) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        };
+        let staging_volt = staging("openems engine volt readback", volt.len());
+        let staging_curr = staging("openems engine curr readback", curr.len());
+        let staging_pair = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("openems engine pair readback"),
+            size: (2 * volt.len() * 4) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
         Some(Self {
             device,
             queue,
@@ -669,6 +728,10 @@ impl GpuFields {
             bind_h,
             pipe_e,
             pipe_h,
+            staging_volt,
+            staging_curr,
+            staging_pair,
+            upload_scratch: std::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -682,35 +745,147 @@ impl GpuFields {
         self.dispatch(&self.pipe_h, &self.bind_h, cells);
     }
 
+    /// Run `steps` complete E/H steps in one submission.
+    ///
+    /// The earlier path submitted one command buffer per half step, so a batch
+    /// of N steps paid 2N queue submissions plus the per-step host sync. Here
+    /// the passes are recorded back to back and submitted once per chunk, and
+    /// the fields stay on the device between steps.
+    pub fn dispatch_steps(&self, steps: u32) {
+        // Bound the encoder size; a chunk is still thousands of kernel
+        // launches, far fewer submissions than before.
+        const CHUNK: u32 = 256;
+        let volt_cells = (self.dims[0] * self.dims[1] * self.dims[2]) as u32;
+        let curr_cells = (self.dims[0].saturating_sub(1)
+            * self.dims[1].saturating_sub(1)
+            * self.dims[2].saturating_sub(1)) as u32;
+        let mut remaining = steps;
+        while remaining > 0 {
+            let chunk = remaining.min(CHUNK);
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("openems engine batch"),
+            });
+            for _ in 0..chunk {
+                record_dispatch(&mut encoder, &self.pipe_e, &self.bind_e, volt_cells);
+                record_dispatch(&mut encoder, &self.pipe_h, &self.bind_h, curr_cells);
+            }
+            self.queue.submit(std::iter::once(encoder.finish()));
+            remaining -= chunk;
+        }
+    }
+
     fn dispatch(&self, pipeline: &wgpu::ComputePipeline, bind: &wgpu::BindGroup, groups: u32) {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("openems engine step"),
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("openems engine pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, bind, &[]);
-            pass.dispatch_workgroups(groups.div_ceil(64), 1, 1);
-        }
+        record_dispatch(&mut encoder, pipeline, bind, groups);
         self.queue.submit(std::iter::once(encoder.finish()));
     }
 
+    /// Download the voltage field only (host-extension E phase).
+    pub fn download_volt(&self, volt: &mut [FDTD_FLOAT]) -> Option<()> {
+        readback_into(
+            &self.device,
+            &self.queue,
+            &self.volt,
+            &self.staging_volt,
+            volt,
+        )
+    }
+
+    /// Download the current field only (host-extension H phase).
+    pub fn download_curr(&self, curr: &mut [FDTD_FLOAT]) -> Option<()> {
+        readback_into(
+            &self.device,
+            &self.queue,
+            &self.curr,
+            &self.staging_curr,
+            curr,
+        )
+    }
+
     pub fn download(&self, volt: &mut [FDTD_FLOAT], curr: &mut [FDTD_FLOAT]) -> Option<()> {
+        self.download_pair(volt, curr)
+    }
+
+    /// Download both fields with a single copy submission and one map, which
+    /// is the round trip a batch of GPU steps ends with.
+    pub fn download_pair(
+        &self,
+        volt: &mut [FDTD_FLOAT],
+        curr: &mut [FDTD_FLOAT],
+    ) -> Option<()> {
         let bytes = (volt.len() * 4) as u64;
-        let (v, c) = readback_pair(&self.device, &self.queue, &self.volt, &self.curr, bytes)?;
-        volt.copy_from_slice(&v[..volt.len()]);
-        curr.copy_from_slice(&c[..curr.len()]);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("openems gpu pair copy"),
+        });
+        encoder.copy_buffer_to_buffer(&self.volt, 0, &self.staging_pair, 0, bytes);
+        encoder.copy_buffer_to_buffer(&self.curr, 0, &self.staging_pair, bytes, bytes);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        let slice = self.staging_pair.slice(..2 * bytes);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .ok()?;
+        receiver.recv().ok()?.ok()?;
+        let data = slice.get_mapped_range().ok()?;
+        for (value, chunk) in volt.iter_mut().zip(data.chunks_exact(4)) {
+            *value = FDTD_FLOAT::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        for (value, chunk) in curr
+            .iter_mut()
+            .zip(data[bytes as usize..].chunks_exact(4))
+        {
+            *value = FDTD_FLOAT::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        drop(data);
+        self.staging_pair.unmap();
         Some(())
+    }
+
+    /// Upload the voltage field only.
+    pub fn upload_volt(&self, volt: &[FDTD_FLOAT]) {
+        self.write_field(&self.volt, volt);
+    }
+
+    /// Upload the current field only.
+    pub fn upload_curr(&self, curr: &[FDTD_FLOAT]) {
+        self.write_field(&self.curr, curr);
     }
 
     /// Upload host fields into the persistent GPU buffers (host-extension path).
     pub fn upload(&self, volt: &[FDTD_FLOAT], curr: &[FDTD_FLOAT]) {
-        self.queue.write_buffer(&self.volt, 0, &f32_bytes(volt));
-        self.queue.write_buffer(&self.curr, 0, &f32_bytes(curr));
+        self.upload_volt(volt);
+        self.upload_curr(curr);
     }
+
+    fn write_field(&self, target: &wgpu::Buffer, values: &[FDTD_FLOAT]) {
+        let mut scratch = self.upload_scratch.borrow_mut();
+        scratch.clear();
+        scratch.reserve(values.len() * 4);
+        for value in values {
+            scratch.extend_from_slice(&value.to_le_bytes());
+        }
+        self.queue.write_buffer(target, 0, &scratch);
+    }
+}
+
+fn record_dispatch(
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    bind: &wgpu::BindGroup,
+    cells: u32,
+) {
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("openems engine pass"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind, &[]);
+    pass.dispatch_workgroups(cells.div_ceil(64).max(1), 1, 1);
 }
 
 #[cfg(test)]

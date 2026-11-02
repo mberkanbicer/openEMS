@@ -85,6 +85,15 @@ pub struct Engine {
     /// Persistent GPU field/coefficient buffers (ADR 0012).
     #[cfg(feature = "gpu")]
     pub gpu_fields: Option<crate::gpu::GpuFields>,
+    /// The host copy of `volt` has changes the device has not seen yet.
+    #[cfg(feature = "gpu")]
+    host_volt_dirty: bool,
+    /// The host copy of `curr` has changes the device has not seen yet.
+    #[cfg(feature = "gpu")]
+    host_curr_dirty: bool,
+    /// A GPU batch advanced the device fields past the host copies.
+    #[cfg(feature = "gpu")]
+    gpu_pending: bool,
 }
 
 impl Engine {
@@ -113,6 +122,12 @@ impl Engine {
             multi_grid: None,
             #[cfg(feature = "gpu")]
             gpu_fields: None,
+            #[cfg(feature = "gpu")]
+            host_volt_dirty: false,
+            #[cfg(feature = "gpu")]
+            host_curr_dirty: false,
+            #[cfg(feature = "gpu")]
+            gpu_pending: false,
         }
     }
 
@@ -156,41 +171,92 @@ impl Engine {
         Ok(())
     }
 
-    /// Copy the GPU fields back into the CPU arrays (after a step).
+    /// Copy the device `volt` result back into the CPU array.
     #[cfg(feature = "gpu")]
-    fn sync_gpu_fields(&mut self) {
+    fn download_volt(&mut self) {
         let Some(gpu) = self.gpu_fields.as_ref() else {
             return;
         };
-        let volt_ptr = self.volt_ptr.as_mut_ptr();
-        let curr_ptr = self.curr_ptr.as_mut_ptr();
         let len = self.volt_ptr.len();
-        // SAFETY: the GPU buffers have the same length; `download` only writes
-        // those elements and the pointers are not aliased by `gpu`.
-        let (volt, curr) = unsafe {
-            (
-                std::slice::from_raw_parts_mut(volt_ptr, len),
-                std::slice::from_raw_parts_mut(curr_ptr, len),
-            )
-        };
-        gpu.download(volt, curr);
+        // SAFETY: the GPU buffer has the same length; `download_volt` only
+        // writes those elements and the pointer is not aliased by `gpu`.
+        let volt = unsafe { std::slice::from_raw_parts_mut(self.volt_ptr.as_mut_ptr(), len) };
+        gpu.download_volt(volt);
+        self.host_volt_dirty = false;
     }
 
-    /// Upload the CPU fields into the GPU buffers (host-extension path).
+    /// Copy the device `curr` result back into the CPU array.
     #[cfg(feature = "gpu")]
-    fn upload_gpu_fields(&self) {
+    fn download_curr(&mut self) {
         let Some(gpu) = self.gpu_fields.as_ref() else {
             return;
         };
-        // SAFETY: the slices only live for the upload call, which copies them
-        // into the GPU buffers.
+        let len = self.curr_ptr.len();
+        // SAFETY: as in `download_volt`.
+        let curr = unsafe { std::slice::from_raw_parts_mut(self.curr_ptr.as_mut_ptr(), len) };
+        gpu.download_curr(curr);
+        self.host_curr_dirty = false;
+    }
+
+    /// Fetch both device fields with one round trip when a batch advanced
+    /// them; a no-op otherwise.
+    #[cfg(feature = "gpu")]
+    pub fn sync_fields(&mut self) {
+        if !self.gpu_pending {
+            return;
+        }
+        let Some(gpu) = self.gpu_fields.as_ref() else {
+            self.gpu_pending = false;
+            return;
+        };
+        let len = self.volt_ptr.len();
+        // SAFETY: both GPU buffers have the same length; `download_pair` only
+        // writes those elements and the pointers are not aliased by `gpu`.
         let (volt, curr) = unsafe {
             (
-                std::slice::from_raw_parts(self.volt_ptr.as_ptr(), self.volt_ptr.len()),
-                std::slice::from_raw_parts(self.curr_ptr.as_ptr(), self.curr_ptr.len()),
+                std::slice::from_raw_parts_mut(self.volt_ptr.as_mut_ptr(), len),
+                std::slice::from_raw_parts_mut(self.curr_ptr.as_mut_ptr(), len),
             )
         };
-        gpu.upload(volt, curr);
+        gpu.download_pair(volt, curr);
+        self.gpu_pending = false;
+        self.host_volt_dirty = false;
+        self.host_curr_dirty = false;
+    }
+
+    /// Upload the CPU voltage field into the GPU buffer when it changed on the
+    /// host (host-extension path); a no-op otherwise.
+    #[cfg(feature = "gpu")]
+    fn upload_volt(&mut self) {
+        if !self.host_volt_dirty {
+            return;
+        }
+        let Some(gpu) = self.gpu_fields.as_ref() else {
+            return;
+        };
+        // SAFETY: the slice only lives for the upload call, which copies it
+        // into the GPU buffer.
+        let volt =
+            unsafe { std::slice::from_raw_parts(self.volt_ptr.as_ptr(), self.volt_ptr.len()) };
+        gpu.upload_volt(volt);
+        self.host_volt_dirty = false;
+    }
+
+    /// Upload the CPU current field into the GPU buffer when it changed on the
+    /// host (host-extension path); a no-op otherwise.
+    #[cfg(feature = "gpu")]
+    fn upload_curr(&mut self) {
+        if !self.host_curr_dirty {
+            return;
+        }
+        let Some(gpu) = self.gpu_fields.as_ref() else {
+            return;
+        };
+        // SAFETY: as in `upload_volt`.
+        let curr =
+            unsafe { std::slice::from_raw_parts(self.curr_ptr.as_ptr(), self.curr_ptr.len()) };
+        gpu.upload_curr(curr);
+        self.host_curr_dirty = false;
     }
 
     /// Set the number of worker threads (clamped to at least one).
@@ -584,6 +650,19 @@ impl Engine {
         if self.gpu_fields.is_some() && !self.extensions.is_empty() {
             return self.iterate_ts_gpu_host(iter_ts);
         }
+        #[cfg(feature = "gpu")]
+        if self.gpu_fields.is_some() {
+            // Extension-free batch: record every E/H step into one submission
+            // and keep the fields resident. The batch ends with one download,
+            // so the CPU arrays are current for the caller as before.
+            if let Some(gpu) = self.gpu_fields.as_ref() {
+                gpu.dispatch_steps(iter_ts);
+            }
+            self.gpu_pending = true;
+            self.num_ts = self.num_ts.saturating_add(iter_ts);
+            self.sync_fields();
+            return true;
+        }
         for _ in 0..iter_ts {
             // Native `GetNumberOfTimesteps()` is the step index during the
             // update phases; the counter is incremented only at the end.
@@ -609,7 +688,7 @@ impl Engine {
         // The CPU arrays are only needed by observables/extensions; sync once
         // per batch instead of every step (extensions force the CPU path).
         #[cfg(feature = "gpu")]
-        self.sync_gpu_fields();
+        self.sync_fields();
         true
     }
 
@@ -626,20 +705,29 @@ impl Engine {
                 extension.set_timestep(number);
             }
 
-            // The CPU arrays hold the completed previous step.
+            // The CPU arrays hold the completed previous step, including the
+            // edits the extensions made after the last download.
             self.do_pre_voltage_updates();
-            self.upload_gpu_fields();
+            self.host_volt_dirty = true;
+            // The E kernel reads `curr` as its peer and updates `volt`.
+            self.upload_curr();
+            self.upload_volt();
             self.update_voltages();
-            self.sync_gpu_fields();
+            self.download_volt();
             self.do_post_voltage_updates();
             self.apply2_voltages();
+            self.host_volt_dirty = true;
 
             self.do_pre_current_updates();
-            self.upload_gpu_fields();
+            self.host_curr_dirty = true;
+            // The H kernel reads `volt` as its peer and updates `curr`.
+            self.upload_volt();
+            self.upload_curr();
             self.update_currents();
-            self.sync_gpu_fields();
+            self.download_curr();
             self.do_post_current_updates();
             self.apply2_current();
+            self.host_curr_dirty = true;
 
             self.num_ts += 1;
         }
