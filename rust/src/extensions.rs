@@ -66,6 +66,11 @@ pub trait EngineExtension {
         None
     }
 
+    /// TFSF tables for the device-side kernels.
+    fn tfsf_terms(&self) -> Option<&crate::extensions::EngineExtTFSF> {
+        None
+    }
+
     /// Mark this extension as fully executed by the device, so its host
     /// phases become no-ops.
     fn mark_gpu_handled(&mut self) {}
@@ -807,6 +812,9 @@ pub struct EngineExtTFSF {
     pub curr_amp: Vec<Vec<Vec<Vec<FDTD_FLOAT>>>>,
     /// `current_ts - delay` lookup table, computed once per step.
     delay_lookup: Vec<usize>,
+    /// The GPU path applies the two correction phases with device kernels; the
+    /// host phases then do nothing.
+    pub gpu_handled: bool,
 }
 
 impl EngineExtTFSF {
@@ -826,6 +834,7 @@ impl EngineExtTFSF {
             curr_delay_delta: vec![vec![vec![vec![]; 2]; 2]; 3],
             curr_amp: vec![vec![vec![vec![]; 2]; 2]; 3],
             delay_lookup: Vec::new(),
+            gpu_handled: false,
         }
     }
 
@@ -931,11 +940,26 @@ impl EngineExtension for EngineExtTFSF {
         "TFSF"
     }
 
+    fn tfsf_terms(&self) -> Option<&crate::extensions::EngineExtTFSF> {
+        Some(self)
+    }
+
+    fn mark_gpu_handled(&mut self) {
+        self.gpu_handled = true;
+    }
+
+    fn is_gpu_native(&self) -> bool {
+        self.gpu_handled
+    }
+
     fn set_timestep(&mut self, number: u32) {
         self.current_ts = number;
     }
 
     fn do_post_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        if self.gpu_handled {
+            return;
+        }
         let length = self.signal.signal_length();
         let period = self.signal.signal_period();
         self.update_delay_lookup(length, period);
@@ -979,6 +1003,9 @@ impl EngineExtension for EngineExtTFSF {
     }
 
     fn do_post_current_updates(&mut self, _volt: &FieldArray, curr: &mut FieldArray) {
+        if self.gpu_handled {
+            return;
+        }
         let length = self.signal.signal_length();
         let period = self.signal.signal_period();
         self.update_delay_lookup(length, period);

@@ -403,10 +403,154 @@ fn sheet_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
         sheet_volt[index] = sheet_volt[index] - correction;
     }
 }
+
+// Device-side TFSF: the two correction phases. Per term the table stores the
+// flat field index, the amplitude, the delay and the interpolation factor;
+// the per-step timestamp arrives in a uniform slot and the signal samples are
+// uploaded once.
+
+struct TfsfParams {
+    ts: u32,
+    length: u32,
+    period: u32,
+    max_delay: u32,
+};
+
+@group(0) @binding(0) var<storage, read_write> tfsf_target: array<f32>;
+@group(0) @binding(1) var<storage, read> tfsf_index: array<u32>;
+@group(0) @binding(2) var<storage, read> tfsf_amp: array<f32>;
+@group(0) @binding(3) var<storage, read> tfsf_delay: array<u32>;
+@group(0) @binding(4) var<storage, read> tfsf_delta: array<f32>;
+@group(0) @binding(5) var<storage, read> tfsf_samples: array<f32>;
+@group(0) @binding(6) var<uniform> tfsf_params: TfsfParams;
+
+// `EngineExtTFSF::update_delay_lookup`: negative becomes 0, a run past the
+// signal (for non-periodic signals) becomes 0, then the period folds it.
+// `delay + 1` past `max_delay` falls back to index 0, like the host table.
+fn tfsf_lookup(ts: u32, delay: u32) -> u32 {
+    if (delay > tfsf_params.max_delay) { return 0u; }
+    var value = 0u;
+    if (ts >= delay) {
+        let diff = ts - delay;
+        if (tfsf_params.period == 0u && diff >= tfsf_params.length) {
+            value = 0u;
+        } else {
+            value = diff;
+        }
+    }
+    if (tfsf_params.period > 0u) { value = value % tfsf_params.period; }
+    return value;
+}
+
+fn tfsf_sample(index: u32) -> f32 {
+    if (index < tfsf_params.length) { return tfsf_samples[index]; }
+    return 0.0;
+}
+
+@compute @workgroup_size(64)
+fn tfsf_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    if (t >= arrayLength(&tfsf_index)) { return; }
+    let ts = tfsf_params.ts;
+    let delay = tfsf_delay[t];
+    let first = tfsf_lookup(ts, delay);
+    let second = tfsf_lookup(ts, delay + 1u);
+    let delta = tfsf_delta[t];
+    let amp = tfsf_amp[t];
+    let correction = (1.0 - delta) * amp * tfsf_sample(first)
+        + delta * amp * tfsf_sample(second);
+    let index = tfsf_index[t];
+    tfsf_target[index] = tfsf_target[index] + correction;
+}
 "#;
 
 fn f32_bytes(values: &[FDTD_FLOAT]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// Host-side TFSF table flattening for one direction: one (index, amplitude,
+/// delay, delta) term per corrected edge, in the same order as
+/// `EngineExtTFSF`'s loops. Faces of one direction sit on opposite planes, so
+/// they never write the same edge; different directions overlap at the box
+/// corners, which is why the engine dispatches one pass per direction.
+fn tfsf_terms(
+    extension: &crate::extensions::EngineExtTFSF,
+    volt: bool,
+    dims: [usize; 3],
+    n: usize,
+) -> (Vec<u32>, Vec<f32>, Vec<u32>, Vec<f32>) {
+    let (i_stride, j_stride, plane) = (
+        dims[1] * dims[2],
+        dims[2],
+        dims[0] * dims[1] * dims[2],
+    );
+    let mut indices = Vec::new();
+    let mut amps = Vec::new();
+    let mut delays = Vec::new();
+    let mut deltas = Vec::new();
+    let n_p = (n + 1) % 3;
+    let n_pp = (n + 2) % 3;
+    for face in 0..2 {
+        if !extension.active_dir[n][face] {
+            continue;
+        }
+        let mut pos = [0usize; 3];
+        pos[n_p] = extension.start[n_p];
+        let mut ui_pos = 0usize;
+        for _i in 0..extension.num_lines[n_p] {
+            pos[n_pp] = extension.start[n_pp];
+            for _j in 0..extension.num_lines[n_pp] {
+                pos[n] = if volt {
+                    if face == 0 {
+                        extension.start[n]
+                    } else {
+                        extension.stop[n]
+                    }
+                } else if face == 0 {
+                    extension.start[n].saturating_sub(1)
+                } else {
+                    extension.stop[n]
+                };
+                for component in 0..2 {
+                    let (amp, delay, delta) = if volt {
+                        (
+                            extension.volt_amp[n][face][component].get(ui_pos).copied(),
+                            extension.volt_delay[n][face][component].get(ui_pos).copied(),
+                            extension.volt_delay_delta[n][face][component]
+                                .get(ui_pos)
+                                .copied(),
+                        )
+                    } else {
+                        (
+                            extension.curr_amp[n][face][component].get(ui_pos).copied(),
+                            extension.curr_delay[n][face][component].get(ui_pos).copied(),
+                            extension.curr_delay_delta[n][face][component]
+                                .get(ui_pos)
+                                .copied(),
+                        )
+                    };
+                    if let (Some(amp), Some(delay), Some(delta)) = (amp, delay, delta) {
+                        if amp != 0.0 {
+                            let edge = if component == 0 { n_p } else { n_pp };
+                            indices.push(
+                                (edge * plane
+                                    + pos[0] * i_stride
+                                    + pos[1] * j_stride
+                                    + pos[2]) as u32,
+                            );
+                            amps.push(amp);
+                            delays.push(delay);
+                            deltas.push(delta);
+                        }
+                    }
+                }
+                pos[n_pp] += 1;
+                ui_pos += 1;
+            }
+            pos[n_p] += 1;
+        }
+    }
+    (indices, amps, delays, deltas)
 }
 
 fn u32_bytes(values: &[u32]) -> Vec<u8> {
@@ -1066,6 +1210,50 @@ impl SheetBinds {
     }
 }
 
+/// Device-side TFSF kernels, one bind group per extension and side.
+struct TfsfBinds {
+    pipeline: wgpu::ComputePipeline,
+    volt: Vec<TfsfSide>,
+    curr: Vec<TfsfSide>,
+    slot_size: u32,
+}
+
+struct TfsfSide {
+    bind: wgpu::BindGroup,
+    groups: u32,
+    params: wgpu::Buffer,
+    scratch: std::cell::RefCell<Vec<u8>>,
+    length: u32,
+    period: u32,
+    max_delay: u32,
+}
+
+impl TfsfBinds {
+    fn write_params(&self, queue: &wgpu::Queue, side: &TfsfSide, start_ts: u32, steps: u32) {
+        let mut scratch = side.scratch.borrow_mut();
+        scratch.clear();
+        scratch.resize(steps as usize * self.slot_size as usize, 0);
+        for step in 0..steps {
+            let base = step as usize * self.slot_size as usize;
+            scratch[base..base + 4].copy_from_slice(&(start_ts + step).to_le_bytes());
+            scratch[base + 4..base + 8].copy_from_slice(&side.length.to_le_bytes());
+            scratch[base + 8..base + 12].copy_from_slice(&side.period.to_le_bytes());
+            scratch[base + 12..base + 16].copy_from_slice(&side.max_delay.to_le_bytes());
+        }
+        queue.write_buffer(&side.params, 0, &scratch);
+    }
+
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, side: &TfsfSide, step: u32) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("openems tfsf pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &side.bind, &[step * self.slot_size]);
+        pass.dispatch_workgroups(side.groups, 1, 1);
+    }
+}
+
 /// Persistent GPU field/coefficient buffers for `Engine`.
 ///
 /// The engine uploads once, dispatches the E and H kernels per step, and
@@ -1096,6 +1284,8 @@ pub struct GpuFields {
     lumped: Option<LumpedBinds>,
     /// Device-side conducting-sheet kernels.
     sheet: Option<SheetBinds>,
+    /// Device-side TFSF kernels.
+    tfsf: Option<TfsfBinds>,
     /// Reused little-endian upload scratch, so a host-phase upload does not
     /// allocate a new byte vector per field.
     upload_scratch: std::cell::RefCell<Vec<u8>>,
@@ -1256,6 +1446,7 @@ impl GpuFields {
             mur: None,
             lumped: None,
             sheet: None,
+            tfsf: None,
             upload_scratch: std::cell::RefCell::new(Vec::new()),
         })
     }
@@ -2058,6 +2249,179 @@ impl GpuFields {
         self.sheet.is_some()
     }
 
+    /// Build the device-side TFSF kernels from the host tables.
+    pub fn setup_tfsf(&mut self, tfsfs: &[&crate::extensions::EngineExtTFSF]) -> bool {
+        if tfsfs.is_empty() {
+            return false;
+        }
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("openems tfsf kernels"),
+            source: wgpu::ShaderSource::Wgsl(UPDATE_SHADER.into()),
+        });
+        let alignment = self
+            .device
+            .limits()
+            .min_uniform_buffer_offset_alignment
+            .max(16);
+        let slot_size = 16u32.div_ceil(alignment) * alignment;
+        let entries = (0..7u32)
+            .map(|binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: if binding == 6 {
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: None,
+                    }
+                } else {
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage {
+                            read_only: binding >= 1 && binding != 0,
+                        },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    }
+                },
+                count: None,
+            })
+            .collect::<Vec<_>>();
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("openems tfsf layout"),
+                entries: &entries,
+            });
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("openems tfsf pipeline layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("openems tfsf apply"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("tfsf_apply"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let dims = self.dims;
+        let mut make_side = |extension: &crate::extensions::EngineExtTFSF,
+                             volt: bool,
+                             direction: usize|
+         -> Option<TfsfSide> {
+            let (indices, amps, delays, deltas) = tfsf_terms(extension, volt, dims, direction);
+            if indices.is_empty() {
+                return None;
+            }
+            let count = indices.len() as u32;
+            let length = extension.signal.signal_length();
+            let samples: Vec<f32> = (0..length as usize)
+                .map(|index| {
+                    if volt {
+                        extension.signal.current(index)
+                    } else {
+                        extension.signal.voltage(index)
+                    }
+                })
+                .collect();
+            let buffer_u32 = |label: &str, data: &[u32]| {
+                use wgpu::util::DeviceExt;
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(label),
+                        contents: &u32_bytes(data),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
+            };
+            let buffer_f32 = |label: &str, data: &[f32]| {
+                use wgpu::util::DeviceExt;
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(label),
+                        contents: &f32_bytes(data),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
+            };
+            let index_buf = buffer_u32("openems tfsf index", &indices);
+            let amp_buf = buffer_f32("openems tfsf amp", &amps);
+            let delay_buf = buffer_u32("openems tfsf delay", &delays);
+            let delta_buf = buffer_f32("openems tfsf delta", &deltas);
+            let sample_buf = buffer_f32("openems tfsf samples", &samples);
+            let params = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("openems tfsf params"),
+                size: (SOURCE_BATCH * slot_size) as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("openems tfsf bind group"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: if volt {
+                            self.volt.as_entire_binding()
+                        } else {
+                            self.curr.as_entire_binding()
+                        },
+                    },
+                    wgpu::BindGroupEntry { binding: 1, resource: index_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: amp_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: delay_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: delta_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: sample_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &params,
+                            offset: 0,
+                            size: wgpu::BufferSize::new(16),
+                        }),
+                    },
+                ],
+            });
+            Some(TfsfSide {
+                bind,
+                groups: count.div_ceil(64).max(1),
+                params,
+                scratch: std::cell::RefCell::new(Vec::new()),
+                length,
+                period: extension.signal.signal_period(),
+                max_delay: extension.max_delay,
+            })
+        };
+        let mut volt = Vec::new();
+        let mut curr = Vec::new();
+        for extension in tfsfs {
+            // One pass per direction, in the host's n-outer order: corners are
+            // shared between directions and a single dispatch would race.
+            for direction in 0..3 {
+                if let Some(side) = make_side(extension, true, direction) {
+                    volt.push(side);
+                }
+                if let Some(side) = make_side(extension, false, direction) {
+                    curr.push(side);
+                }
+            }
+        }
+        if volt.is_empty() && curr.is_empty() {
+            return false;
+        }
+        self.tfsf = Some(TfsfBinds {
+            pipeline,
+            volt,
+            curr,
+            slot_size,
+        });
+        true
+    }
+
+    /// Whether device-side TFSF kernels are active.
+    pub fn has_tfsf(&self) -> bool {
+        self.tfsf.is_some()
+    }
+
     /// Apply the device-side voltage source for one step (host path).
     pub fn dispatch_source_volt(&self, ts: u32) {
         self.dispatch_source(true, ts);
@@ -2144,6 +2508,11 @@ impl GpuFields {
                     );
                 }
             }
+            if let Some(tfsf) = self.tfsf.as_ref() {
+                for side in tfsf.volt.iter().chain(tfsf.curr.iter()) {
+                    tfsf.write_params(&self.queue, side, start_ts + done, chunk);
+                }
+            }
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("openems engine batch"),
             });
@@ -2163,6 +2532,11 @@ impl GpuFields {
                 record_dispatch(&mut encoder, &self.pipe_e, &self.bind_e, volt_cells);
                 if let Some(upml) = self.upml.as_ref() {
                     upml.record(&mut encoder, 1);
+                }
+                if let Some(tfsf) = self.tfsf.as_ref() {
+                    for side in &tfsf.volt {
+                        tfsf.record(&mut encoder, side, step);
+                    }
                 }
                 if let Some(mur) = self.mur.as_ref() {
                     mur.record(&mut encoder, 1);
@@ -2185,6 +2559,11 @@ impl GpuFields {
                 record_dispatch(&mut encoder, &self.pipe_h, &self.bind_h, curr_cells);
                 if let Some(upml) = self.upml.as_ref() {
                     upml.record(&mut encoder, 3);
+                }
+                if let Some(tfsf) = self.tfsf.as_ref() {
+                    for side in &tfsf.curr {
+                        tfsf.record(&mut encoder, side, step);
+                    }
                 }
                 if let Some(source) = self.source.as_ref() {
                     source.record(&mut encoder, source.curr.as_ref(), step);

@@ -215,6 +215,7 @@ impl Engine {
                 || extension.mur_terms().is_some()
                 || extension.lumped_terms().is_some()
                 || extension.sheet_terms().is_some()
+                || extension.tfsf_terms().is_some()
         });
         if !all_native {
             if std::env::var_os("OPENEMS_DEBUG_GPU").is_some() {
@@ -287,6 +288,11 @@ impl Engine {
             .iter()
             .filter_map(|extension| extension.sheet_terms())
             .collect();
+        let tfsfs: Vec<&crate::extensions::EngineExtTFSF> = self
+            .extensions
+            .iter()
+            .filter_map(|extension| extension.tfsf_terms())
+            .collect();
         let Some(gpu) = self.gpu_fields.as_mut() else {
             return;
         };
@@ -306,17 +312,21 @@ impl Engine {
         if !sheets.is_empty() {
             prepared |= gpu.setup_sheet(&sheets);
         }
+        if !tfsfs.is_empty() {
+            prepared |= gpu.setup_tfsf(&tfsfs);
+        }
         if !prepared {
             return;
         }
         if std::env::var_os("OPENEMS_DEBUG_GPU").is_some() {
             eprintln!(
-                "[openEMS] GPU batched path: source {}, UPML slabs {}, Mur faces {}, lumped edges {}, sheet cells {}",
+                "[openEMS] GPU batched path: source {}, UPML slabs {}, Mur faces {}, lumped edges {}, sheet cells {}, TFSF regions {}",
                 if gpu.has_source() { "on device" } else { "none" },
                 upmls.len(),
                 murs.iter().map(|mur| mur.faces.len()).sum::<usize>(),
                 lumped.iter().map(|extension| extension.num_positions).sum::<usize>(),
-                sheets.iter().map(|sheet| sheet.num_positions).sum::<usize>()
+                sheets.iter().map(|sheet| sheet.num_positions).sum::<usize>(),
+                tfsfs.len()
             );
         }
         for extension in self.extensions.iter_mut() {
@@ -1529,6 +1539,97 @@ mod tests {
         );
         eprintln!(
             "GPU device sheet: {n}^3, {steps} steps, CPU diff {diff:.2e}, batch/step diff {batch_diff:.2e}, GPU {gpu_time:.2?}"
+        );
+    }
+
+    #[cfg(feature = "gpu")]
+    fn tfsf_extension(n: usize) -> crate::extensions::EngineExtTFSF {
+        let mut extension = crate::extensions::EngineExtTFSF::new();
+        extension.set_region([2, 2, 2], [n - 2, n - 2, n - 2]);
+        for direction in 0..3 {
+            extension.activate_face(direction, 0);
+            extension.activate_face(direction, 1);
+        }
+        extension.set_max_delay(6);
+        let mut signal = crate::excitation::Excitation::gauss(2.0e9, 1.0e9);
+        signal.build(1.0e-12, 4096).expect("signal must build");
+        extension.set_signal(signal);
+        extension.allocate();
+        for direction in 0..3 {
+            for face in 0..2 {
+                for component in 0..2 {
+                    let count = extension.volt_amp[direction][face][component].len();
+                    for pos in 0..count {
+                        extension.volt_amp[direction][face][component][pos] =
+                            0.2 + 0.01 * pos as f32;
+                        extension.volt_delay[direction][face][component][pos] = (pos % 5) as u32;
+                        extension.volt_delay_delta[direction][face][component][pos] = 0.25;
+                        extension.curr_amp[direction][face][component][pos] =
+                            0.15 + 0.01 * pos as f32;
+                        extension.curr_delay[direction][face][component][pos] =
+                            ((pos + 1) % 5) as u32;
+                        extension.curr_delay_delta[direction][face][component][pos] = 0.4;
+                    }
+                }
+            }
+        }
+        extension
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_device_tfsf_matches_the_cpu_engine() {
+        let n = 16;
+        let steps = 120;
+        let build = || {
+            let mut engine = Engine::new(Box::new(cavity_operator(n)));
+            engine.add_extension(Box::new(tfsf_extension(n)));
+            seed_fields(&mut engine);
+            engine
+        };
+
+        let mut cpu = build();
+        let cpu_start = std::time::Instant::now();
+        assert!(cpu.iterate_ts(steps));
+        let cpu_time = cpu_start.elapsed();
+
+        let mut gpu = build();
+        if let Err(reason) = gpu.enable_gpu() {
+            eprintln!("skipping the GPU TFSF test: {reason}");
+            return;
+        }
+        assert!(
+            gpu.gpu_fields
+                .as_ref()
+                .map(|fields| fields.has_tfsf())
+                .unwrap_or(false),
+            "the TFSF tables must be uploaded to the device"
+        );
+        assert!(
+            !gpu.needs_host_extension(),
+            "a TFSF-only model must use the batched device path"
+        );
+
+        let start = std::time::Instant::now();
+        assert!(gpu.iterate_ts(steps));
+        let gpu_time = start.elapsed();
+        let diff = field_diff(&cpu, &gpu);
+        assert!(diff < 1.0e-5, "CPU/GPU device-TFSF field diff {diff}");
+
+        let mut stepped = build();
+        if stepped.enable_gpu().is_err() {
+            return;
+        }
+        for _ in 0..steps {
+            assert!(stepped.iterate_ts(1));
+        }
+        let batch_diff = field_diff(&gpu, &stepped);
+        assert!(
+            batch_diff < 1.0e-6,
+            "batch vs single-step TFSF scheduling diff {batch_diff}"
+        );
+        eprintln!(
+            "GPU device TFSF: {n}^3, {steps} steps, CPU diff {diff:.2e}, batch/step diff {batch_diff:.2e}, CPU {cpu_time:.2?}, GPU {gpu_time:.2?}"
         );
     }
 
