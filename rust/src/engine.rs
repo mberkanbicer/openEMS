@@ -96,6 +96,32 @@ pub struct Engine {
     gpu_pending: bool,
 }
 
+#[cfg(feature = "gpu")]
+fn source_slot(
+    slots: &mut Vec<(usize, usize)>,
+    values: &mut Vec<Vec<f32>>,
+    signal: &std::sync::Arc<crate::excitation::Excitation>,
+    voltage: bool,
+) -> usize {
+    let key = std::sync::Arc::as_ptr(signal) as usize;
+    if let Some((_, slot)) = slots.iter().find(|(entry, _)| *entry == key) {
+        return *slot;
+    }
+    let length = signal.signal_length() as usize;
+    let mut samples = Vec::with_capacity(length);
+    for index in 0..length {
+        samples.push(if voltage {
+            signal.voltage(index)
+        } else {
+            signal.current(index)
+        });
+    }
+    let slot = slots.len();
+    slots.push((key, slot));
+    values.push(samples);
+    slot
+}
+
 impl Engine {
     /// Create a new engine for the given operator.
     pub fn new(op: Box<dyn OperatorBase>) -> Self {
@@ -168,7 +194,84 @@ impl Engine {
         )
         .ok_or_else(|| "GPU buffer size mismatch".to_string())?
         .into();
+        self.setup_gpu_source();
         Ok(())
+    }
+
+    /// Upload the excitation source so the device can apply it inside a batch.
+    ///
+    /// Only taken when every registered extension is an excitation. A mixed
+    /// model would have to apply the source between host extension phases,
+    /// where the host array is authoritative, so those keep the host path.
+    #[cfg(feature = "gpu")]
+    fn setup_gpu_source(&mut self) {
+        if self.gpu_fields.is_none() || self.extensions.is_empty() {
+            return;
+        }
+        if !self
+            .extensions
+            .iter()
+            .all(|extension| extension.excitation_terms().is_some())
+        {
+            return;
+        }
+        let dims = self.num_lines;
+        let i_stride = dims[1] * dims[2];
+        let j_stride = dims[2];
+        let plane = dims[0] * dims[1] * dims[2];
+        let mut terms = crate::gpu::SourceTerms::default();
+        let mut volt_slots: Vec<(usize, usize)> = Vec::new();
+        let mut curr_slots: Vec<(usize, usize)> = Vec::new();
+        for extension in &self.extensions {
+            let Some(source) = extension.excitation_terms() else {
+                continue;
+            };
+            for excitation in &source.voltage_excitations {
+                let slot = source_slot(&mut volt_slots, &mut terms.volt_values, &excitation.signal, true);
+                terms.volt.push(crate::gpu::SourceTerm {
+                    index: (excitation.component * plane
+                        + excitation.pos[0] * i_stride
+                        + excitation.pos[1] * j_stride
+                        + excitation.pos[2]) as u32,
+                    coeff: excitation.amp,
+                    delay: excitation.delay,
+                    period: excitation.signal.signal_period(),
+                    slot: slot as u32,
+                    length: excitation.signal.signal_length(),
+                });
+            }
+            for excitation in &source.current_excitations {
+                let slot = source_slot(&mut curr_slots, &mut terms.curr_values, &excitation.signal, false);
+                terms.curr.push(crate::gpu::SourceTerm {
+                    index: (excitation.component * plane
+                        + excitation.pos[0] * i_stride
+                        + excitation.pos[1] * j_stride
+                        + excitation.pos[2]) as u32,
+                    coeff: excitation.amp,
+                    delay: excitation.delay,
+                    period: excitation.signal.signal_period(),
+                    slot: slot as u32,
+                    length: excitation.signal.signal_length(),
+                });
+            }
+        }
+        let Some(gpu) = self.gpu_fields.as_mut() else {
+            return;
+        };
+        if !gpu.setup_source(&terms) {
+            return;
+        }
+        for extension in self.extensions.iter_mut() {
+            extension.mark_gpu_handled();
+        }
+    }
+
+    /// True when at least one extension must run on the host.
+    #[cfg(feature = "gpu")]
+    fn needs_host_extension(&self) -> bool {
+        self.extensions
+            .iter()
+            .any(|extension| !extension.is_gpu_native())
     }
 
     /// Copy the device `volt` result back into the CPU array.
@@ -647,16 +750,17 @@ impl Engine {
             return self.iterate_multi_grid(iter_ts);
         }
         #[cfg(feature = "gpu")]
-        if self.gpu_fields.is_some() && !self.extensions.is_empty() {
+        if self.gpu_fields.is_some() && self.needs_host_extension() {
             return self.iterate_ts_gpu_host(iter_ts);
         }
         #[cfg(feature = "gpu")]
         if self.gpu_fields.is_some() {
-            // Extension-free batch: record every E/H step into one submission
-            // and keep the fields resident. The batch ends with one download,
-            // so the CPU arrays are current for the caller as before.
+            // Extension-free or all-device batch: record every E/H step and
+            // the excitation source into one submission and keep the fields
+            // resident. The batch ends with one download, so the CPU arrays
+            // are current for the caller as before.
             if let Some(gpu) = self.gpu_fields.as_ref() {
-                gpu.dispatch_steps(iter_ts);
+                gpu.dispatch_steps(iter_ts, self.num_ts);
             }
             self.gpu_pending = true;
             self.num_ts = self.num_ts.saturating_add(iter_ts);
@@ -975,6 +1079,82 @@ mod tests {
             .zip(right)
             .map(|(x, y)| (x - y).abs())
             .fold(0.0, f32::max)
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_device_source_matches_the_cpu_engine() {
+        let n = 24;
+        let steps = 120;
+        // The source waveform only needs a fixed sample interval; both
+        // engines are fed the same samples, so the comparison is exact.
+        let mut signal = crate::excitation::Excitation::gauss(2.0e9, 1.0e9);
+        signal.build(1.0e-12, 4096).expect("signal must build");
+        let build = || {
+            let mut engine = Engine::new(Box::new(cavity_operator(n)));
+            let mut excitation = crate::extensions::EngineExtExcitation::new();
+            excitation.add_voltage_excitation(
+                0,
+                [3, 3, 3],
+                0,
+                1.5,
+                std::sync::Arc::new(signal.clone()),
+            );
+            excitation.add_current_excitation(
+                1,
+                [4, 4, 4],
+                0,
+                0.75,
+                std::sync::Arc::new(signal.clone()),
+            );
+            engine.add_extension(Box::new(excitation));
+            seed_fields(&mut engine);
+            engine
+        };
+
+        let mut cpu = build();
+        assert!(cpu.iterate_ts(steps));
+
+        let mut gpu = build();
+        if let Err(reason) = gpu.enable_gpu() {
+            eprintln!("skipping the GPU device-source test: {reason}");
+            return;
+        }
+        assert!(
+            gpu.gpu_fields
+                .as_ref()
+                .map(|fields| fields.has_source())
+                .unwrap_or(false),
+            "the excitation must be uploaded to the device"
+        );
+        assert!(
+            !gpu.needs_host_extension(),
+            "a source-only model must use the batched device path"
+        );
+
+        let start = std::time::Instant::now();
+        assert!(gpu.iterate_ts(steps));
+        let gpu_time = start.elapsed();
+        let diff = field_diff(&cpu, &gpu);
+        assert!(diff < 1.0e-5, "CPU/GPU device-source field diff {diff}");
+
+        // One batch and one step at a time must select the same source
+        // samples, i.e. the per-step uniform slots are indexed correctly.
+        let mut stepped = build();
+        if stepped.enable_gpu().is_err() {
+            return;
+        }
+        for _ in 0..steps {
+            assert!(stepped.iterate_ts(1));
+        }
+        let batch_diff = field_diff(&gpu, &stepped);
+        assert!(
+            batch_diff < 1.0e-6,
+            "batch vs single-step scheduling diff {batch_diff}"
+        );
+        eprintln!(
+            "GPU device source: {n}^3, {steps} steps, CPU diff {diff:.2e}, batch/step diff {batch_diff:.2e}, GPU {gpu_time:.2?}"
+        );
     }
 
     #[cfg(feature = "gpu")]

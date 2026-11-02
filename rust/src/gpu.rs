@@ -111,9 +111,54 @@ fn update_h(@builtin(global_invocation_id) gid: vec3<u32>) {
     field[hy] = field[hy] * ii[hy] + iv[hy] * (v0_ijk - v0_ijkp1 - v2_ijk + v2_ip1jk);
     field[hz] = field[hz] * ii[hz] + iv[hz] * (v1_ijk - v1_ip1jk - v0_ijk + v0_ijp1k);
 }
+
+// Device-side excitation source: `target[index] += coeff * value(ts)`.
+//
+// Mirrors `EngineExtExcitation::apply2_voltages` / `apply2_current`: the
+// sample index is `(ts - delay)` modulo the signal period when the signal is
+// periodic, and the term is skipped once the index runs past the built
+// signal. The waveform samples live in one concatenated buffer, one slot per
+// distinct signal, so a batch only needs the per-step `ts` in a uniform.
+
+struct SourceParams {
+    ts: u32,
+    stride: u32,
+    count: u32,
+    pad: u32,
+};
+
+@group(0) @binding(0) var<storage, read> src_index: array<u32>;
+@group(0) @binding(1) var<storage, read> src_coeff: array<f32>;
+@group(0) @binding(2) var<storage, read> src_delay: array<u32>;
+@group(0) @binding(3) var<storage, read> src_period: array<u32>;
+@group(0) @binding(4) var<storage, read> src_slot: array<u32>;
+@group(0) @binding(5) var<storage, read> src_length: array<u32>;
+@group(0) @binding(6) var<storage, read> src_values: array<f32>;
+@group(0) @binding(7) var<storage, read_write> src_target: array<f32>;
+@group(0) @binding(8) var<uniform> src_params: SourceParams;
+
+@compute @workgroup_size(64)
+fn apply_source(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let e = gid.x;
+    if (e >= src_params.count) { return; }
+    let ts = src_params.ts;
+    let delay = src_delay[e];
+    if (ts < delay) { return; }
+    var pos = ts - delay;
+    let period = src_period[e];
+    if (period > 0u) { pos = pos % period; }
+    if (pos >= src_length[e]) { return; }
+    let value = src_values[src_slot[e] * src_params.stride + pos];
+    let index = src_index[e];
+    src_target[index] = src_target[index] + src_coeff[e] * value;
+}
 "#;
 
 fn f32_bytes(values: &[FDTD_FLOAT]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+fn u32_bytes(values: &[u32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
@@ -556,6 +601,101 @@ impl GpuContext {
 }
 
 
+/// One device-side excitation term.
+///
+/// `index` is the flat N-I-J-K field index, `coeff` the weighted amplitude,
+/// and `slot`/`delay`/`period`/`length` reproduce
+/// `EngineExtExcitation::sample_index` on the device.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SourceTerm {
+    pub index: u32,
+    pub coeff: f32,
+    pub delay: u32,
+    pub period: u32,
+    pub slot: u32,
+    pub length: u32,
+}
+
+/// Host description of the excitation source handed to the GPU kernels.
+#[derive(Default)]
+pub struct SourceTerms {
+    pub volt: Vec<SourceTerm>,
+    pub curr: Vec<SourceTerm>,
+    /// `volt_values[slot][sample]` and `curr_values[slot][sample]`.
+    pub volt_values: Vec<Vec<f32>>,
+    pub curr_values: Vec<Vec<f32>>,
+}
+
+impl SourceTerms {
+    pub fn is_empty(&self) -> bool {
+        self.volt.is_empty() && self.curr.is_empty()
+    }
+
+    fn stride(&self) -> u32 {
+        self.volt_values
+            .iter()
+            .chain(self.curr_values.iter())
+            .map(|values| values.len())
+            .max()
+            .unwrap_or(0) as u32
+    }
+}
+
+/// Maximum number of steps recorded into one submission; the per-step uniform
+/// slots are sized for it.
+const SOURCE_BATCH: u32 = 256;
+
+struct SourceSide {
+    pipeline: wgpu::ComputePipeline,
+    bind: wgpu::BindGroup,
+    count: u32,
+    params: wgpu::Buffer,
+    scratch: std::cell::RefCell<Vec<u8>>,
+}
+
+/// Device-side excitation kernels and their per-step parameters.
+struct SourceBinds {
+    volt: Option<SourceSide>,
+    curr: Option<SourceSide>,
+    slot_size: u32,
+    stride: u32,
+}
+
+impl SourceBinds {
+    fn write_params(
+        queue: &wgpu::Queue,
+        side: &SourceSide,
+        slot_size: u32,
+        stride: u32,
+        start_ts: u32,
+        steps: u32,
+    ) {
+        let mut scratch = side.scratch.borrow_mut();
+        scratch.clear();
+        scratch.resize(steps as usize * slot_size as usize, 0);
+        for step in 0..steps {
+            let base = step as usize * slot_size as usize;
+            scratch[base..base + 4].copy_from_slice(&(start_ts + step).to_le_bytes());
+            scratch[base + 4..base + 8].copy_from_slice(&stride.to_le_bytes());
+            scratch[base + 8..base + 12].copy_from_slice(&side.count.to_le_bytes());
+        }
+        queue.write_buffer(&side.params, 0, &scratch);
+    }
+
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, side: Option<&SourceSide>, step: u32) {
+        let Some(side) = side else {
+            return;
+        };
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("openems source pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&side.pipeline);
+        pass.set_bind_group(0, &side.bind, &[step * self.slot_size]);
+        pass.dispatch_workgroups(side.count.div_ceil(64).max(1), 1, 1);
+    }
+}
+
 /// Persistent GPU field/coefficient buffers for `Engine`.
 ///
 /// The engine uploads once, dispatches the E and H kernels per step, and
@@ -576,6 +716,8 @@ pub struct GpuFields {
     staging_curr: wgpu::Buffer,
     /// Persistent map-read staging buffer for a `volt`+`curr` pair download.
     staging_pair: wgpu::Buffer,
+    /// Device-side excitation kernels, when the model has a source.
+    source: Option<SourceBinds>,
     /// Reused little-endian upload scratch, so a host-phase upload does not
     /// allocate a new byte vector per field.
     upload_scratch: std::cell::RefCell<Vec<u8>>,
@@ -731,8 +873,198 @@ impl GpuFields {
             staging_volt,
             staging_curr,
             staging_pair,
+            source: None,
             upload_scratch: std::cell::RefCell::new(Vec::new()),
         })
+    }
+
+    /// Build the device-side excitation kernels from the host terms.
+    ///
+    /// Returns `true` when at least one side was created; the caller marks the
+    /// extension as GPU-handled so its host phase becomes a no-op.
+    pub fn setup_source(&mut self, terms: &SourceTerms) -> bool {
+        if terms.is_empty() {
+            return false;
+        }
+        let stride = terms.stride();
+        let alignment = self
+            .device
+            .limits()
+            .min_uniform_buffer_offset_alignment
+            .max(16);
+        let slot_size = 16u32.div_ceil(alignment) * alignment;
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("openems source kernels"),
+            source: wgpu::ShaderSource::Wgsl(UPDATE_SHADER.into()),
+        });
+        let entries = (0..9u32)
+            .map(|binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: if binding == 8 {
+                        wgpu::BufferBindingType::Uniform
+                    } else if binding == 7 {
+                        wgpu::BufferBindingType::Storage { read_only: false }
+                    } else {
+                        wgpu::BufferBindingType::Storage { read_only: true }
+                    },
+                    has_dynamic_offset: binding == 8,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .collect::<Vec<_>>();
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("openems source layout"),
+                entries: &entries,
+            });
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("openems source pipeline layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("openems source apply"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("apply_source"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let mut make_side = |terms: &[SourceTerm],
+                             values: &[Vec<f32>],
+                             target: &wgpu::Buffer|
+         -> Option<SourceSide> {
+            if terms.is_empty() || values.is_empty() {
+                return None;
+            }
+            let count = terms.len() as u32;
+            let indices: Vec<u32> = terms.iter().map(|term| term.index).collect();
+            let coeffs: Vec<f32> = terms.iter().map(|term| term.coeff).collect();
+            let delays: Vec<u32> = terms.iter().map(|term| term.delay).collect();
+            let periods: Vec<u32> = terms.iter().map(|term| term.period).collect();
+            let slots: Vec<u32> = terms.iter().map(|term| term.slot).collect();
+            let lengths: Vec<u32> = terms.iter().map(|term| term.length).collect();
+            let mut samples = Vec::with_capacity(values.len() * stride as usize);
+            for slot in values {
+                samples.extend_from_slice(slot);
+                samples.resize(samples.len() + (stride as usize - slot.len()), 0.0);
+            }
+            let buffer_u32 = |label: &str, data: &[u32]| {
+                use wgpu::util::DeviceExt;
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(label),
+                        contents: &u32_bytes(data),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
+            };
+            let buffer_f32 = |label: &str, data: &[f32]| {
+                use wgpu::util::DeviceExt;
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(label),
+                        contents: &f32_bytes(data),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
+            };
+            let index_buf = buffer_u32("openems source index", &indices);
+            let coeff_buf = buffer_f32("openems source coeff", &coeffs);
+            let delay_buf = buffer_u32("openems source delay", &delays);
+            let period_buf = buffer_u32("openems source period", &periods);
+            let slot_buf = buffer_u32("openems source slot", &slots);
+            let length_buf = buffer_u32("openems source length", &lengths);
+            let value_buf = buffer_f32("openems source values", &samples);
+            let params = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("openems source params"),
+                size: (SOURCE_BATCH * slot_size) as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("openems source bind group"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: index_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: coeff_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: delay_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: period_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: slot_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: length_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: value_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: target.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &params,
+                            offset: 0,
+                            size: wgpu::BufferSize::new(16),
+                        }),
+                    },
+                ],
+            });
+            Some(SourceSide {
+                pipeline: pipeline.clone(),
+                bind,
+                count,
+                params,
+                scratch: std::cell::RefCell::new(Vec::new()),
+            })
+        };
+        let volt = make_side(&terms.volt, &terms.volt_values, &self.volt);
+        let curr = make_side(&terms.curr, &terms.curr_values, &self.curr);
+        if volt.is_none() && curr.is_none() {
+            return false;
+        }
+        self.source = Some(SourceBinds {
+            volt,
+            curr,
+            slot_size,
+            stride,
+        });
+        true
+    }
+
+    /// Whether a device-side excitation source is active.
+    pub fn has_source(&self) -> bool {
+        self.source.is_some()
+    }
+
+    /// Apply the device-side voltage source for one step (host path).
+    pub fn dispatch_source_volt(&self, ts: u32) {
+        self.dispatch_source(true, ts);
+    }
+
+    /// Apply the device-side current source for one step (host path).
+    pub fn dispatch_source_curr(&self, ts: u32) {
+        self.dispatch_source(false, ts);
+    }
+
+    fn dispatch_source(&self, volt: bool, ts: u32) {
+        let Some(source) = self.source.as_ref() else {
+            return;
+        };
+        let side = if volt {
+            source.volt.as_ref()
+        } else {
+            source.curr.as_ref()
+        };
+        let Some(side) = side else {
+            return;
+        };
+        SourceBinds::write_params(&self.queue, side, source.slot_size, source.stride, ts, 1);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("openems source step"),
+        });
+        if volt {
+            source.record(&mut encoder, source.volt.as_ref(), 0);
+        } else {
+            source.record(&mut encoder, source.curr.as_ref(), 0);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
     }
 
     pub fn dispatch_e(&self) {
@@ -750,27 +1082,58 @@ impl GpuFields {
     /// The earlier path submitted one command buffer per half step, so a batch
     /// of N steps paid 2N queue submissions plus the per-step host sync. Here
     /// the passes are recorded back to back and submitted once per chunk, and
-    /// the fields stay on the device between steps.
-    pub fn dispatch_steps(&self, steps: u32) {
+    /// the fields stay on the device between steps. A device-side source is
+    /// interleaved after the E and H kernels, matching the host order
+    /// (`UpdateVoltages` -> `Apply2Voltages` -> `UpdateCurrents` ->
+    /// `Apply2Current`).
+    pub fn dispatch_steps(&self, steps: u32, start_ts: u32) {
         // Bound the encoder size; a chunk is still thousands of kernel
         // launches, far fewer submissions than before.
-        const CHUNK: u32 = 256;
+        const CHUNK: u32 = SOURCE_BATCH;
         let volt_cells = (self.dims[0] * self.dims[1] * self.dims[2]) as u32;
         let curr_cells = (self.dims[0].saturating_sub(1)
             * self.dims[1].saturating_sub(1)
             * self.dims[2].saturating_sub(1)) as u32;
-        let mut remaining = steps;
-        while remaining > 0 {
-            let chunk = remaining.min(CHUNK);
+        let mut done = 0u32;
+        while done < steps {
+            let chunk = (steps - done).min(CHUNK);
+            if let Some(source) = self.source.as_ref() {
+                if let Some(side) = source.volt.as_ref() {
+                    SourceBinds::write_params(
+                        &self.queue,
+                        side,
+                        source.slot_size,
+                        source.stride,
+                        start_ts + done,
+                        chunk,
+                    );
+                }
+                if let Some(side) = source.curr.as_ref() {
+                    SourceBinds::write_params(
+                        &self.queue,
+                        side,
+                        source.slot_size,
+                        source.stride,
+                        start_ts + done,
+                        chunk,
+                    );
+                }
+            }
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("openems engine batch"),
             });
-            for _ in 0..chunk {
+            for step in 0..chunk {
                 record_dispatch(&mut encoder, &self.pipe_e, &self.bind_e, volt_cells);
+                if let Some(source) = self.source.as_ref() {
+                    source.record(&mut encoder, source.volt.as_ref(), step);
+                }
                 record_dispatch(&mut encoder, &self.pipe_h, &self.bind_h, curr_cells);
+                if let Some(source) = self.source.as_ref() {
+                    source.record(&mut encoder, source.curr.as_ref(), step);
+                }
             }
             self.queue.submit(std::iter::once(encoder.finish()));
-            remaining -= chunk;
+            done += chunk;
         }
     }
 

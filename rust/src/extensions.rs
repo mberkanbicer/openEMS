@@ -37,6 +37,21 @@ pub trait EngineExtension {
     fn get_last_diff(&self) -> Option<FDTD_FLOAT> {
         None
     }
+
+    /// Excitation terms for the device-side source kernels, if this extension
+    /// is an excitation. The engine builds the GPU buffers from them.
+    fn excitation_terms(&self) -> Option<&crate::extensions::EngineExtExcitation> {
+        None
+    }
+
+    /// Mark this extension as fully executed by the device, so its host
+    /// phases become no-ops.
+    fn mark_gpu_handled(&mut self) {}
+
+    /// True when the GPU path runs this extension entirely on the device.
+    fn is_gpu_native(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -79,6 +94,9 @@ pub struct EngineExtExcitation {
     pub voltage_excitations: Vec<VoltageExcitation>,
     pub current_excitations: Vec<CurrentExcitation>,
     pub current_ts: u32,
+    /// The GPU path applies the source with a device kernel; the host phases
+    /// then do nothing.
+    pub gpu_handled: bool,
 }
 
 impl EngineExtExcitation {
@@ -87,6 +105,7 @@ impl EngineExtExcitation {
             voltage_excitations: Vec::new(),
             current_excitations: Vec::new(),
             current_ts: 0,
+            gpu_handled: false,
         }
     }
 
@@ -165,7 +184,22 @@ impl EngineExtension for EngineExtExcitation {
         "Excitation"
     }
 
+    fn excitation_terms(&self) -> Option<&crate::extensions::EngineExtExcitation> {
+        Some(self)
+    }
+
+    fn mark_gpu_handled(&mut self) {
+        self.gpu_handled = true;
+    }
+
+    fn is_gpu_native(&self) -> bool {
+        self.gpu_handled
+    }
+
     fn apply2_voltages(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        if self.gpu_handled {
+            return;
+        }
         let ts = self.current_ts;
         for exc in &self.voltage_excitations {
             let Some(index) = Self::sample_index(&exc.signal, ts, exc.delay) else {
@@ -178,6 +212,9 @@ impl EngineExtension for EngineExtExcitation {
     }
 
     fn apply2_current(&mut self, _volt: &FieldArray, curr: &mut FieldArray) {
+        if self.gpu_handled {
+            return;
+        }
         let ts = self.current_ts;
         for exc in &self.current_excitations {
             let Some(index) = Self::sample_index(&exc.signal, ts, exc.delay) else {
