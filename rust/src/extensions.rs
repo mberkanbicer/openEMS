@@ -61,6 +61,11 @@ pub trait EngineExtension {
         None
     }
 
+    /// Conducting-sheet positions for the device-side kernels.
+    fn sheet_terms(&self) -> Option<&crate::extensions::EngineExtConductingSheet> {
+        None
+    }
+
     /// Mark this extension as fully executed by the device, so its host
     /// phases become no-ops.
     fn mark_gpu_handled(&mut self) {}
@@ -1680,6 +1685,9 @@ pub struct EngineExtConductingSheet {
     pub vi_mod: Vec<Vec<FDTD_FLOAT>>,
     /// Whether EC coefficients have been applied to the operator.
     pub ec_applied: bool,
+    /// The GPU path applies the two ADE phases with device kernels; the host
+    /// phases then do nothing.
+    pub gpu_handled: bool,
 }
 
 impl EngineExtConductingSheet {
@@ -1712,6 +1720,7 @@ impl EngineExtConductingSheet {
             vv_mod,
             vi_mod,
             ec_applied: false,
+            gpu_handled: false,
         }
     }
 
@@ -1767,7 +1776,22 @@ impl EngineExtension for EngineExtConductingSheet {
         "Conducting Sheet"
     }
 
+    fn sheet_terms(&self) -> Option<&crate::extensions::EngineExtConductingSheet> {
+        Some(self)
+    }
+
+    fn mark_gpu_handled(&mut self) {
+        self.gpu_handled = true;
+    }
+
+    fn is_gpu_native(&self) -> bool {
+        self.gpu_handled
+    }
+
     fn do_pre_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        if self.gpu_handled {
+            return;
+        }
         // ADE update: volt_ADE[o][n] = v_int * volt_ADE[o][n] + v_ext * V[n]
         for pos_idx in 0..self.num_positions {
             let [i, j, k] = self.positions[pos_idx];
@@ -1783,6 +1807,9 @@ impl EngineExtension for EngineExtConductingSheet {
     }
 
     fn apply2_voltages(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        if self.gpu_handled {
+            return;
+        }
         // Subtract the sum of ADE corrections from voltage fields.
         for pos_idx in 0..self.num_positions {
             let [i, j, k] = self.positions[pos_idx];

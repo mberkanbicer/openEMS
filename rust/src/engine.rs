@@ -214,6 +214,7 @@ impl Engine {
                 || extension.upml_terms().is_some()
                 || extension.mur_terms().is_some()
                 || extension.lumped_terms().is_some()
+                || extension.sheet_terms().is_some()
         });
         if !all_native {
             if std::env::var_os("OPENEMS_DEBUG_GPU").is_some() {
@@ -281,6 +282,11 @@ impl Engine {
             .iter()
             .filter_map(|extension| extension.lumped_terms())
             .collect();
+        let sheets: Vec<&crate::extensions::EngineExtConductingSheet> = self
+            .extensions
+            .iter()
+            .filter_map(|extension| extension.sheet_terms())
+            .collect();
         let Some(gpu) = self.gpu_fields.as_mut() else {
             return;
         };
@@ -297,16 +303,20 @@ impl Engine {
         if !lumped.is_empty() {
             prepared |= gpu.setup_lumped(&lumped);
         }
+        if !sheets.is_empty() {
+            prepared |= gpu.setup_sheet(&sheets);
+        }
         if !prepared {
             return;
         }
         if std::env::var_os("OPENEMS_DEBUG_GPU").is_some() {
             eprintln!(
-                "[openEMS] GPU batched path: source {}, UPML slabs {}, Mur faces {}, lumped edges {}",
+                "[openEMS] GPU batched path: source {}, UPML slabs {}, Mur faces {}, lumped edges {}, sheet cells {}",
                 if gpu.has_source() { "on device" } else { "none" },
                 upmls.len(),
                 murs.iter().map(|mur| mur.faces.len()).sum::<usize>(),
-                lumped.iter().map(|extension| extension.num_positions).sum::<usize>()
+                lumped.iter().map(|extension| extension.num_positions).sum::<usize>(),
+                sheets.iter().map(|sheet| sheet.num_positions).sum::<usize>()
             );
         }
         for extension in self.extensions.iter_mut() {
@@ -1444,6 +1454,81 @@ mod tests {
         );
         eprintln!(
             "GPU device lumped: {n}^3, {steps} steps, CPU diff {diff:.2e}, batch/step diff {batch_diff:.2e}, GPU {gpu_time:.2?}"
+        );
+    }
+
+    #[cfg(feature = "gpu")]
+    fn sheet_extension(n: usize) -> crate::extensions::EngineExtConductingSheet {
+        let mut extension = crate::extensions::EngineExtConductingSheet::new(2);
+        let mut coefficients = crate::extensions::ConductingSheetCoeffs {
+            v_int_ade: [[0.0; 3]; 2],
+            v_ext_ade: [[0.0; 3]; 2],
+            vv: [0.0; 3],
+            vi: [0.0; 3],
+        };
+        for order in 0..2 {
+            for component in 0..3 {
+                coefficients.v_int_ade[order][component] = 0.5 + 0.05 * (order * 3 + component) as f32;
+                coefficients.v_ext_ade[order][component] = 0.1 * (1 + order * 3 + component) as f32;
+            }
+        }
+        extension.set_position(0, [3, 3, 3], &coefficients);
+        extension.set_position(1, [n / 2, n / 2, n / 2], &coefficients);
+        extension
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_device_conducting_sheet_matches_the_cpu_engine() {
+        let n = 12;
+        let steps = 120;
+        let build = || {
+            let mut engine = Engine::new(Box::new(cavity_operator(n)));
+            engine.add_extension(Box::new(sheet_extension(n)));
+            seed_fields(&mut engine);
+            engine
+        };
+
+        let mut cpu = build();
+        assert!(cpu.iterate_ts(steps));
+
+        let mut gpu = build();
+        if let Err(reason) = gpu.enable_gpu() {
+            eprintln!("skipping the GPU sheet test: {reason}");
+            return;
+        }
+        assert!(
+            gpu.gpu_fields
+                .as_ref()
+                .map(|fields| fields.has_sheet())
+                .unwrap_or(false),
+            "the sheet cells must be uploaded to the device"
+        );
+        assert!(
+            !gpu.needs_host_extension(),
+            "a sheet-only model must use the batched device path"
+        );
+
+        let start = std::time::Instant::now();
+        assert!(gpu.iterate_ts(steps));
+        let gpu_time = start.elapsed();
+        let diff = field_diff(&cpu, &gpu);
+        assert!(diff < 1.0e-5, "CPU/GPU device-sheet field diff {diff}");
+
+        let mut stepped = build();
+        if stepped.enable_gpu().is_err() {
+            return;
+        }
+        for _ in 0..steps {
+            assert!(stepped.iterate_ts(1));
+        }
+        let batch_diff = field_diff(&gpu, &stepped);
+        assert!(
+            batch_diff < 1.0e-6,
+            "batch vs single-step sheet scheduling diff {batch_diff}"
+        );
+        eprintln!(
+            "GPU device sheet: {n}^3, {steps} steps, CPU diff {diff:.2e}, batch/step diff {batch_diff:.2e}, GPU {gpu_time:.2?}"
         );
     }
 

@@ -357,6 +357,52 @@ fn lumped_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
         - (lump_coeff[c + 6u] * lump_coeff[c + 4u]) * lump_jn[b + 2u];
     lump_volt[index] = lump_hist[b];
 }
+
+// Device-side conducting sheet: two ADE orders over the sheet cells. The
+// per-cell state and coefficients are packed as (order * 3 + component) * n.
+
+struct SheetDims {
+    count: vec4<u32>,
+    plane: vec4<u32>,
+};
+
+@group(0) @binding(0) var<storage, read_write> sheet_volt: array<f32>;
+@group(0) @binding(1) var<storage, read> sheet_pos: array<u32>;
+@group(0) @binding(2) var<storage, read> sheet_int: array<f32>;
+@group(0) @binding(3) var<storage, read> sheet_ext: array<f32>;
+@group(0) @binding(4) var<storage, read_write> sheet_state: array<f32>;
+@group(0) @binding(5) var<uniform> sheet_dims: SheetDims;
+
+@compute @workgroup_size(64)
+fn sheet_pre(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    if (t >= sheet_dims.count.x) { return; }
+    let base = sheet_pos[t];
+    let plane = sheet_dims.plane.x;
+    let count = sheet_dims.count.x;
+    for (var n = 0u; n < 3u; n = n + 1u) {
+        let v = sheet_volt[base + n * plane];
+        for (var o = 0u; o < 2u; o = o + 1u) {
+            let s = (o * 3u + n) * count + t;
+            sheet_state[s] = sheet_int[s] * sheet_state[s] + sheet_ext[s] * v;
+        }
+    }
+}
+
+@compute @workgroup_size(64)
+fn sheet_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    if (t >= sheet_dims.count.x) { return; }
+    let base = sheet_pos[t];
+    let plane = sheet_dims.plane.x;
+    let count = sheet_dims.count.x;
+    for (var n = 0u; n < 3u; n = n + 1u) {
+        let correction = sheet_state[(0u * 3u + n) * count + t]
+            + sheet_state[(1u * 3u + n) * count + t];
+        let index = base + n * plane;
+        sheet_volt[index] = sheet_volt[index] - correction;
+    }
+}
 "#;
 
 fn f32_bytes(values: &[FDTD_FLOAT]) -> Vec<u8> {
@@ -1000,6 +1046,26 @@ impl LumpedBinds {
     }
 }
 
+/// Device-side conducting-sheet kernels.
+struct SheetBinds {
+    pre: wgpu::ComputePipeline,
+    apply: wgpu::ComputePipeline,
+    bind: wgpu::BindGroup,
+    groups: u32,
+}
+
+impl SheetBinds {
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, pre: bool) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("openems sheet pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(if pre { &self.pre } else { &self.apply });
+        pass.set_bind_group(0, &self.bind, &[]);
+        pass.dispatch_workgroups(self.groups, 1, 1);
+    }
+}
+
 /// Persistent GPU field/coefficient buffers for `Engine`.
 ///
 /// The engine uploads once, dispatches the E and H kernels per step, and
@@ -1028,6 +1094,8 @@ pub struct GpuFields {
     mur: Option<MurBinds>,
     /// Device-side lumped RLC kernels, when the model has lumped elements.
     lumped: Option<LumpedBinds>,
+    /// Device-side conducting-sheet kernels.
+    sheet: Option<SheetBinds>,
     /// Reused little-endian upload scratch, so a host-phase upload does not
     /// allocate a new byte vector per field.
     upload_scratch: std::cell::RefCell<Vec<u8>>,
@@ -1187,6 +1255,7 @@ impl GpuFields {
             upml: None,
             mur: None,
             lumped: None,
+            sheet: None,
             upload_scratch: std::cell::RefCell::new(Vec::new()),
         })
     }
@@ -1822,6 +1891,173 @@ impl GpuFields {
         self.lumped.is_some()
     }
 
+    /// Build the device-side conducting-sheet kernels from the host cells.
+    pub fn setup_sheet(
+        &mut self,
+        sheets: &[&crate::extensions::EngineExtConductingSheet],
+    ) -> bool {
+        let count: usize = sheets.iter().map(|sheet| sheet.num_positions).sum();
+        if count == 0 {
+            return false;
+        }
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("openems sheet kernels"),
+            source: wgpu::ShaderSource::Wgsl(UPDATE_SHADER.into()),
+        });
+        let entries = (0..6u32)
+            .map(|binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: if binding == 5 {
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    }
+                } else {
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage {
+                            read_only: binding == 1 || binding == 2 || binding == 3,
+                        },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    }
+                },
+                count: None,
+            })
+            .collect::<Vec<_>>();
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("openems sheet layout"),
+                entries: &entries,
+            });
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("openems sheet pipeline layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = |entry: &str| {
+            self.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(&pipeline_layout),
+                    module: &shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        };
+        let pre = pipeline("sheet_pre");
+        let apply = pipeline("sheet_apply");
+        let dims = self.dims;
+        let (i_stride, j_stride, plane) = (
+            dims[1] * dims[2],
+            dims[2],
+            dims[0] * dims[1] * dims[2],
+        );
+        let mut positions = Vec::with_capacity(count);
+        let mut int_coeffs = Vec::with_capacity(6 * count);
+        let mut ext_coeffs = Vec::with_capacity(6 * count);
+        let mut state = Vec::with_capacity(6 * count);
+        for sheet in sheets {
+            // The kernels work on the component-0 base index; `n * plane` is
+            // added inside the shader.
+            for pos in 0..sheet.num_positions {
+                let [i, j, k] = sheet.positions[pos];
+                positions.push((i * i_stride + j * j_stride + k) as u32);
+            }
+        }
+        // Global (order, component, position) layout, so several sheet
+        // extensions concatenate into one matrix.
+        for order in 0..2 {
+            for component in 0..3 {
+                for sheet in sheets {
+                    int_coeffs.extend_from_slice(&sheet.v_int_ade[order][component]);
+                }
+            }
+        }
+        for order in 0..2 {
+            for component in 0..3 {
+                for sheet in sheets {
+                    ext_coeffs.extend_from_slice(&sheet.v_ext_ade[order][component]);
+                }
+            }
+        }
+        for order in 0..2 {
+            for component in 0..3 {
+                for sheet in sheets {
+                    state.extend_from_slice(&sheet.volt_ade[order][component]);
+                }
+            }
+        }
+        let buffer_u32 = |label: &str, data: &[u32]| {
+            use wgpu::util::DeviceExt;
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: &u32_bytes(data),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let buffer_f32 = |label: &str, data: &[f32]| {
+            use wgpu::util::DeviceExt;
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: &f32_bytes(data),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let pos_buf = buffer_u32("openems sheet pos", &positions);
+        let int_buf = buffer_f32("openems sheet int", &int_coeffs);
+        let ext_buf = buffer_f32("openems sheet ext", &ext_coeffs);
+        let state_buf = buffer_f32("openems sheet state", &state);
+        let uniform = {
+            use wgpu::util::DeviceExt;
+            let mut data = Vec::with_capacity(32);
+            for value in [count as u32, 0, 0, 0] {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            for value in [plane as u32, 0, 0, 0] {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("openems sheet dims"),
+                    contents: &data,
+                    usage: wgpu::BufferUsages::UNIFORM,
+                })
+        };
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("openems sheet bind group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.volt.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry { binding: 1, resource: pos_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: int_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: ext_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: state_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: uniform.as_entire_binding() },
+            ],
+        });
+        self.sheet = Some(SheetBinds {
+            pre,
+            apply,
+            bind,
+            groups: (count as u32).div_ceil(64).max(1),
+        });
+        true
+    }
+
+    /// Whether device-side conducting-sheet kernels are active.
+    pub fn has_sheet(&self) -> bool {
+        self.sheet.is_some()
+    }
+
     /// Apply the device-side voltage source for one step (host path).
     pub fn dispatch_source_volt(&self, ts: u32) {
         self.dispatch_source(true, ts);
@@ -1918,6 +2154,9 @@ impl GpuFields {
                 if let Some(lumped) = self.lumped.as_ref() {
                     lumped.record(&mut encoder, true);
                 }
+                if let Some(sheet) = self.sheet.as_ref() {
+                    sheet.record(&mut encoder, true);
+                }
                 if let Some(upml) = self.upml.as_ref() {
                     upml.record(&mut encoder, 0);
                 }
@@ -1927,6 +2166,9 @@ impl GpuFields {
                 }
                 if let Some(mur) = self.mur.as_ref() {
                     mur.record(&mut encoder, 1);
+                }
+                if let Some(sheet) = self.sheet.as_ref() {
+                    sheet.record(&mut encoder, false);
                 }
                 if let Some(lumped) = self.lumped.as_ref() {
                     lumped.record(&mut encoder, false);
