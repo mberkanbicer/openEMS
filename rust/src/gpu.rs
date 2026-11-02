@@ -152,6 +152,92 @@ fn apply_source(@builtin(global_invocation_id) gid: vec3<u32>) {
     let index = src_index[e];
     src_target[index] = src_target[index] + src_coeff[e] * value;
 }
+
+// Device-side UPML: the four PML phases over one slab, mirroring
+// `EngineExtUPML`'s host loops. The slab arrays are concatenated over the
+// three components, so the invocation index is also the slab-array index and
+// the global field index is decoded from the uniform.
+
+struct UpmlDims {
+    global: vec4<u32>,
+    start: vec4<u32>,
+    slab: vec4<u32>,
+};
+
+@group(0) @binding(0) var<storage, read_write> up_volt: array<f32>;
+@group(0) @binding(1) var<storage, read_write> up_curr: array<f32>;
+@group(0) @binding(2) var<storage, read> up_vv: array<f32>;
+@group(0) @binding(3) var<storage, read> up_vvfo: array<f32>;
+@group(0) @binding(4) var<storage, read> up_vvfn: array<f32>;
+@group(0) @binding(5) var<storage, read> up_ii: array<f32>;
+@group(0) @binding(6) var<storage, read> up_iifo: array<f32>;
+@group(0) @binding(7) var<storage, read> up_iifn: array<f32>;
+@group(0) @binding(8) var<storage, read_write> up_volt_flux: array<f32>;
+@group(0) @binding(9) var<storage, read_write> up_curr_flux: array<f32>;
+@group(0) @binding(10) var<uniform> up_dims: UpmlDims;
+
+fn upml_global_index(t: u32) -> u32 {
+    let slab_n = up_dims.slab.x * up_dims.slab.y * up_dims.slab.z;
+    let comp = t / slab_n;
+    let rem = t % slab_n;
+    let nj = up_dims.slab.y;
+    let nk = up_dims.slab.z;
+    let i = rem / (nj * nk);
+    let rem2 = rem % (nj * nk);
+    let j = rem2 / nk;
+    let k = rem2 % nk;
+    let plane = up_dims.global.x * up_dims.global.y * up_dims.global.z;
+    return comp * plane
+        + (i + up_dims.start.x) * up_dims.global.y * up_dims.global.z
+        + (j + up_dims.start.y) * up_dims.global.z
+        + (k + up_dims.start.z);
+}
+
+@compute @workgroup_size(64)
+fn upml_pre_volt(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let slab_n = up_dims.slab.x * up_dims.slab.y * up_dims.slab.z;
+    let t = gid.x;
+    if (t >= 3u * slab_n) { return; }
+    let g = upml_global_index(t);
+    let help = up_vv[t] * up_volt[g] - up_vvfo[t] * up_volt_flux[t];
+    let flux_old = up_volt_flux[t];
+    up_volt[g] = flux_old;
+    up_volt_flux[t] = help;
+}
+
+@compute @workgroup_size(64)
+fn upml_post_volt(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let slab_n = up_dims.slab.x * up_dims.slab.y * up_dims.slab.z;
+    let t = gid.x;
+    if (t >= 3u * slab_n) { return; }
+    let g = upml_global_index(t);
+    let help = up_volt_flux[t];
+    up_volt_flux[t] = up_volt[g];
+    up_volt[g] = help + up_vvfn[t] * up_volt_flux[t];
+}
+
+@compute @workgroup_size(64)
+fn upml_pre_curr(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let slab_n = up_dims.slab.x * up_dims.slab.y * up_dims.slab.z;
+    let t = gid.x;
+    if (t >= 3u * slab_n) { return; }
+    let g = upml_global_index(t);
+    let help = up_ii[t] * up_curr[g] - up_iifo[t] * up_curr_flux[t];
+    let flux_old = up_curr_flux[t];
+    up_curr[g] = flux_old;
+    up_curr_flux[t] = help;
+}
+
+@compute @workgroup_size(64)
+fn upml_post_curr(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let slab_n = up_dims.slab.x * up_dims.slab.y * up_dims.slab.z;
+    let t = gid.x;
+    if (t >= 3u * slab_n) { return; }
+    let g = upml_global_index(t);
+    let help = up_curr_flux[t];
+    up_curr_flux[t] = up_curr[g];
+    up_curr[g] = help + up_iifn[t] * up_curr_flux[t];
+}
 "#;
 
 fn f32_bytes(values: &[FDTD_FLOAT]) -> Vec<u8> {
@@ -297,7 +383,18 @@ impl GpuContext {
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                // The UPML kernels bind the two field buffers, six coefficient
+                // arrays and two flux arrays (10 storage buffers), above the
+                // WebGPU default of 8. Every desktop adapter offers more; ask
+                // for 16 when the adapter allows it.
+                required_limits: {
+                    let mut limits = wgpu::Limits::default();
+                    limits.max_storage_buffers_per_shader_stage = adapter
+                        .limits()
+                        .max_storage_buffers_per_shader_stage
+                        .clamp(8, 16);
+                    limits
+                },
                 label: Some("openems-core gpu context"),
                 trace: wgpu::Trace::default(),
                 memory_hints: wgpu::MemoryHints::default(),
@@ -696,6 +793,41 @@ impl SourceBinds {
     }
 }
 
+/// One device-side UPML slab: its bind group and dispatch size.
+struct UpmlInstance {
+    bind: wgpu::BindGroup,
+    groups: u32,
+}
+
+/// Device-side UPML kernels shared by every PML slab of a model.
+struct UpmlBinds {
+    pre_volt: wgpu::ComputePipeline,
+    post_volt: wgpu::ComputePipeline,
+    pre_curr: wgpu::ComputePipeline,
+    post_curr: wgpu::ComputePipeline,
+    instances: Vec<UpmlInstance>,
+}
+
+impl UpmlBinds {
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, phase: usize) {
+        let pipeline = match phase {
+            0 => &self.pre_volt,
+            1 => &self.post_volt,
+            2 => &self.pre_curr,
+            _ => &self.post_curr,
+        };
+        for instance in &self.instances {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("openems upml pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &instance.bind, &[]);
+            pass.dispatch_workgroups(instance.groups, 1, 1);
+        }
+    }
+}
+
 /// Persistent GPU field/coefficient buffers for `Engine`.
 ///
 /// The engine uploads once, dispatches the E and H kernels per step, and
@@ -718,6 +850,8 @@ pub struct GpuFields {
     staging_pair: wgpu::Buffer,
     /// Device-side excitation kernels, when the model has a source.
     source: Option<SourceBinds>,
+    /// Device-side UPML kernels, when the model has PML regions.
+    upml: Option<UpmlBinds>,
     /// Reused little-endian upload scratch, so a host-phase upload does not
     /// allocate a new byte vector per field.
     upload_scratch: std::cell::RefCell<Vec<u8>>,
@@ -874,6 +1008,7 @@ impl GpuFields {
             staging_curr,
             staging_pair,
             source: None,
+            upml: None,
             upload_scratch: std::cell::RefCell::new(Vec::new()),
         })
     }
@@ -1033,6 +1168,183 @@ impl GpuFields {
         self.source.is_some()
     }
 
+    /// Build the device-side UPML kernels from the host slabs.
+    pub fn setup_upml(&mut self, upmls: &[&crate::extensions::EngineExtUPML]) -> bool {
+        if upmls.is_empty() {
+            return false;
+        }
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("openems upml kernels"),
+            source: wgpu::ShaderSource::Wgsl(UPDATE_SHADER.into()),
+        });
+        let entries = (0..11u32)
+            .map(|binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: if binding == 10 {
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    }
+                } else {
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage {
+                            read_only: binding >= 2 && binding <= 7,
+                        },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    }
+                },
+                count: None,
+            })
+            .collect::<Vec<_>>();
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("openems upml layout"),
+                entries: &entries,
+            });
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("openems upml pipeline layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = |entry: &str| {
+            self.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(&pipeline_layout),
+                    module: &shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        };
+        let pre_volt = pipeline("upml_pre_volt");
+        let post_volt = pipeline("upml_post_volt");
+        let pre_curr = pipeline("upml_pre_curr");
+        let post_curr = pipeline("upml_post_curr");
+        let mut instances = Vec::with_capacity(upmls.len());
+        for upml in upmls {
+            let slab = upml.num_lines;
+            let mut values = |arrays: &[crate::array_nijk::FieldArray]| -> Vec<f32> {
+                let mut out =
+                    Vec::with_capacity(3 * slab[0] * slab[1] * slab[2]);
+                for comp in 0..3 {
+                    for i in 0..slab[0] {
+                        for j in 0..slab[1] {
+                            for k in 0..slab[2] {
+                                out.push(*arrays[comp].get(0, i, j, k));
+                            }
+                        }
+                    }
+                }
+                out
+            };
+            let vv = values(&upml.vv);
+            let vvfo = values(&upml.vvfo);
+            let vvfn = values(&upml.vvfn);
+            let ii = values(&upml.ii);
+            let iifo = values(&upml.iifo);
+            let iifn = values(&upml.iifn);
+            let volt_flux = values(&upml.volt_flux);
+            let curr_flux = values(&upml.curr_flux);
+            let buffer = |label: &str, data: &[f32]| {
+                use wgpu::util::DeviceExt;
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(label),
+                        contents: &f32_bytes(data),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
+            };
+            let vv_buf = buffer("openems upml vv", &vv);
+            let vvfo_buf = buffer("openems upml vvfo", &vvfo);
+            let vvfn_buf = buffer("openems upml vvfn", &vvfn);
+            let ii_buf = buffer("openems upml ii", &ii);
+            let iifo_buf = buffer("openems upml iifo", &iifo);
+            let iifn_buf = buffer("openems upml iifn", &iifn);
+            let volt_flux_buf = buffer("openems upml volt flux", &volt_flux);
+            let curr_flux_buf = buffer("openems upml curr flux", &curr_flux);
+            let mut dims = Vec::<u8>::with_capacity(48);
+            for value in [
+                self.dims[0] as u32,
+                self.dims[1] as u32,
+                self.dims[2] as u32,
+                0,
+            ] {
+                dims.extend_from_slice(&value.to_le_bytes());
+            }
+            for value in [
+                upml.start_pos[0] as u32,
+                upml.start_pos[1] as u32,
+                upml.start_pos[2] as u32,
+                0,
+            ] {
+                dims.extend_from_slice(&value.to_le_bytes());
+            }
+            for value in [
+                slab[0] as u32,
+                slab[1] as u32,
+                slab[2] as u32,
+                0,
+            ] {
+                dims.extend_from_slice(&value.to_le_bytes());
+            }
+            let uniform = {
+                use wgpu::util::DeviceExt;
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("openems upml dims"),
+                        contents: &dims,
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    })
+            };
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("openems upml bind group"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.volt.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.curr.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: vv_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: vvfo_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: vvfn_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: ii_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: iifo_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: iifn_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: volt_flux_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: curr_flux_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry { binding: 10, resource: uniform.as_entire_binding() },
+                ],
+            });
+            let particles = (3 * slab[0] * slab[1] * slab[2]) as u32;
+            instances.push(UpmlInstance {
+                bind,
+                groups: particles.div_ceil(64).max(1),
+            });
+        }
+        self.upml = Some(UpmlBinds {
+            pre_volt,
+            post_volt,
+            pre_curr,
+            post_curr,
+            instances,
+        });
+        true
+    }
+
+    /// Whether device-side UPML kernels are active.
+    pub fn has_upml(&self) -> bool {
+        self.upml.is_some()
+    }
+
     /// Apply the device-side voltage source for one step (host path).
     pub fn dispatch_source_volt(&self, ts: u32) {
         self.dispatch_source(true, ts);
@@ -1123,11 +1435,23 @@ impl GpuFields {
                 label: Some("openems engine batch"),
             });
             for step in 0..chunk {
+                if let Some(upml) = self.upml.as_ref() {
+                    upml.record(&mut encoder, 0);
+                }
                 record_dispatch(&mut encoder, &self.pipe_e, &self.bind_e, volt_cells);
+                if let Some(upml) = self.upml.as_ref() {
+                    upml.record(&mut encoder, 1);
+                }
                 if let Some(source) = self.source.as_ref() {
                     source.record(&mut encoder, source.volt.as_ref(), step);
                 }
+                if let Some(upml) = self.upml.as_ref() {
+                    upml.record(&mut encoder, 2);
+                }
                 record_dispatch(&mut encoder, &self.pipe_h, &self.bind_h, curr_cells);
+                if let Some(upml) = self.upml.as_ref() {
+                    upml.record(&mut encoder, 3);
+                }
                 if let Some(source) = self.source.as_ref() {
                     source.record(&mut encoder, source.curr.as_ref(), step);
                 }

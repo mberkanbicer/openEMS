@@ -194,25 +194,33 @@ impl Engine {
         )
         .ok_or_else(|| "GPU buffer size mismatch".to_string())?
         .into();
-        self.setup_gpu_source();
+        self.setup_gpu_extensions();
         Ok(())
     }
 
-    /// Upload the excitation source so the device can apply it inside a batch.
+    /// Upload every extension that has a device implementation.
     ///
-    /// Only taken when every registered extension is an excitation. A mixed
-    /// model would have to apply the source between host extension phases,
-    /// where the host array is authoritative, so those keep the host path.
+    /// Taken only when **all** registered extensions are device-native
+    /// (excitation or UPML). A mixed model must apply the device extension
+    /// phases between host extension phases, where the host array is
+    /// authoritative, so it keeps the host path.
     #[cfg(feature = "gpu")]
-    fn setup_gpu_source(&mut self) {
+    fn setup_gpu_extensions(&mut self) {
         if self.gpu_fields.is_none() || self.extensions.is_empty() {
             return;
         }
-        if !self
-            .extensions
-            .iter()
-            .all(|extension| extension.excitation_terms().is_some())
-        {
+        let all_native = self.extensions.iter().all(|extension| {
+            extension.excitation_terms().is_some() || extension.upml_terms().is_some()
+        });
+        if !all_native {
+            if std::env::var_os("OPENEMS_DEBUG_GPU").is_some() {
+                let names: Vec<&str> = self
+                    .extensions
+                    .iter()
+                    .map(|extension| extension.get_extension_name())
+                    .collect();
+                eprintln!("[openEMS] GPU host path, extensions {names:?}");
+            }
             return;
         }
         let dims = self.num_lines;
@@ -255,11 +263,30 @@ impl Engine {
                 });
             }
         }
+        let upmls: Vec<&crate::extensions::EngineExtUPML> = self
+            .extensions
+            .iter()
+            .filter_map(|extension| extension.upml_terms())
+            .collect();
         let Some(gpu) = self.gpu_fields.as_mut() else {
             return;
         };
-        if !gpu.setup_source(&terms) {
+        let mut prepared = false;
+        if !terms.is_empty() {
+            prepared |= gpu.setup_source(&terms);
+        }
+        if !upmls.is_empty() {
+            prepared |= gpu.setup_upml(&upmls);
+        }
+        if !prepared {
             return;
+        }
+        if std::env::var_os("OPENEMS_DEBUG_GPU").is_some() {
+            eprintln!(
+                "[openEMS] GPU batched path: source {}, UPML slabs {}",
+                if gpu.has_source() { "on device" } else { "none" },
+                upmls.len()
+            );
         }
         for extension in self.extensions.iter_mut() {
             extension.mark_gpu_handled();
@@ -1154,6 +1181,86 @@ mod tests {
         );
         eprintln!(
             "GPU device source: {n}^3, {steps} steps, CPU diff {diff:.2e}, batch/step diff {batch_diff:.2e}, GPU {gpu_time:.2?}"
+        );
+    }
+
+    #[cfg(feature = "gpu")]
+    fn upml_extension(
+        start: [usize; 3],
+        slab: [usize; 3],
+    ) -> crate::extensions::EngineExtUPML {
+        let mut extension = crate::extensions::EngineExtUPML::new(start, slab);
+        for comp in 0..3 {
+            for i in 0..slab[0] {
+                for j in 0..slab[1] {
+                    for k in 0..slab[2] {
+                        *extension.vv[comp].get_mut(0, i, j, k) = 1.0 + 0.01 * i as f32;
+                        *extension.vvfo[comp].get_mut(0, i, j, k) = 0.25;
+                        *extension.vvfn[comp].get_mut(0, i, j, k) = 0.5 + 0.02 * j as f32;
+                        *extension.ii[comp].get_mut(0, i, j, k) = 1.0 + 0.01 * k as f32;
+                        *extension.iifo[comp].get_mut(0, i, j, k) = 0.25;
+                        *extension.iifn[comp].get_mut(0, i, j, k) = 0.5 + 0.02 * i as f32;
+                    }
+                }
+            }
+        }
+        extension
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_device_upml_matches_the_cpu_engine() {
+        let n = 12;
+        let steps = 120;
+        let slab = [4, 4, 4];
+        let start = [2, 2, 2];
+        let build = || {
+            let mut engine = Engine::new(Box::new(cavity_operator(n)));
+            engine.add_extension(Box::new(upml_extension(start, slab)));
+            seed_fields(&mut engine);
+            engine
+        };
+
+        let mut cpu = build();
+        assert!(cpu.iterate_ts(steps));
+
+        let mut gpu = build();
+        if let Err(reason) = gpu.enable_gpu() {
+            eprintln!("skipping the GPU UPML test: {reason}");
+            return;
+        }
+        assert!(
+            gpu.gpu_fields
+                .as_ref()
+                .map(|fields| fields.has_upml())
+                .unwrap_or(false),
+            "the PML slab must be uploaded to the device"
+        );
+        assert!(
+            !gpu.needs_host_extension(),
+            "a PML-only model must use the batched device path"
+        );
+
+        let start_time = std::time::Instant::now();
+        assert!(gpu.iterate_ts(steps));
+        let gpu_time = start_time.elapsed();
+        let diff = field_diff(&cpu, &gpu);
+        assert!(diff < 1.0e-5, "CPU/GPU device-UPML field diff {diff}");
+
+        let mut stepped = build();
+        if stepped.enable_gpu().is_err() {
+            return;
+        }
+        for _ in 0..steps {
+            assert!(stepped.iterate_ts(1));
+        }
+        let batch_diff = field_diff(&gpu, &stepped);
+        assert!(
+            batch_diff < 1.0e-6,
+            "batch vs single-step UPML scheduling diff {batch_diff}"
+        );
+        eprintln!(
+            "GPU device UPML: {n}^3, {steps} steps, CPU diff {diff:.2e}, batch/step diff {batch_diff:.2e}, GPU {gpu_time:.2?}"
         );
     }
 

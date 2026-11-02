@@ -44,6 +44,12 @@ pub trait EngineExtension {
         None
     }
 
+    /// UPML state for the device-side kernels, if this extension is a PML
+    /// region. The engine uploads the coefficients and flux arrays once.
+    fn upml_terms(&self) -> Option<&crate::extensions::EngineExtUPML> {
+        None
+    }
+
     /// Mark this extension as fully executed by the device, so its host
     /// phases become no-ops.
     fn mark_gpu_handled(&mut self) {}
@@ -498,6 +504,9 @@ pub struct EngineExtUPML {
     /// Auxiliary flux arrays for voltage and current.
     pub volt_flux: Vec<FieldArray>,
     pub curr_flux: Vec<FieldArray>,
+    /// The GPU path applies the four PML phases with device kernels; the host
+    /// phases then do nothing.
+    pub gpu_handled: bool,
 }
 
 impl EngineExtUPML {
@@ -534,6 +543,7 @@ impl EngineExtUPML {
             iifn,
             volt_flux,
             curr_flux,
+            gpu_handled: false,
         }
     }
 
@@ -558,7 +568,22 @@ impl EngineExtension for EngineExtUPML {
         "UPML"
     }
 
+    fn upml_terms(&self) -> Option<&crate::extensions::EngineExtUPML> {
+        Some(self)
+    }
+
+    fn mark_gpu_handled(&mut self) {
+        self.gpu_handled = true;
+    }
+
+    fn is_gpu_native(&self) -> bool {
+        self.gpu_handled
+    }
+
     fn do_pre_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        if self.gpu_handled {
+            return;
+        }
         let nx = self.num_lines[0];
         let ny = self.num_lines[1];
         let nz = self.num_lines[2];
@@ -586,6 +611,9 @@ impl EngineExtension for EngineExtUPML {
     }
 
     fn do_post_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        if self.gpu_handled {
+            return;
+        }
         let nx = self.num_lines[0];
         let ny = self.num_lines[1];
         let nz = self.num_lines[2];
@@ -612,6 +640,9 @@ impl EngineExtension for EngineExtUPML {
     }
 
     fn do_pre_current_updates(&mut self, _volt: &FieldArray, curr: &mut FieldArray) {
+        if self.gpu_handled {
+            return;
+        }
         let nx = self.num_lines[0];
         let ny = self.num_lines[1];
         let nz = self.num_lines[2];
@@ -639,6 +670,9 @@ impl EngineExtension for EngineExtUPML {
     }
 
     fn do_post_current_updates(&mut self, _volt: &FieldArray, curr: &mut FieldArray) {
+        if self.gpu_handled {
+            return;
+        }
         let nx = self.num_lines[0];
         let ny = self.num_lines[1];
         let nz = self.num_lines[2];

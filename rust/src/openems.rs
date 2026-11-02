@@ -2338,6 +2338,10 @@ impl OpenEMS {
             } else {
                 1
             };
+            #[cfg(feature = "gpu")]
+            if ts == 0 && gpu_active && std::env::var_os("OPENEMS_DEBUG_GPU").is_some() {
+                eprintln!("[openEMS] GPU batch size {batch} (nyquist {nyquist})");
+            }
             // Execute the timestep(s) (voltage + current updates with extensions).
             self.fdtd_eng.as_mut().unwrap().iterate_ts(batch);
             ts = self.fdtd_eng.as_ref().unwrap().get_number_of_timesteps();
