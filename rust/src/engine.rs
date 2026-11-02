@@ -210,7 +210,9 @@ impl Engine {
             return;
         }
         let all_native = self.extensions.iter().all(|extension| {
-            extension.excitation_terms().is_some() || extension.upml_terms().is_some()
+            extension.excitation_terms().is_some()
+                || extension.upml_terms().is_some()
+                || extension.mur_terms().is_some()
         });
         if !all_native {
             if std::env::var_os("OPENEMS_DEBUG_GPU").is_some() {
@@ -268,6 +270,11 @@ impl Engine {
             .iter()
             .filter_map(|extension| extension.upml_terms())
             .collect();
+        let murs: Vec<&crate::extensions::EngineExtMurABC> = self
+            .extensions
+            .iter()
+            .filter_map(|extension| extension.mur_terms())
+            .collect();
         let Some(gpu) = self.gpu_fields.as_mut() else {
             return;
         };
@@ -278,14 +285,18 @@ impl Engine {
         if !upmls.is_empty() {
             prepared |= gpu.setup_upml(&upmls);
         }
+        if !murs.is_empty() {
+            prepared |= gpu.setup_mur(&murs);
+        }
         if !prepared {
             return;
         }
         if std::env::var_os("OPENEMS_DEBUG_GPU").is_some() {
             eprintln!(
-                "[openEMS] GPU batched path: source {}, UPML slabs {}",
+                "[openEMS] GPU batched path: source {}, UPML slabs {}, Mur faces {}",
                 if gpu.has_source() { "on device" } else { "none" },
-                upmls.len()
+                upmls.len(),
+                murs.iter().map(|mur| mur.faces.len()).sum::<usize>()
             );
         }
         for extension in self.extensions.iter_mut() {
@@ -1261,6 +1272,92 @@ mod tests {
         );
         eprintln!(
             "GPU device UPML: {n}^3, {steps} steps, CPU diff {diff:.2e}, batch/step diff {batch_diff:.2e}, GPU {gpu_time:.2?}"
+        );
+    }
+
+    #[cfg(feature = "gpu")]
+    fn mur_extension(n: usize) -> crate::extensions::EngineExtMurABC {
+        let mut extension = crate::extensions::EngineExtMurABC::new();
+        let plane = n * n;
+        // Two faces that overlap on the x/y corner edges (x-min and y-min),
+        // which checks that the per-face pass order matches the host order.
+        extension.add_face(
+            0,
+            0,
+            false,
+            0,
+            1,
+            n,
+            n,
+            vec![0.4; plane],
+            vec![0.6; plane],
+        );
+        extension.add_face(
+            1,
+            1,
+            false,
+            0,
+            1,
+            n,
+            n,
+            vec![0.3; plane],
+            vec![0.7; plane],
+        );
+        extension
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_device_mur_matches_the_cpu_engine() {
+        let n = 12;
+        let steps = 120;
+        let build = || {
+            let mut engine = Engine::new(Box::new(cavity_operator(n)));
+            engine.add_extension(Box::new(mur_extension(n)));
+            seed_fields(&mut engine);
+            engine
+        };
+
+        let mut cpu = build();
+        assert!(cpu.iterate_ts(steps));
+
+        let mut gpu = build();
+        if let Err(reason) = gpu.enable_gpu() {
+            eprintln!("skipping the GPU Mur test: {reason}");
+            return;
+        }
+        assert!(
+            gpu.gpu_fields
+                .as_ref()
+                .map(|fields| fields.has_mur())
+                .unwrap_or(false),
+            "the Mur faces must be uploaded to the device"
+        );
+        assert!(
+            !gpu.needs_host_extension(),
+            "a Mur-only model must use the batched device path"
+        );
+
+        let start = std::time::Instant::now();
+        assert!(gpu.iterate_ts(steps));
+        let gpu_time = start.elapsed();
+        let diff = field_diff(&cpu, &gpu);
+        assert!(diff < 1.0e-5, "CPU/GPU device-Mur field diff {diff}");
+
+        let mut stepped = build();
+        if stepped.enable_gpu().is_err() {
+            return;
+        }
+        for _ in 0..steps {
+            assert!(stepped.iterate_ts(1));
+        }
+        let batch_diff = field_diff(&gpu, &stepped);
+        assert!(
+            batch_diff < 1.0e-6,
+            "batch vs single-step Mur scheduling diff {batch_diff}"
+        );
+        eprintln!(
+            "GPU device Mur: {n}^3, {steps} steps, CPU diff {diff:.2e}, batch/step diff {batch_diff:.2e}, GPU {gpu_time:.2?}"
         );
     }
 

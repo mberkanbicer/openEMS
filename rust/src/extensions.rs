@@ -50,6 +50,12 @@ pub trait EngineExtension {
         None
     }
 
+    /// Mur ABC faces for the device-side kernels, if this extension is a Mur
+    /// boundary.
+    fn mur_terms(&self) -> Option<&crate::extensions::EngineExtMurABC> {
+        None
+    }
+
     /// Mark this extension as fully executed by the device, so its host
     /// phases become no-ops.
     fn mark_gpu_handled(&mut self) {}
@@ -304,6 +310,9 @@ pub struct EngineExtMurABC {
     pub faces: Vec<MurFace>,
     pub current_ts: u32,
     pub start_ts: u32,
+    /// The GPU path applies the three Mur phases with device kernels; the host
+    /// phases then do nothing.
+    pub gpu_handled: bool,
 }
 
 impl EngineExtMurABC {
@@ -360,9 +369,21 @@ impl EngineExtension for EngineExtMurABC {
         "Mur ABC"
     }
 
+    fn mur_terms(&self) -> Option<&crate::extensions::EngineExtMurABC> {
+        Some(self)
+    }
+
+    fn mark_gpu_handled(&mut self) {
+        self.gpu_handled = true;
+    }
+
+    fn is_gpu_native(&self) -> bool {
+        self.gpu_handled
+    }
+
     fn do_pre_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
         self.current_ts += 1;
-        if !self.is_active() {
+        if self.gpu_handled || !self.is_active() {
             return;
         }
         for face in &mut self.faces {
@@ -393,7 +414,7 @@ impl EngineExtension for EngineExtMurABC {
     }
 
     fn do_post_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
-        if !self.is_active() {
+        if self.gpu_handled || !self.is_active() {
             return;
         }
         for face in &mut self.faces {
@@ -416,7 +437,7 @@ impl EngineExtension for EngineExtMurABC {
     }
 
     fn apply2_voltages(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
-        if !self.is_active() {
+        if self.gpu_handled || !self.is_active() {
             return;
         }
         for face in &self.faces {
