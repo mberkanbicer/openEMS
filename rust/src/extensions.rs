@@ -71,6 +71,16 @@ pub trait EngineExtension {
         None
     }
 
+    /// Debye pole state for the device-side kernels.
+    fn debye_terms(&self) -> Option<&crate::extensions::EngineExtDebyeMaterial> {
+        None
+    }
+
+    /// Lorentz dispersion state for the device-side kernels.
+    fn lorentz_terms(&self) -> Option<&crate::extensions::EngineExtLorentzMaterial> {
+        None
+    }
+
     /// Mark this extension as fully executed by the device, so its host
     /// phases become no-ops.
     fn mark_gpu_handled(&mut self) {}
@@ -1165,6 +1175,9 @@ pub struct EngineExtDebyeMaterial {
     pub v_drive_ade: Vec<Vec<Vec<FDTD_FLOAT>>>,
     /// Solve coefficient for implicit update: [component][pos_idx].
     pub v_solve_ade: Vec<Vec<FDTD_FLOAT>>,
+    /// The GPU path applies the three voltage phases with device kernels; the
+    /// host phases then do nothing.
+    pub gpu_handled: bool,
 }
 
 impl EngineExtDebyeMaterial {
@@ -1184,6 +1197,7 @@ impl EngineExtDebyeMaterial {
             v_relax_ade: zero_cube.clone(),
             v_drive_ade: zero_cube,
             v_solve_ade: vec![zero_vec.clone(); 3],
+            gpu_handled: false,
         }
     }
 
@@ -1245,7 +1259,22 @@ impl EngineExtension for EngineExtDebyeMaterial {
         "Debye Material"
     }
 
+    fn debye_terms(&self) -> Option<&crate::extensions::EngineExtDebyeMaterial> {
+        Some(self)
+    }
+
+    fn mark_gpu_handled(&mut self) {
+        self.gpu_handled = true;
+    }
+
+    fn is_gpu_native(&self) -> bool {
+        self.gpu_handled
+    }
+
     fn do_pre_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        if self.gpu_handled {
+            return;
+        }
         // Compute pole states from V^n (the only place V^n exists before the main update).
         for pos_idx in 0..self.num_positions {
             let [i, j, k] = self.positions[pos_idx];
@@ -1265,6 +1294,9 @@ impl EngineExtension for EngineExtDebyeMaterial {
     }
 
     fn do_post_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        if self.gpu_handled {
+            return;
+        }
         // Solve for V^(n+1) and finish pole state updates.
         for pos_idx in 0..self.num_positions {
             let [i, j, k] = self.positions[pos_idx];
@@ -1282,6 +1314,9 @@ impl EngineExtension for EngineExtDebyeMaterial {
     }
 
     fn apply2_voltages(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        if self.gpu_handled {
+            return;
+        }
         // Subtract the joint Debye correction from voltage fields.
         for pos_idx in 0..self.num_positions {
             let [i, j, k] = self.positions[pos_idx];
@@ -1399,6 +1434,9 @@ pub struct EngineExtLorentzMaterial {
     pub volt_ade_on: Vec<bool>,
     /// Current ADE active per order (native `m_curr_ADE_On`).
     pub curr_ade_on: Vec<bool>,
+    /// The GPU path applies the four phases with device kernels; the host
+    /// phases then do nothing.
+    pub gpu_handled: bool,
 }
 
 impl EngineExtLorentzMaterial {
@@ -1424,6 +1462,7 @@ impl EngineExtLorentzMaterial {
             i_lor_ade: zero_cube,
             volt_ade_on: vec![false; num_orders],
             curr_ade_on: vec![false; num_orders],
+            gpu_handled: false,
         }
     }
 
@@ -1484,7 +1523,22 @@ impl EngineExtension for EngineExtLorentzMaterial {
         "Lorentz Material"
     }
 
+    fn lorentz_terms(&self) -> Option<&crate::extensions::EngineExtLorentzMaterial> {
+        Some(self)
+    }
+
+    fn mark_gpu_handled(&mut self) {
+        self.gpu_handled = true;
+    }
+
+    fn is_gpu_native(&self) -> bool {
+        self.gpu_handled
+    }
+
     fn do_pre_voltage_updates(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        if self.gpu_handled {
+            return;
+        }
         // Update voltage ADE state: volt_ADE *= v_int + v_ext * (V - volt_Lor)
         // volt_Lor += v_lor * volt_ADE (old)
         for pos_idx in 0..self.num_positions {
@@ -1512,6 +1566,9 @@ impl EngineExtension for EngineExtLorentzMaterial {
     }
 
     fn do_pre_current_updates(&mut self, _volt: &FieldArray, curr: &mut FieldArray) {
+        if self.gpu_handled {
+            return;
+        }
         // Update current ADE state: curr_ADE *= i_int + i_ext * (I - curr_Lor)
         // curr_Lor += i_lor * curr_ADE (old)
         for pos_idx in 0..self.num_positions {
@@ -1539,6 +1596,9 @@ impl EngineExtension for EngineExtLorentzMaterial {
     }
 
     fn apply2_voltages(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
+        if self.gpu_handled {
+            return;
+        }
         // Subtract voltage ADE correction from voltage fields.
         for pos_idx in 0..self.num_positions {
             let [i, j, k] = self.positions[pos_idx];
@@ -1552,6 +1612,9 @@ impl EngineExtension for EngineExtLorentzMaterial {
     }
 
     fn apply2_current(&mut self, _volt: &FieldArray, curr: &mut FieldArray) {
+        if self.gpu_handled {
+            return;
+        }
         // Subtract current ADE correction from current fields.
         for pos_idx in 0..self.num_positions {
             let [i, j, k] = self.positions[pos_idx];

@@ -462,6 +462,196 @@ fn tfsf_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
     let index = tfsf_index[t];
     tfsf_target[index] = tfsf_target[index] + correction;
 }
+
+// Device-side Debye: three voltage phases over the dispersive cells. The
+// pole state and the per-pole coefficients are packed as
+// (pole * 3 + component) * count.
+
+struct DebyeDims {
+    count: vec4<u32>,
+    poles: vec4<u32>,
+    plane: vec4<u32>,
+};
+
+@group(0) @binding(0) var<storage, read_write> debye_volt: array<f32>;
+@group(0) @binding(1) var<storage, read> debye_pos: array<u32>;
+@group(0) @binding(2) var<storage, read> debye_relax: array<f32>;
+@group(0) @binding(3) var<storage, read> debye_drive: array<f32>;
+@group(0) @binding(4) var<storage, read> debye_solve: array<f32>;
+@group(0) @binding(5) var<storage, read_write> debye_pole: array<f32>;
+@group(0) @binding(6) var<storage, read_write> debye_pre_ade: array<f32>;
+@group(0) @binding(7) var<storage, read_write> debye_ade_state: array<f32>;
+@group(0) @binding(8) var<uniform> debye_dims: DebyeDims;
+
+@compute @workgroup_size(64)
+fn debye_pre(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    if (t >= debye_dims.count.x) { return; }
+    let base = debye_pos[t];
+    let count = debye_dims.count.x;
+    let poles = debye_dims.poles.x;
+    let plane = debye_dims.plane.x;
+    for (var comp = 0u; comp < 3u; comp = comp + 1u) {
+        let v = debye_volt[base + comp * plane];
+        var pre = 0.0;
+        for (var o = 0u; o < poles; o = o + 1u) {
+            let s = (o * 3u + comp) * count + t;
+            let w = debye_relax[s] * debye_pole[s] + debye_drive[s] * v;
+            pre = pre + (w - debye_pole[s]);
+            debye_pole[s] = w;
+        }
+        debye_pre_ade[comp * count + t] = pre;
+    }
+}
+
+@compute @workgroup_size(64)
+fn debye_post(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    if (t >= debye_dims.count.x) { return; }
+    let base = debye_pos[t];
+    let count = debye_dims.count.x;
+    let poles = debye_dims.poles.x;
+    let plane = debye_dims.plane.x;
+    for (var comp = 0u; comp < 3u; comp = comp + 1u) {
+        let v_raw = debye_volt[base + comp * plane];
+        let key = comp * count + t;
+        let v_new = (v_raw - debye_pre_ade[key]) * debye_solve[key];
+        debye_ade_state[key] = v_raw - v_new;
+        for (var o = 0u; o < poles; o = o + 1u) {
+            let s = (o * 3u + comp) * count + t;
+            debye_pole[s] = debye_pole[s] + debye_drive[s] * v_new;
+        }
+    }
+}
+
+@compute @workgroup_size(64)
+fn debye_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    if (t >= debye_dims.count.x) { return; }
+    let base = debye_pos[t];
+    let count = debye_dims.count.x;
+    let plane = debye_dims.plane.x;
+    for (var comp = 0u; comp < 3u; comp = comp + 1u) {
+        let index = base + comp * plane;
+        debye_volt[index] = debye_volt[index] - debye_ade_state[comp * count + t];
+    }
+}
+
+// Device-side Lorentz: four phases over the dispersive cells. The state and
+// coefficients are packed as (order * 3 + component) * count; `active`
+// carries one flag per order and side.
+
+struct LorentzDims {
+    count: vec4<u32>,
+    orders: vec4<u32>,
+    plane: vec4<u32>,
+};
+
+@group(0) @binding(0) var<storage, read_write> lor_volt: array<f32>;
+@group(0) @binding(1) var<storage, read_write> lor_curr: array<f32>;
+@group(0) @binding(2) var<storage, read> lor_pos: array<u32>;
+@group(0) @binding(3) var<storage, read> lor_active: array<u32>;
+@group(0) @binding(4) var<storage, read> lor_v_int: array<f32>;
+@group(0) @binding(5) var<storage, read> lor_v_ext: array<f32>;
+@group(0) @binding(6) var<storage, read> lor_v_lor: array<f32>;
+@group(0) @binding(7) var<storage, read> lor_i_int: array<f32>;
+@group(0) @binding(8) var<storage, read> lor_i_ext: array<f32>;
+@group(0) @binding(9) var<storage, read> lor_i_lor: array<f32>;
+@group(0) @binding(10) var<storage, read_write> lor_volt_ade: array<f32>;
+@group(0) @binding(11) var<storage, read_write> lor_volt_lor: array<f32>;
+@group(0) @binding(12) var<storage, read_write> lor_curr_ade: array<f32>;
+@group(0) @binding(13) var<storage, read_write> lor_curr_lor: array<f32>;
+@group(0) @binding(14) var<uniform> lor_dims: LorentzDims;
+
+@compute @workgroup_size(64)
+fn lorentz_pre_volt(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    if (t >= lor_dims.count.x) { return; }
+    let base = lor_pos[t];
+    let count = lor_dims.count.x;
+    let orders = lor_dims.orders.x;
+    let plane = lor_dims.plane.x;
+    for (var o = 0u; o < orders; o = o + 1u) {
+        if (lor_active[o * 2u] == 0u) { continue; }
+        for (var comp = 0u; comp < 3u; comp = comp + 1u) {
+            let key = (o * 3u + comp) * count + t;
+            let v = lor_volt[base + comp * plane];
+            let lor = lor_v_lor[key];
+            if (lor != 0.0) {
+                let lor_new = lor_volt_lor[key] + lor * lor_volt_ade[key];
+                lor_volt_lor[key] = lor_new;
+                lor_volt_ade[key] = lor_volt_ade[key] * lor_v_int[key]
+                    + lor_v_ext[key] * (v - lor_new);
+            } else {
+                lor_volt_ade[key] = lor_volt_ade[key] * lor_v_int[key] + lor_v_ext[key] * v;
+            }
+        }
+    }
+}
+
+@compute @workgroup_size(64)
+fn lorentz_pre_curr(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    if (t >= lor_dims.count.x) { return; }
+    let base = lor_pos[t];
+    let count = lor_dims.count.x;
+    let orders = lor_dims.orders.x;
+    let plane = lor_dims.plane.x;
+    for (var o = 0u; o < orders; o = o + 1u) {
+        if (lor_active[o * 2u + 1u] == 0u) { continue; }
+        for (var comp = 0u; comp < 3u; comp = comp + 1u) {
+            let key = (o * 3u + comp) * count + t;
+            let v = lor_curr[base + comp * plane];
+            let lor = lor_i_lor[key];
+            if (lor != 0.0) {
+                let lor_new = lor_curr_lor[key] + lor * lor_curr_ade[key];
+                lor_curr_lor[key] = lor_new;
+                lor_curr_ade[key] = lor_curr_ade[key] * lor_i_int[key]
+                    + lor_i_ext[key] * (v - lor_new);
+            } else {
+                lor_curr_ade[key] = lor_curr_ade[key] * lor_i_int[key] + lor_i_ext[key] * v;
+            }
+        }
+    }
+}
+
+@compute @workgroup_size(64)
+fn lorentz_apply_volt(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    if (t >= lor_dims.count.x) { return; }
+    let base = lor_pos[t];
+    let count = lor_dims.count.x;
+    let orders = lor_dims.orders.x;
+    let plane = lor_dims.plane.x;
+    for (var comp = 0u; comp < 3u; comp = comp + 1u) {
+        let index = base + comp * plane;
+        var v = lor_volt[index];
+        for (var o = 0u; o < orders; o = o + 1u) {
+            if (lor_active[o * 2u] == 0u) { continue; }
+            v = v - lor_volt_ade[(o * 3u + comp) * count + t];
+        }
+        lor_volt[index] = v;
+    }
+}
+
+@compute @workgroup_size(64)
+fn lorentz_apply_curr(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    if (t >= lor_dims.count.x) { return; }
+    let base = lor_pos[t];
+    let count = lor_dims.count.x;
+    let orders = lor_dims.orders.x;
+    let plane = lor_dims.plane.x;
+    for (var comp = 0u; comp < 3u; comp = comp + 1u) {
+        let index = base + comp * plane;
+        var v = lor_curr[index];
+        for (var o = 0u; o < orders; o = o + 1u) {
+            if (lor_active[o * 2u + 1u] == 0u) { continue; }
+            v = v - lor_curr_ade[(o * 3u + comp) * count + t];
+        }
+        lor_curr[index] = v;
+    }
+}
 "#;
 
 fn f32_bytes(values: &[FDTD_FLOAT]) -> Vec<u8> {
@@ -1254,6 +1444,72 @@ impl TfsfBinds {
     }
 }
 
+/// One device-side Debye region.
+struct DebyeBinds {
+    pre: wgpu::ComputePipeline,
+    post: wgpu::ComputePipeline,
+    apply: wgpu::ComputePipeline,
+    instances: Vec<DebyeInstance>,
+}
+
+struct DebyeInstance {
+    bind: wgpu::BindGroup,
+    groups: u32,
+}
+
+impl DebyeBinds {
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, phase: usize) {
+        let pipeline = match phase {
+            0 => &self.pre,
+            1 => &self.post,
+            _ => &self.apply,
+        };
+        for instance in &self.instances {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("openems debye pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &instance.bind, &[]);
+            pass.dispatch_workgroups(instance.groups, 1, 1);
+        }
+    }
+}
+
+/// Device-side Lorentz kernels.
+struct LorentzBinds {
+    pre_volt: wgpu::ComputePipeline,
+    pre_curr: wgpu::ComputePipeline,
+    apply_volt: wgpu::ComputePipeline,
+    apply_curr: wgpu::ComputePipeline,
+    instances: Vec<LorentzInstance>,
+}
+
+struct LorentzInstance {
+    bind: wgpu::BindGroup,
+    groups: u32,
+}
+
+impl LorentzBinds {
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, phase: usize) {
+        let pipeline = match phase {
+            0 => &self.pre_volt,
+            1 => &self.pre_curr,
+            2 => &self.apply_volt,
+            _ => &self.apply_curr,
+        };
+        for instance in &self.instances {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("openems lorentz pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &instance.bind, &[]);
+            pass.dispatch_workgroups(instance.groups, 1, 1);
+        }
+    }
+}
+
 /// Persistent GPU field/coefficient buffers for `Engine`.
 ///
 /// The engine uploads once, dispatches the E and H kernels per step, and
@@ -1286,6 +1542,10 @@ pub struct GpuFields {
     sheet: Option<SheetBinds>,
     /// Device-side TFSF kernels.
     tfsf: Option<TfsfBinds>,
+    /// Device-side Debye dispersive kernels.
+    debye: Option<DebyeBinds>,
+    /// Device-side Lorentz dispersive kernels.
+    lorentz: Option<LorentzBinds>,
     /// Reused little-endian upload scratch, so a host-phase upload does not
     /// allocate a new byte vector per field.
     upload_scratch: std::cell::RefCell<Vec<u8>>,
@@ -1447,6 +1707,8 @@ impl GpuFields {
             lumped: None,
             sheet: None,
             tfsf: None,
+            debye: None,
+            lorentz: None,
             upload_scratch: std::cell::RefCell::new(Vec::new()),
         })
     }
@@ -2422,6 +2684,403 @@ impl GpuFields {
         self.tfsf.is_some()
     }
 
+    /// Build the device-side Debye kernels from the host state.
+    pub fn setup_debye(
+        &mut self,
+        debye: &[&crate::extensions::EngineExtDebyeMaterial],
+    ) -> bool {
+        let mut instances = Vec::new();
+        if debye.is_empty() {
+            return false;
+        }
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("openems debye kernels"),
+            source: wgpu::ShaderSource::Wgsl(UPDATE_SHADER.into()),
+        });
+        let entries = (0..9u32)
+            .map(|binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: if binding == 8 {
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    }
+                } else {
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage {
+                            read_only: binding >= 1 && binding <= 4,
+                        },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    }
+                },
+                count: None,
+            })
+            .collect::<Vec<_>>();
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("openems debye layout"),
+                entries: &entries,
+            });
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("openems debye pipeline layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = |entry: &str| {
+            self.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(&pipeline_layout),
+                    module: &shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        };
+        let pre = pipeline("debye_pre");
+        let post = pipeline("debye_post");
+        let apply = pipeline("debye_apply");
+        let dims = self.dims;
+        let (i_stride, j_stride, plane) = (
+            dims[1] * dims[2],
+            dims[2],
+            dims[0] * dims[1] * dims[2],
+        );
+        for extension in debye {
+            let count = extension.num_positions;
+            if count == 0 {
+                continue;
+            }
+            let poles = extension.num_poles;
+            let mut positions = Vec::with_capacity(count);
+            for pos in 0..count {
+                let [i, j, k] = extension.positions[pos];
+                positions.push((i * i_stride + j * j_stride + k) as u32);
+            }
+            let mut relax = Vec::with_capacity(poles * 3 * count);
+            let mut drive = Vec::with_capacity(poles * 3 * count);
+            let mut poles_state = Vec::with_capacity(poles * 3 * count);
+            for pole in 0..poles {
+                for component in 0..3 {
+                    relax.extend_from_slice(&extension.v_relax_ade[pole][component]);
+                    drive.extend_from_slice(&extension.v_drive_ade[pole][component]);
+                    poles_state.extend_from_slice(&extension.volt_pole_ade[pole][component]);
+                }
+            }
+            let mut solve = Vec::with_capacity(3 * count);
+            let mut pre_state = Vec::with_capacity(3 * count);
+            let mut ade = Vec::with_capacity(3 * count);
+            for component in 0..3 {
+                solve.extend_from_slice(&extension.v_solve_ade[component]);
+                pre_state.extend_from_slice(&extension.volt_pre_ade[component]);
+                ade.extend_from_slice(&extension.volt_ade[component]);
+            }
+            let buffer_u32 = |label: &str, data: &[u32]| {
+                use wgpu::util::DeviceExt;
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(label),
+                        contents: &u32_bytes(data),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
+            };
+            let buffer_f32 = |label: &str, data: &[f32]| {
+                use wgpu::util::DeviceExt;
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(label),
+                        contents: &f32_bytes(data),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
+            };
+            let pos_buf = buffer_u32("openems debye pos", &positions);
+            let relax_buf = buffer_f32("openems debye relax", &relax);
+            let drive_buf = buffer_f32("openems debye drive", &drive);
+            let solve_buf = buffer_f32("openems debye solve", &solve);
+            let pole_buf = buffer_f32("openems debye pole", &poles_state);
+            let pre_buf = buffer_f32("openems debye pre", &pre_state);
+            let ade_buf = buffer_f32("openems debye ade", &ade);
+            let uniform = {
+                use wgpu::util::DeviceExt;
+                let mut data = Vec::with_capacity(48);
+                for value in [count as u32, 0, 0, 0] {
+                    data.extend_from_slice(&value.to_le_bytes());
+                }
+                for value in [poles as u32, 0, 0, 0] {
+                    data.extend_from_slice(&value.to_le_bytes());
+                }
+                for value in [plane as u32, 0, 0, 0] {
+                    data.extend_from_slice(&value.to_le_bytes());
+                }
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("openems debye dims"),
+                        contents: &data,
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    })
+            };
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("openems debye bind group"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.volt.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry { binding: 1, resource: pos_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: relax_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: drive_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: solve_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: pole_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: pre_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: ade_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: uniform.as_entire_binding() },
+                ],
+            });
+            instances.push(DebyeInstance {
+                bind,
+                groups: (count as u32).div_ceil(64).max(1),
+            });
+        }
+        if instances.is_empty() {
+            return false;
+        }
+        self.debye = Some(DebyeBinds {
+            pre,
+            post,
+            apply,
+            instances,
+        });
+        true
+    }
+
+    /// Whether device-side Debye kernels are active.
+    pub fn has_debye(&self) -> bool {
+        self.debye.is_some()
+    }
+
+    /// Build the device-side Lorentz kernels from the host state.
+    pub fn setup_lorentz(
+        &mut self,
+        lorentz: &[&crate::extensions::EngineExtLorentzMaterial],
+    ) -> bool {
+        if lorentz.is_empty() {
+            return false;
+        }
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("openems lorentz kernels"),
+            source: wgpu::ShaderSource::Wgsl(UPDATE_SHADER.into()),
+        });
+        let entries = (0..15u32)
+            .map(|binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: if binding == 14 {
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    }
+                } else {
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage {
+                            read_only: binding >= 2 && binding <= 9,
+                        },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    }
+                },
+                count: None,
+            })
+            .collect::<Vec<_>>();
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("openems lorentz layout"),
+                entries: &entries,
+            });
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("openems lorentz pipeline layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = |entry: &str| {
+            self.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(&pipeline_layout),
+                    module: &shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        };
+        let pre_volt = pipeline("lorentz_pre_volt");
+        let pre_curr = pipeline("lorentz_pre_curr");
+        let apply_volt = pipeline("lorentz_apply_volt");
+        let apply_curr = pipeline("lorentz_apply_curr");
+        let dims = self.dims;
+        let (i_stride, j_stride, plane) = (
+            dims[1] * dims[2],
+            dims[2],
+            dims[0] * dims[1] * dims[2],
+        );
+        let mut instances = Vec::new();
+        for extension in lorentz {
+            let count = extension.num_positions;
+            if count == 0 {
+                continue;
+            }
+            let orders = extension.num_orders;
+            let mut positions = Vec::with_capacity(count);
+            for pos in 0..count {
+                let [i, j, k] = extension.positions[pos];
+                positions.push((i * i_stride + j * j_stride + k) as u32);
+            }
+            let mut active = Vec::with_capacity(orders * 2);
+            for order in 0..orders {
+                active.push(u32::from(extension.volt_ade_on[order]));
+                active.push(u32::from(extension.curr_ade_on[order]));
+            }
+            let mut v_int = Vec::with_capacity(orders * 3 * count);
+            let mut v_ext = Vec::with_capacity(orders * 3 * count);
+            let mut v_lor = Vec::with_capacity(orders * 3 * count);
+            let mut i_int = Vec::with_capacity(orders * 3 * count);
+            let mut i_ext = Vec::with_capacity(orders * 3 * count);
+            let mut i_lor = Vec::with_capacity(orders * 3 * count);
+            let mut volt_ade = Vec::with_capacity(orders * 3 * count);
+            let mut volt_lor = Vec::with_capacity(orders * 3 * count);
+            let mut curr_ade = Vec::with_capacity(orders * 3 * count);
+            let mut curr_lor = Vec::with_capacity(orders * 3 * count);
+            for order in 0..orders {
+                for component in 0..3 {
+                    v_int.extend_from_slice(&extension.v_int_ade[order][component]);
+                    v_ext.extend_from_slice(&extension.v_ext_ade[order][component]);
+                    v_lor.extend_from_slice(&extension.v_lor_ade[order][component]);
+                    i_int.extend_from_slice(&extension.i_int_ade[order][component]);
+                    i_ext.extend_from_slice(&extension.i_ext_ade[order][component]);
+                    i_lor.extend_from_slice(&extension.i_lor_ade[order][component]);
+                    volt_ade.extend_from_slice(&extension.volt_ade[order][component]);
+                    volt_lor.extend_from_slice(&extension.volt_lor_ade[order][component]);
+                    curr_ade.extend_from_slice(&extension.curr_ade[order][component]);
+                    curr_lor.extend_from_slice(&extension.curr_lor_ade[order][component]);
+                }
+            }
+            let buffer_u32 = |label: &str, data: &[u32]| {
+                use wgpu::util::DeviceExt;
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(label),
+                        contents: &u32_bytes(data),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
+            };
+            let buffer_f32 = |label: &str, data: &[f32]| {
+                use wgpu::util::DeviceExt;
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(label),
+                        contents: &f32_bytes(data),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
+            };
+            let pos_buf = buffer_u32("openems lorentz pos", &positions);
+            let active_buf = buffer_u32("openems lorentz active", &active);
+            let v_int_buf = buffer_f32("openems lorentz v int", &v_int);
+            let v_ext_buf = buffer_f32("openems lorentz v ext", &v_ext);
+            let v_lor_buf = buffer_f32("openems lorentz v lor", &v_lor);
+            let i_int_buf = buffer_f32("openems lorentz i int", &i_int);
+            let i_ext_buf = buffer_f32("openems lorentz i ext", &i_ext);
+            let i_lor_buf = buffer_f32("openems lorentz i lor", &i_lor);
+            let volt_ade_buf = buffer_f32("openems lorentz volt ade", &volt_ade);
+            let volt_lor_buf = buffer_f32("openems lorentz volt lor", &volt_lor);
+            let curr_ade_buf = buffer_f32("openems lorentz curr ade", &curr_ade);
+            let curr_lor_buf = buffer_f32("openems lorentz curr lor", &curr_lor);
+            let uniform = {
+                use wgpu::util::DeviceExt;
+                let mut data = Vec::with_capacity(48);
+                for value in [count as u32, 0, 0, 0] {
+                    data.extend_from_slice(&value.to_le_bytes());
+                }
+                for value in [orders as u32, 0, 0, 0] {
+                    data.extend_from_slice(&value.to_le_bytes());
+                }
+                for value in [plane as u32, 0, 0, 0] {
+                    data.extend_from_slice(&value.to_le_bytes());
+                }
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("openems lorentz dims"),
+                        contents: &data,
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    })
+            };
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("openems lorentz bind group"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.volt.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.curr.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry { binding: 2, resource: pos_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: active_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: v_int_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: v_ext_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: v_lor_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: i_int_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: i_ext_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 9, resource: i_lor_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 10,
+                        resource: volt_ade_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 11,
+                        resource: volt_lor_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 12,
+                        resource: curr_ade_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 13,
+                        resource: curr_lor_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry { binding: 14, resource: uniform.as_entire_binding() },
+                ],
+            });
+            instances.push(LorentzInstance {
+                bind,
+                groups: (count as u32).div_ceil(64).max(1),
+            });
+        }
+        if instances.is_empty() {
+            return false;
+        }
+        self.lorentz = Some(LorentzBinds {
+            pre_volt,
+            pre_curr,
+            apply_volt,
+            apply_curr,
+            instances,
+        });
+        true
+    }
+
+    /// Whether device-side Lorentz kernels are active.
+    pub fn has_lorentz(&self) -> bool {
+        self.lorentz.is_some()
+    }
+
     /// Apply the device-side voltage source for one step (host path).
     pub fn dispatch_source_volt(&self, ts: u32) {
         self.dispatch_source(true, ts);
@@ -2526,12 +3185,21 @@ impl GpuFields {
                 if let Some(sheet) = self.sheet.as_ref() {
                     sheet.record(&mut encoder, true);
                 }
+                if let Some(debye) = self.debye.as_ref() {
+                    debye.record(&mut encoder, 0);
+                }
+                if let Some(lorentz) = self.lorentz.as_ref() {
+                    lorentz.record(&mut encoder, 0);
+                }
                 if let Some(upml) = self.upml.as_ref() {
                     upml.record(&mut encoder, 0);
                 }
                 record_dispatch(&mut encoder, &self.pipe_e, &self.bind_e, volt_cells);
                 if let Some(upml) = self.upml.as_ref() {
                     upml.record(&mut encoder, 1);
+                }
+                if let Some(debye) = self.debye.as_ref() {
+                    debye.record(&mut encoder, 1);
                 }
                 if let Some(tfsf) = self.tfsf.as_ref() {
                     for side in &tfsf.volt {
@@ -2543,6 +3211,12 @@ impl GpuFields {
                 }
                 if let Some(sheet) = self.sheet.as_ref() {
                     sheet.record(&mut encoder, false);
+                }
+                if let Some(debye) = self.debye.as_ref() {
+                    debye.record(&mut encoder, 2);
+                }
+                if let Some(lorentz) = self.lorentz.as_ref() {
+                    lorentz.record(&mut encoder, 2);
                 }
                 if let Some(lumped) = self.lumped.as_ref() {
                     lumped.record(&mut encoder, false);
@@ -2556,6 +3230,9 @@ impl GpuFields {
                 if let Some(upml) = self.upml.as_ref() {
                     upml.record(&mut encoder, 2);
                 }
+                if let Some(lorentz) = self.lorentz.as_ref() {
+                    lorentz.record(&mut encoder, 1);
+                }
                 record_dispatch(&mut encoder, &self.pipe_h, &self.bind_h, curr_cells);
                 if let Some(upml) = self.upml.as_ref() {
                     upml.record(&mut encoder, 3);
@@ -2564,6 +3241,9 @@ impl GpuFields {
                     for side in &tfsf.curr {
                         tfsf.record(&mut encoder, side, step);
                     }
+                }
+                if let Some(lorentz) = self.lorentz.as_ref() {
+                    lorentz.record(&mut encoder, 3);
                 }
                 if let Some(source) = self.source.as_ref() {
                     source.record(&mut encoder, source.curr.as_ref(), step);

@@ -216,6 +216,8 @@ impl Engine {
                 || extension.lumped_terms().is_some()
                 || extension.sheet_terms().is_some()
                 || extension.tfsf_terms().is_some()
+                || extension.debye_terms().is_some()
+                || extension.lorentz_terms().is_some()
         });
         if !all_native {
             if std::env::var_os("OPENEMS_DEBUG_GPU").is_some() {
@@ -293,6 +295,16 @@ impl Engine {
             .iter()
             .filter_map(|extension| extension.tfsf_terms())
             .collect();
+        let debyes: Vec<&crate::extensions::EngineExtDebyeMaterial> = self
+            .extensions
+            .iter()
+            .filter_map(|extension| extension.debye_terms())
+            .collect();
+        let lorentzs: Vec<&crate::extensions::EngineExtLorentzMaterial> = self
+            .extensions
+            .iter()
+            .filter_map(|extension| extension.lorentz_terms())
+            .collect();
         let Some(gpu) = self.gpu_fields.as_mut() else {
             return;
         };
@@ -315,18 +327,25 @@ impl Engine {
         if !tfsfs.is_empty() {
             prepared |= gpu.setup_tfsf(&tfsfs);
         }
+        if !debyes.is_empty() {
+            prepared |= gpu.setup_debye(&debyes);
+        }
+        if !lorentzs.is_empty() {
+            prepared |= gpu.setup_lorentz(&lorentzs);
+        }
         if !prepared {
             return;
         }
         if std::env::var_os("OPENEMS_DEBUG_GPU").is_some() {
             eprintln!(
-                "[openEMS] GPU batched path: source {}, UPML slabs {}, Mur faces {}, lumped edges {}, sheet cells {}, TFSF regions {}",
+                "[openEMS] GPU batched path: source {}, UPML slabs {}, Mur faces {}, lumped edges {}, sheet cells {}, TFSF regions {}, Debye cells {}",
                 if gpu.has_source() { "on device" } else { "none" },
                 upmls.len(),
                 murs.iter().map(|mur| mur.faces.len()).sum::<usize>(),
                 lumped.iter().map(|extension| extension.num_positions).sum::<usize>(),
                 sheets.iter().map(|sheet| sheet.num_positions).sum::<usize>(),
-                tfsfs.len()
+                tfsfs.len(),
+                debyes.iter().map(|extension| extension.num_positions).sum::<usize>()
             );
         }
         for extension in self.extensions.iter_mut() {
@@ -1630,6 +1649,161 @@ mod tests {
         );
         eprintln!(
             "GPU device TFSF: {n}^3, {steps} steps, CPU diff {diff:.2e}, batch/step diff {batch_diff:.2e}, CPU {cpu_time:.2?}, GPU {gpu_time:.2?}"
+        );
+    }
+
+    #[cfg(feature = "gpu")]
+    fn debye_extension(n: usize) -> crate::extensions::EngineExtDebyeMaterial {
+        let mut extension = crate::extensions::EngineExtDebyeMaterial::new(2, 3);
+        extension.set_position_uniform(0, [2, 3, 4], &[0.5, 0.3], &[0.2, 0.1], 0.8);
+        extension.set_position_uniform(
+            1,
+            [n / 2, n / 2, n / 2],
+            &[0.4, 0.6],
+            &[0.3, 0.05],
+            0.7,
+        );
+        extension.set_position_uniform(2, [n / 3, 2, n - 3], &[0.2, 0.9], &[0.1, 0.2], 0.9);
+        extension
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_device_debye_matches_the_cpu_engine() {
+        let n = 12;
+        let steps = 120;
+        let build = || {
+            let mut engine = Engine::new(Box::new(cavity_operator(n)));
+            engine.add_extension(Box::new(debye_extension(n)));
+            seed_fields(&mut engine);
+            engine
+        };
+
+        let mut cpu = build();
+        assert!(cpu.iterate_ts(steps));
+
+        let mut gpu = build();
+        if let Err(reason) = gpu.enable_gpu() {
+            eprintln!("skipping the GPU Debye test: {reason}");
+            return;
+        }
+        assert!(
+            gpu.gpu_fields
+                .as_ref()
+                .map(|fields| fields.has_debye())
+                .unwrap_or(false),
+            "the Debye cells must be uploaded to the device"
+        );
+        assert!(
+            !gpu.needs_host_extension(),
+            "a Debye-only model must use the batched device path"
+        );
+
+        let start = std::time::Instant::now();
+        assert!(gpu.iterate_ts(steps));
+        let gpu_time = start.elapsed();
+        let diff = field_diff(&cpu, &gpu);
+        assert!(diff < 1.0e-5, "CPU/GPU device-Debye field diff {diff}");
+
+        let mut stepped = build();
+        if stepped.enable_gpu().is_err() {
+            return;
+        }
+        for _ in 0..steps {
+            assert!(stepped.iterate_ts(1));
+        }
+        let batch_diff = field_diff(&gpu, &stepped);
+        assert!(
+            batch_diff < 1.0e-6,
+            "batch vs single-step Debye scheduling diff {batch_diff}"
+        );
+        eprintln!(
+            "GPU device Debye: {n}^3, {steps} steps, CPU diff {diff:.2e}, batch/step diff {batch_diff:.2e}, GPU {gpu_time:.2?}"
+        );
+    }
+
+    #[cfg(feature = "gpu")]
+    fn lorentz_extension(n: usize) -> crate::extensions::EngineExtLorentzMaterial {
+        let mut extension = crate::extensions::EngineExtLorentzMaterial::new(2, 2);
+        let mut v_int = [0.0f32; 3];
+        let mut v_ext = [0.0f32; 3];
+        let mut v_lor = [0.0f32; 3];
+        let mut i_int = [0.0f32; 3];
+        let mut i_ext = [0.0f32; 3];
+        let mut i_lor = [0.0f32; 3];
+        for component in 0..3 {
+            v_int[component] = 0.6 + 0.05 * component as f32;
+            v_ext[component] = 0.2 + 0.01 * component as f32;
+            v_lor[component] = if component == 2 { 0.0 } else { 0.15 };
+            i_int[component] = 0.55 + 0.02 * component as f32;
+            i_ext[component] = 0.18 + 0.02 * component as f32;
+            i_lor[component] = 0.12;
+        }
+        extension.set_position(0, [2, 3, 4]);
+        extension.set_order_coefficients(
+            0, 0, &v_int, &v_ext, &v_lor, &i_int, &i_ext, &i_lor,
+        );
+        extension.set_position(1, [n / 2, n / 2, n - 3]);
+        extension.set_order_coefficients(
+            1, 1, &v_int, &v_ext, &v_lor, &i_int, &i_ext, &i_lor,
+        );
+        extension.set_order_active(0, true, true);
+        extension.set_order_active(1, true, false);
+        extension
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_device_lorentz_matches_the_cpu_engine() {
+        let n = 12;
+        let steps = 120;
+        let build = || {
+            let mut engine = Engine::new(Box::new(cavity_operator(n)));
+            engine.add_extension(Box::new(lorentz_extension(n)));
+            seed_fields(&mut engine);
+            engine
+        };
+
+        let mut cpu = build();
+        assert!(cpu.iterate_ts(steps));
+
+        let mut gpu = build();
+        if let Err(reason) = gpu.enable_gpu() {
+            eprintln!("skipping the GPU Lorentz test: {reason}");
+            return;
+        }
+        assert!(
+            gpu.gpu_fields
+                .as_ref()
+                .map(|fields| fields.has_lorentz())
+                .unwrap_or(false),
+            "the Lorentz cells must be uploaded to the device"
+        );
+        assert!(
+            !gpu.needs_host_extension(),
+            "a Lorentz-only model must use the batched device path"
+        );
+
+        let start = std::time::Instant::now();
+        assert!(gpu.iterate_ts(steps));
+        let gpu_time = start.elapsed();
+        let diff = field_diff(&cpu, &gpu);
+        assert!(diff < 1.0e-5, "CPU/GPU device-Lorentz field diff {diff}");
+
+        let mut stepped = build();
+        if stepped.enable_gpu().is_err() {
+            return;
+        }
+        for _ in 0..steps {
+            assert!(stepped.iterate_ts(1));
+        }
+        let batch_diff = field_diff(&gpu, &stepped);
+        assert!(
+            batch_diff < 1.0e-6,
+            "batch vs single-step Lorentz scheduling diff {batch_diff}"
+        );
+        eprintln!(
+            "GPU device Lorentz: {n}^3, {steps} steps, CPU diff {diff:.2e}, batch/step diff {batch_diff:.2e}, GPU {gpu_time:.2?}"
         );
     }
 
