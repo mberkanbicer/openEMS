@@ -334,7 +334,13 @@ impl Engine {
             prepared |= gpu.setup_source(&terms);
         }
         if !upmls.is_empty() {
-            prepared |= gpu.setup_upml(&upmls);
+            let built = gpu.setup_upml(&upmls);
+            prepared |= built;
+            if built {
+                // Fold the PML post phases into E/H when the device can bind
+                // the extra buffers; otherwise the separate post passes stay.
+                gpu.setup_pml_engine();
+            }
         }
         if !murs.is_empty() {
             prepared |= gpu.setup_mur(&murs);
@@ -391,6 +397,23 @@ impl Engine {
             .unwrap_or(0)
     }
 
+    /// Upload the device-side probe plan.
+    #[cfg(feature = "gpu")]
+    pub fn setup_gpu_probes(&mut self, points: &[crate::processing::GpuProbePoint]) -> bool {
+        self.gpu_fields
+            .as_mut()
+            .map(|fields| fields.setup_probes(points))
+            .unwrap_or(false)
+    }
+
+    /// Download the per-step probe matrix for a batch.
+    #[cfg(feature = "gpu")]
+    pub fn download_gpu_probe_values(&self, steps: u32) -> Option<Vec<f32>> {
+        self.gpu_fields
+            .as_ref()
+            .and_then(|fields| fields.download_probe_values(steps))
+    }
+
     /// Copy the device `volt` result back into the CPU array.
     #[cfg(feature = "gpu")]
     fn download_volt(&mut self) {
@@ -424,8 +447,7 @@ impl Engine {
     pub fn sync_fields(&mut self) {
         if !self.gpu_pending {
             return;
-        }
-        let Some(gpu) = self.gpu_fields.as_ref() else {
+        }        let Some(gpu) = self.gpu_fields.as_ref() else {
             self.gpu_pending = false;
             return;
         };
@@ -442,6 +464,49 @@ impl Engine {
         self.gpu_pending = false;
         self.host_volt_dirty = false;
         self.host_curr_dirty = false;
+    }
+
+    /// Upload both host arrays unconditionally (multi-grid interface path).
+    #[cfg(feature = "gpu")]
+    fn upload_all_gpu(&mut self) {
+        if self.gpu_fields.is_none() {
+            return;
+        }
+        let len = self.volt_ptr.len();
+        // SAFETY: the slices only live for the upload call, which copies them
+        // into the GPU buffers.
+        let (volt, curr) = unsafe {
+            (
+                std::slice::from_raw_parts(self.volt_ptr.as_ptr(), len),
+                std::slice::from_raw_parts(self.curr_ptr.as_ptr(), len),
+            )
+        };
+        if let Some(gpu) = self.gpu_fields.as_ref() {
+            gpu.upload(volt, curr);
+        }
+        self.host_volt_dirty = false;
+        self.host_curr_dirty = false;
+    }
+
+    /// Download both device arrays unconditionally (multi-grid interface path).
+    #[cfg(feature = "gpu")]
+    fn download_all_gpu(&mut self) {
+        if self.gpu_fields.is_none() {
+            return;
+        }
+        self.download_volt();
+        self.download_curr();
+        self.gpu_pending = false;
+    }
+
+    /// Enable the GPU on this engine and, for a multi-grid base, its child.
+    #[cfg(feature = "gpu")]
+    pub fn enable_gpu_pair(&mut self) -> Result<(), String> {
+        self.enable_gpu()?;
+        if let Some(inner) = self.inner.as_mut() {
+            inner.enable_gpu()?;
+        }
+        Ok(())
     }
 
     /// Upload the CPU voltage field into the GPU buffer when it changed on the
@@ -533,6 +598,12 @@ impl Engine {
 
     /// Rough field energy, mirroring `Engine_Interface_FDTD::CalcFastEnergy`.
     pub fn fast_energy(&self) -> f64 {
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = self.gpu_fields.as_ref() {
+            if let Some(energy) = gpu.compute_energy(self.energy_counts) {
+                return energy;
+            }
+        }
         calc_fast_energy(&self.volt_ptr, &self.curr_ptr, self.energy_counts)
     }
 
@@ -977,14 +1048,21 @@ impl Engine {
                 }
             }
 
-            // Voltage half-step: both engines, then the interface sync.
+            // Voltage half-step: both engines, then the interface sync. When
+            // the GPU drives an engine, the host arrays are uploaded before
+            // the update and downloaded after it, because the multi-grid
+            // interface tables live on the host.
             self.do_pre_voltage_updates();
+            self.upload_all_gpu();
             self.update_voltages();
+            self.download_all_gpu();
             self.do_post_voltage_updates();
             self.apply2_voltages();
             if let Some(inner) = self.inner.as_mut() {
                 inner.do_pre_voltage_updates();
+                inner.upload_all_gpu();
                 inner.update_voltages();
+                inner.download_all_gpu();
                 inner.do_post_voltage_updates();
                 inner.apply2_voltages();
             }
@@ -992,12 +1070,16 @@ impl Engine {
 
             // Current half-step.
             self.do_pre_current_updates();
+            self.upload_all_gpu();
             self.update_currents();
+            self.download_all_gpu();
             self.do_post_current_updates();
             self.apply2_current();
             if let Some(inner) = self.inner.as_mut() {
                 inner.do_pre_current_updates();
+                inner.upload_all_gpu();
                 inner.update_currents();
+                inner.download_all_gpu();
                 inner.do_post_current_updates();
                 inner.apply2_current();
             }
@@ -1167,6 +1249,9 @@ mod tests {
         );
         let mut op = crate::operator::Operator::new();
         op.load_csx(&xml).expect("cavity CSX");
+        // The differential tests must exercise non-zero EC coefficients, so
+        // build them exactly as the solver setup does.
+        op.calc_ec_operator();
         op
     }
 
@@ -1196,6 +1281,14 @@ mod tests {
             .zip(right)
             .map(|(x, y)| (x - y).abs())
             .fold(0.0, f32::max)
+    }
+
+    #[cfg(feature = "gpu")]
+    fn field_max(engine: &Engine) -> f32 {
+        let values = unsafe {
+            std::slice::from_raw_parts(engine.volt_ptr.as_ptr(), engine.volt_ptr.len())
+        };
+        values.iter().fold(0.0, |max, value| max.max(value.abs()))
     }
 
     #[cfg(feature = "gpu")]
@@ -1684,15 +1777,17 @@ mod tests {
     #[cfg(feature = "gpu")]
     fn debye_extension(n: usize) -> crate::extensions::EngineExtDebyeMaterial {
         let mut extension = crate::extensions::EngineExtDebyeMaterial::new(2, 3);
-        extension.set_position_uniform(0, [2, 3, 4], &[0.5, 0.3], &[0.2, 0.1], 0.8);
+        // Stable, contracting coefficients: the differential test must not
+        // amplify last-bit rounding into a large field.
+        extension.set_position_uniform(0, [2, 3, 4], &[0.4, 0.3], &[0.05, 0.02], 0.95);
         extension.set_position_uniform(
             1,
             [n / 2, n / 2, n / 2],
-            &[0.4, 0.6],
-            &[0.3, 0.05],
-            0.7,
+            &[0.35, 0.45],
+            &[0.04, 0.01],
+            0.92,
         );
-        extension.set_position_uniform(2, [n / 3, 2, n - 3], &[0.2, 0.9], &[0.1, 0.2], 0.9);
+        extension.set_position_uniform(2, [n / 3, 2, n - 3], &[0.3, 0.5], &[0.03, 0.02], 0.97);
         extension
     }
 
@@ -1710,6 +1805,7 @@ mod tests {
 
         let mut cpu = build();
         assert!(cpu.iterate_ts(steps));
+        eprintln!("Debye CPU field max after {steps} steps: {:.3e}", field_max(&cpu));
 
         let mut gpu = build();
         if let Err(reason) = gpu.enable_gpu() {
@@ -1858,9 +1954,18 @@ mod tests {
             }
             assert!(engine.iterate_ts(1));
             let passes = engine.gpu_last_batch_passes();
-            // Four UPML phases (one dispatch each, independent of the slab
-            // count) plus the E and H kernels.
-            assert_eq!(passes, 6, "{slabs} slabs must cost 6 passes, got {passes}");
+            // Two PML pre phases (one dispatch each, independent of the slab
+            // count) plus the fused E and H kernels (which also run the post
+            // phases).
+            assert_eq!(passes, 4, "{slabs} slabs must cost 4 passes, got {passes}");
+            assert!(
+                engine
+                    .gpu_fields
+                    .as_ref()
+                    .map(|fields| fields.has_pml_engine())
+                    .unwrap_or(false),
+                "the PML post phases must be fused into E/H"
+            );
         }
 
         // Six Mur faces colour into three passes per phase, so 9 + E + H.
@@ -1876,6 +1981,24 @@ mod tests {
             11,
             "six Mur faces must cost 11 passes"
         );
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_energy_matches_the_cpu_energy() {
+        let n = 16;
+        let mut engine = Engine::new(Box::new(cavity_operator(n)));
+        seed_fields(&mut engine);
+        if engine.enable_gpu().is_err() {
+            return;
+        }
+        assert!(engine.iterate_ts(3));
+        engine.sync_fields();
+        let cpu_energy = calc_fast_energy(&engine.volt_ptr, &engine.curr_ptr, engine.energy_counts);
+        let gpu_energy = engine.fast_energy();
+        let rel = (gpu_energy - cpu_energy).abs() / cpu_energy.abs().max(f64::MIN_POSITIVE);
+        assert!(rel < 1.0e-6, "CPU/GPU energy relative diff {rel}");
+        eprintln!("GPU energy: CPU {cpu_energy:.6e}, GPU {gpu_energy:.6e}, rel {rel:.2e}");
     }
 
     #[cfg(feature = "gpu")]

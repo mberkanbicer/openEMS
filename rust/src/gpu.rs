@@ -258,6 +258,225 @@ fn upml_post_curr(@builtin(global_invocation_id) gid: vec3<u32>) {
     up_curr[g] = help + up_iifn[t] * up_curr_flux[t];
 }
 
+// Fused PML: the post phases run inside the E/H kernels, which removes two
+// dispatches per step. The pre phases stay separate because they read and
+// write the field *between* the two updates (a global barrier is required, and
+// WGSL has none).
+//
+// The post phase only touches its own cell, so running it at the end of the
+// E/H thread that owns the cell is exact. `update_h_pml` iterates the full
+// grid and guards the H update, because PML slabs can include the last line,
+// which the H update itself does not visit but the post phase must.
+
+struct PmlDims {
+    global: vec4<u32>,
+    counts: vec4<u32>,
+};
+
+@group(0) @binding(12) var<storage, read> pml_coeff: array<f32>;
+@group(0) @binding(13) var<storage, read_write> pml_flux: array<f32>;
+@group(0) @binding(14) var<storage, read> pml_slabs: array<vec4<u32>>;
+@group(0) @binding(15) var<uniform> pml_dims: PmlDims;
+
+// Returns (slab index, absolute element index, 0, 0), or `0xffffffff` in `x`
+// when the cell is outside every slab. The absolute index includes the
+// preceding slabs' element ranges, because all slabs share one array.
+fn pml_hit(i: u32, j: u32, k: u32) -> vec4<u32> {
+    var base = 0u;
+    for (var s = 0u; s < pml_dims.counts.x; s = s + 1u) {
+        let start = pml_slabs[s * 2u].xyz;
+        let ext = pml_slabs[s * 2u + 1u].xyz;
+        let n = 3u * ext.x * ext.y * ext.z;
+        if (i >= start.x && i < start.x + ext.x
+            && j >= start.y && j < start.y + ext.y
+            && k >= start.z && k < start.z + ext.z) {
+            let li = i - start.x;
+            let lj = j - start.y;
+            let lk = k - start.z;
+            return vec4<u32>(s, base + li * ext.y * ext.z + lj * ext.z + lk, 0u, 0u);
+        }
+        base = base + n;
+    }
+    return vec4<u32>(0xffffffffu, 0u, 0u, 0u);
+}
+
+fn pml_post_phase(i: u32, j: u32, k: u32) {
+    let hit = pml_hit(i, j, k);
+    if (hit.x == 0xffffffffu) { return; }
+    let ext = pml_slabs[hit.x * 2u + 1u].xyz;
+    let slab_n = ext.x * ext.y * ext.z;
+    let plane = pml_dims.global.x * pml_dims.global.y * pml_dims.global.z;
+    let base = idx(0u, i, j, k);
+    for (var c = 0u; c < 3u; c = c + 1u) {
+        let t = hit.y + c * slab_n;
+        let g = base + c * plane;
+        let help = pml_flux[t];
+        pml_flux[t] = field[g];
+        field[g] = help + pml_coeff[t] * pml_flux[t];
+    }
+}
+
+@compute @workgroup_size(64)
+fn update_e_pml(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let total = dims.nx * dims.ny * dims.nz;
+    let t = gid.x;
+    if (t >= total) { return; }
+    let i = t / (dims.ny * dims.nz);
+    let rem = t % (dims.ny * dims.nz);
+    let j = rem / dims.nz;
+    let k = rem % dims.nz;
+    let si = select(0u, 1u, i > 0u);
+    let sj = select(0u, 1u, j > 0u);
+    let sk = select(0u, 1u, k > 0u);
+
+    let c2_ijk = peer[idx(2u, i, j, k)];
+    let c2_ijm1k = peer[idx(2u, i, j - sj, k)];
+    let c1_ijk = peer[idx(1u, i, j, k)];
+    let c1_ijkm1 = peer[idx(1u, i, j, k - sk)];
+    let c0_ijk = peer[idx(0u, i, j, k)];
+    let c0_ijkm1 = peer[idx(0u, i, j, k - sk)];
+    let c2_im1jk = peer[idx(2u, i - si, j, k)];
+    let c1_im1jk = peer[idx(1u, i - si, j, k)];
+    let c0_ijm1k = peer[idx(0u, i, j - sj, k)];
+
+    let b = idx(0u, i, j, k);
+    let comp = dims.nx * dims.ny * dims.nz;
+    let ex = b;
+    let ey = b + comp;
+    let ez = ey + comp;
+    field[ex] = field[ex] * vv[ex] + vi[ex] * (c2_ijk - c2_ijm1k - c1_ijk + c1_ijkm1);
+    field[ey] = field[ey] * vv[ey] + vi[ey] * (c0_ijk - c0_ijkm1 - c2_ijk + c2_im1jk);
+    field[ez] = field[ez] * vv[ez] + vi[ez] * (c1_ijk - c1_im1jk - c0_ijk + c0_ijm1k);
+    pml_post_phase(i, j, k);
+}
+
+@compute @workgroup_size(64)
+fn update_h_pml(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let total = dims.nx * dims.ny * dims.nz;
+    let t = gid.x;
+    if (t >= total) { return; }
+    let i = t / (dims.ny * dims.nz);
+    let rem = t % (dims.ny * dims.nz);
+    let j = rem / dims.nz;
+    let k = rem % dims.nz;
+    if (i + 1u < dims.nx && j + 1u < dims.ny && k + 1u < dims.nz) {
+        let v2_ijk = peer[idx(2u, i, j, k)];
+        let v2_ijp1k = peer[idx(2u, i, j + 1u, k)];
+        let v1_ijk = peer[idx(1u, i, j, k)];
+        let v1_ijkp1 = peer[idx(1u, i, j, k + 1u)];
+        let v0_ijk = peer[idx(0u, i, j, k)];
+        let v0_ijkp1 = peer[idx(0u, i, j, k + 1u)];
+        let v2_ip1jk = peer[idx(2u, i + 1u, j, k)];
+        let v1_ip1jk = peer[idx(1u, i + 1u, j, k)];
+        let v0_ijp1k = peer[idx(0u, i, j + 1u, k)];
+
+        let b = idx(0u, i, j, k);
+        let comp = dims.nx * dims.ny * dims.nz;
+        let hx = b;
+        let hy = b + comp;
+        let hz = hy + comp;
+        field[hx] = field[hx] * ii[hx] + iv[hx] * (v2_ijk - v2_ijp1k - v1_ijk + v1_ijkp1);
+        field[hy] = field[hy] * ii[hy] + iv[hy] * (v0_ijk - v0_ijkp1 - v2_ijk + v2_ip1jk);
+        field[hz] = field[hz] * ii[hz] + iv[hz] * (v1_ijk - v1_ip1jk - v0_ijk + v0_ijp1k);
+    }
+    pml_post_phase(i, j, k);
+}
+
+// Device-side energy reduction: one workgroup sums 64 cells and writes two
+// partials (E and H). The host sums the partials in f64 and applies the
+// constants, so the value stays within ~1e-7 of the CPU accumulation.
+struct EnergyDims {
+    field: vec4<u32>,
+    counts: vec4<u32>,
+};
+
+@group(0) @binding(0) var<storage, read> energy_volt: array<f32>;
+@group(0) @binding(1) var<storage, read> energy_curr: array<f32>;
+@group(0) @binding(2) var<storage, read_write> energy_parts: array<f32>;
+@group(0) @binding(3) var<uniform> energy_dims: EnergyDims;
+
+var<workgroup> energy_e: array<f32, 64>;
+var<workgroup> energy_h: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn energy_sum(@builtin(global_invocation_id) gid: vec3<u32>,
+              @builtin(local_invocation_id) lid: vec3<u32>) {
+    let cx = energy_dims.counts.x - 1u;
+    let cy = energy_dims.counts.y - 1u;
+    let cz = energy_dims.counts.z - 1u;
+    let total = cx * cy * cz;
+    let t = gid.x;
+    var e_sum = 0.0;
+    var h_sum = 0.0;
+    if (t < total) {
+        let i = t / (cy * cz);
+        let rem = t % (cy * cz);
+        let j = rem / cz;
+        let k = rem % cz;
+        let nx = energy_dims.field.x;
+        let ny = energy_dims.field.y;
+        let nz = energy_dims.field.z;
+        let plane = nx * ny * nz;
+        let base = i * ny * nz + j * nz + k;
+        for (var c = 0u; c < 3u; c = c + 1u) {
+            let ev = energy_volt[base + c * plane];
+            let hv = energy_curr[base + c * plane];
+            e_sum = e_sum + ev * ev;
+            h_sum = h_sum + hv * hv;
+        }
+    }
+    energy_e[lid.x] = e_sum;
+    energy_h[lid.x] = h_sum;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid.x < stride) {
+            energy_e[lid.x] = energy_e[lid.x] + energy_e[lid.x + stride];
+            energy_h[lid.x] = energy_h[lid.x] + energy_h[lid.x + stride];
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (lid.x == 0u) {
+        let group = gid.x / 64u;
+        energy_parts[group * 2u] = energy_e[0];
+        energy_parts[group * 2u + 1u] = energy_h[0];
+    }
+}
+
+// Device-side probe gather: one invocation per probe writes the sampled value
+// into a compact per-step matrix, so a probe-only model never downloads the
+// field.
+struct ProbeParams {
+    ts: u32,
+    step: u32,
+    count: u32,
+    pad: u32,
+};
+
+@group(0) @binding(0) var<storage, read> probe_volt: array<f32>;
+@group(0) @binding(1) var<storage, read> probe_curr: array<f32>;
+@group(0) @binding(2) var<storage, read> probe_index: array<u32>;
+@group(0) @binding(3) var<storage, read> probe_buffer: array<u32>;
+@group(0) @binding(4) var<storage, read> probe_interval: array<u32>;
+@group(0) @binding(5) var<storage, read_write> probe_values: array<f32>;
+@group(0) @binding(6) var<uniform> probe_params: ProbeParams;
+
+@compute @workgroup_size(64)
+fn probe_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = gid.x;
+    if (p >= probe_params.count) { return; }
+    let interval = probe_interval[p];
+    if (interval == 0u || probe_params.ts % interval != 0u) { return; }
+    let index = probe_index[p];
+    var value = probe_volt[index];
+    if (probe_buffer[p] == 1u) {
+        value = probe_curr[index];
+    }
+    probe_values[probe_params.step * probe_params.count + p] = value;
+}
+
 // Device-side Mur ABC: the three host phases (pre, post, apply2). Every face
 // of a model shares one set of concatenated coefficient/history buffers and a
 // face table; the uniform carries the element range of the current pass.
@@ -324,7 +543,7 @@ fn mur_pos_index(face: MurFace, ip: u32, ipp: u32, shifted: bool, comp: u32) -> 
 
 @compute @workgroup_size(64)
 fn mur_pre(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let t = gid.x;
+    let t = gid.x + mur_dims.range.x;
     if (t < mur_dims.range.x || t >= mur_dims.range.y) { return; }
     let face = mur_find(t);
     let ip = (t - face.a.x) / face.a.z;
@@ -341,7 +560,7 @@ fn mur_pre(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn mur_post(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let t = gid.x;
+    let t = gid.x + mur_dims.range.x;
     if (t < mur_dims.range.x || t >= mur_dims.range.y) { return; }
     let face = mur_find(t);
     let ip = (t - face.a.x) / face.a.z;
@@ -354,7 +573,7 @@ fn mur_post(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn mur_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let t = gid.x;
+    let t = gid.x + mur_dims.range.x;
     if (t < mur_dims.range.x || t >= mur_dims.range.y) { return; }
     let face = mur_find(t);
     let ip = (t - face.a.x) / face.a.z;
@@ -1299,6 +1518,9 @@ impl SourceTerms {
 /// slots are sized for it.
 const SOURCE_BATCH: u32 = 256;
 
+/// Largest batch a caller may request when device-side sampling is active.
+pub const GPU_MAX_BATCH: u32 = SOURCE_BATCH;
+
 struct SourceSide {
     pipeline: wgpu::ComputePipeline,
     bind: wgpu::BindGroup,
@@ -1368,6 +1590,13 @@ struct UpmlBinds {
     post_curr: wgpu::ComputePipeline,
     bind: wgpu::BindGroup,
     groups: u32,
+    /// Buffers the fused E/H kernels reuse for the post phases.
+    vvfn: wgpu::Buffer,
+    volt_flux: wgpu::Buffer,
+    iifn: wgpu::Buffer,
+    curr_flux: wgpu::Buffer,
+    table: wgpu::Buffer,
+    dims: wgpu::Buffer,
 }
 
 impl UpmlBinds {
@@ -1584,6 +1813,27 @@ impl LorentzBinds {
     }
 }
 
+/// Device-side probe gather: a compact per-step value matrix.
+struct ProbeBinds {
+    pipe: wgpu::ComputePipeline,
+    bind: wgpu::BindGroup,
+    params: wgpu::Buffer,
+    values: wgpu::Buffer,
+    staging: wgpu::Buffer,
+    count: u32,
+    slot_size: u32,
+    scratch: std::cell::RefCell<Vec<u8>>,
+}
+
+/// Fused PML E/H kernels: the post phases run at the end of the update thread,
+/// which removes the two post dispatches per step.
+struct PmlEngine {
+    pipe_e: wgpu::ComputePipeline,
+    pipe_h: wgpu::ComputePipeline,
+    bind_e: wgpu::BindGroup,
+    bind_h: wgpu::BindGroup,
+}
+
 /// Persistent GPU field/coefficient buffers for `Engine`.
 ///
 /// The engine uploads once, dispatches the E and H kernels per step, and
@@ -1608,6 +1858,25 @@ pub struct GpuFields {
     source: Option<SourceBinds>,
     /// Device-side UPML kernels, when the model has PML regions.
     upml: Option<UpmlBinds>,
+    /// Fused PML E/H kernels (post phases folded into the updates).
+    pml_engine: Option<PmlEngine>,
+    /// EC coefficient buffers, kept so the fused PML bind groups can rebind
+    /// them next to the PML buffers.
+    ec_vv: wgpu::Buffer,
+    ec_vi: wgpu::Buffer,
+    ec_ii: wgpu::Buffer,
+    ec_iv: wgpu::Buffer,
+    /// The `Dims` uniform bound by the E/H kernels.
+    dims_uniform: wgpu::Buffer,
+    /// Device-side energy reduction (partial sums per workgroup).
+    energy_pipe: wgpu::ComputePipeline,
+    energy_bind: wgpu::BindGroup,
+    energy_uniform: wgpu::Buffer,
+    energy_parts: wgpu::Buffer,
+    energy_staging: wgpu::Buffer,
+    energy_groups: u32,
+    /// Device-side probe gather, when the model only has point probes.
+    probes: Option<ProbeBinds>,
     /// Device-side Mur ABC kernels, when the model has Mur faces.
     mur: Option<MurBinds>,
     /// Device-side lumped RLC kernels, when the model has lumped elements.
@@ -1764,6 +2033,107 @@ impl GpuFields {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
+        // Energy reduction: one partial (E and H) per 64-cell workgroup.
+        let energy_groups = (volt.len() as u32).div_ceil(64).max(1);
+        let energy_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("openems energy layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let energy_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("openems energy pipeline layout"),
+                bind_group_layouts: &[Some(&energy_layout)],
+                immediate_size: 0,
+            });
+        let energy_pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("openems energy sum"),
+            layout: Some(&energy_pipeline_layout),
+            module: &shader,
+            entry_point: Some("energy_sum"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let energy_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("openems energy dims"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let energy_parts = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("openems energy parts"),
+            size: (energy_groups as u64) * 2 * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let energy_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("openems energy readback"),
+            size: (energy_groups as u64) * 2 * 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let energy_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("openems energy bind group"),
+            layout: &energy_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: volt_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: curr_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: energy_parts.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: energy_uniform.as_entire_binding(),
+                },
+            ],
+        });
         Some(Self {
             device,
             queue,
@@ -1779,6 +2149,19 @@ impl GpuFields {
             staging_pair,
             source: None,
             upml: None,
+            pml_engine: None,
+            ec_vv: vv_buf,
+            ec_vi: vi_buf,
+            ec_ii: ii_buf,
+            ec_iv: iv_buf,
+            dims_uniform: uniform_buf,
+            energy_pipe,
+            energy_bind,
+            energy_uniform,
+            energy_parts,
+            energy_staging,
+            energy_groups,
+            probes: None,
             mur: None,
             lumped: None,
             sheet: None,
@@ -2126,6 +2509,12 @@ impl GpuFields {
             post_curr,
             bind,
             groups: (total as u32).div_ceil(64).max(1),
+            vvfn: vvfn_buf,
+            volt_flux: volt_flux_buf,
+            iifn: iifn_buf,
+            curr_flux: curr_flux_buf,
+            table: table_buf,
+            dims: uniform,
         });
         true
     }
@@ -2133,6 +2522,347 @@ impl GpuFields {
     /// Whether device-side UPML kernels are active.
     pub fn has_upml(&self) -> bool {
         self.upml.is_some()
+    }
+
+    /// Build the fused PML E/H kernels.
+    ///
+    /// The post phases only read and write their own cell, so they run at the
+    /// end of the E/H thread that owns it; the pre phases stay separate
+    /// dispatches because they need a global barrier before the update.
+    pub fn setup_pml_engine(&mut self) -> bool {
+        let Some(upml) = self.upml.as_ref() else {
+            return false;
+        };
+        let vvfn = upml.vvfn.clone();
+        let volt_flux = upml.volt_flux.clone();
+        let iifn = upml.iifn.clone();
+        let curr_flux = upml.curr_flux.clone();
+        let table = upml.table.clone();
+        let pml_dims = upml.dims.clone();
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("openems pml engine kernels"),
+            source: wgpu::ShaderSource::Wgsl(UPDATE_SHADER.into()),
+        });
+        let mut entries: Vec<wgpu::BindGroupLayoutEntry> = (0..7u32)
+            .map(|binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: if binding == 6 {
+                        wgpu::BufferBindingType::Uniform
+                    } else if binding <= 1 {
+                        wgpu::BufferBindingType::Storage {
+                            read_only: binding == 1,
+                        }
+                    } else {
+                        wgpu::BufferBindingType::Storage { read_only: true }
+                    },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .collect();
+        for binding in 12..15u32 {
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage {
+                        read_only: binding != 13,
+                    },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            });
+        }
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 15,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        });
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("openems pml engine layout"),
+                entries: &entries,
+            });
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("openems pml engine pipeline layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipe = |entry: &str| {
+            self.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(&pipeline_layout),
+                    module: &shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        };
+        let pipe_e = pipe("update_e_pml");
+        let pipe_h = pipe("update_h_pml");
+        let (bind_e, bind_h) = {
+            let make_bind = |field: &wgpu::Buffer,
+                             peer: &wgpu::Buffer,
+                             coeff: &wgpu::Buffer,
+                             flux: &wgpu::Buffer| {
+                self.device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("openems pml engine bind group"),
+                        layout: &layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: field.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: peer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: self.ec_vv.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: self.ec_vi.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: self.ec_ii.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: self.ec_iv.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: self.dims_uniform.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 12,
+                                resource: coeff.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 13,
+                                resource: flux.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 14,
+                                resource: table.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 15,
+                                resource: pml_dims.as_entire_binding(),
+                            },
+                        ],
+                    })
+            };
+            (
+                make_bind(&self.volt, &self.curr, &vvfn, &volt_flux),
+                make_bind(&self.curr, &self.volt, &iifn, &curr_flux),
+            )
+        };
+        self.pml_engine = Some(PmlEngine {
+            pipe_e,
+            pipe_h,
+            bind_e,
+            bind_h,
+        });
+        true
+    }
+
+    /// Whether the fused PML E/H kernels are active.
+    pub fn has_pml_engine(&self) -> bool {
+        self.pml_engine.is_some()
+    }
+
+    /// Build the device-side probe gather from the host probe plan.
+    pub fn setup_probes(&mut self, points: &[crate::processing::GpuProbePoint]) -> bool {
+        if points.is_empty() {
+            return false;
+        }
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("openems probe kernels"),
+            source: wgpu::ShaderSource::Wgsl(UPDATE_SHADER.into()),
+        });
+        let entries = (0..7u32)
+            .map(|binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: if binding == 6 {
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: wgpu::BufferSize::new(16),
+                    }
+                } else {
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage {
+                            read_only: binding != 5,
+                        },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    }
+                },
+                count: None,
+            })
+            .collect::<Vec<_>>();
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("openems probe layout"),
+                entries: &entries,
+            });
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("openems probe pipeline layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipe = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("openems probe gather"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("probe_gather"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let alignment = self
+            .device
+            .limits()
+            .min_uniform_buffer_offset_alignment
+            .max(16);
+        let slot_size = 16u32.div_ceil(alignment) * alignment;
+        let count = points.len() as u32;
+        let plane = self.dims[0] * self.dims[1] * self.dims[2];
+        let i_stride = self.dims[1] * self.dims[2];
+        let j_stride = self.dims[2];
+        let mut indices = Vec::with_capacity(points.len());
+        let mut intervals = Vec::with_capacity(points.len());
+        let mut buffers = Vec::with_capacity(points.len());
+        for point in points {
+            indices.push(
+                (point.component * plane
+                    + point.index[0] * i_stride
+                    + point.index[1] * j_stride
+                    + point.index[2]) as u32,
+            );
+            intervals.push(point.interval);
+            buffers.push(point.buffer as u32);
+        }
+        let index_buf = {
+            use wgpu::util::DeviceExt;
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("openems probe index"),
+                    contents: &u32_bytes(&indices),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let interval_buf = {
+            use wgpu::util::DeviceExt;
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("openems probe interval"),
+                    contents: &u32_bytes(&intervals),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let buffer_buf = {
+            use wgpu::util::DeviceExt;
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("openems probe buffer"),
+                    contents: &u32_bytes(&buffers),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let params = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("openems probe params"),
+            size: (SOURCE_BATCH * slot_size) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let values = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("openems probe values"),
+            size: (count as u64) * (SOURCE_BATCH as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("openems probe readback"),
+            size: (count as u64) * (SOURCE_BATCH as u64) * 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("openems probe bind group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.volt.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.curr.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry { binding: 2, resource: index_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: buffer_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: interval_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: values.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &params,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(16),
+                    }),
+                },
+            ],
+        });
+        self.probes = Some(ProbeBinds {
+            pipe,
+            bind,
+            params,
+            values,
+            staging,
+            count,
+            slot_size,
+            scratch: std::cell::RefCell::new(Vec::new()),
+        });
+        true
+    }
+
+    /// Whether device-side probe gathering is active.
+    pub fn has_probes(&self) -> bool {
+        self.probes.is_some()
+    }
+
+    /// Download the per-step probe matrix for `steps` steps.
+    pub fn download_probe_values(&self, steps: u32) -> Option<Vec<f32>> {
+        let probes = self.probes.as_ref()?;
+        let mut values = vec![0.0f32; probes.count as usize * steps as usize];
+        readback_into(
+            &self.device,
+            &self.queue,
+            &probes.values,
+            &probes.staging,
+            &mut values,
+        )?;
+        Some(values)
     }
 
     /// Build the device-side Mur kernels from the host faces.
@@ -3362,6 +4092,7 @@ impl GpuFields {
                     tfsf.write_params(&self.queue, side, start_ts + done, chunk);
                 }
             }
+            self.write_probe_params(start_ts + done, chunk);
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("openems engine batch"),
             });
@@ -3384,10 +4115,16 @@ impl GpuFields {
                 if let Some(upml) = self.upml.as_ref() {
                     passes += upml.record(&mut encoder, 0);
                 }
-                record_dispatch(&mut encoder, &self.pipe_e, &self.bind_e, volt_cells);
+                if let Some(pml) = self.pml_engine.as_ref() {
+                    record_dispatch(&mut encoder, &pml.pipe_e, &pml.bind_e, volt_cells);
+                } else {
+                    record_dispatch(&mut encoder, &self.pipe_e, &self.bind_e, volt_cells);
+                }
                 passes += 1;
-                if let Some(upml) = self.upml.as_ref() {
-                    passes += upml.record(&mut encoder, 1);
+                if self.pml_engine.is_none() {
+                    if let Some(upml) = self.upml.as_ref() {
+                        passes += upml.record(&mut encoder, 1);
+                    }
                 }
                 if let Some(debye) = self.debye.as_ref() {
                     passes += debye.record(&mut encoder, 1);
@@ -3424,10 +4161,16 @@ impl GpuFields {
                 if let Some(lorentz) = self.lorentz.as_ref() {
                     passes += lorentz.record(&mut encoder, 1);
                 }
-                record_dispatch(&mut encoder, &self.pipe_h, &self.bind_h, curr_cells);
+                if let Some(pml) = self.pml_engine.as_ref() {
+                    record_dispatch(&mut encoder, &pml.pipe_h, &pml.bind_h, volt_cells);
+                } else {
+                    record_dispatch(&mut encoder, &self.pipe_h, &self.bind_h, curr_cells);
+                }
                 passes += 1;
-                if let Some(upml) = self.upml.as_ref() {
-                    passes += upml.record(&mut encoder, 3);
+                if self.pml_engine.is_none() {
+                    if let Some(upml) = self.upml.as_ref() {
+                        passes += upml.record(&mut encoder, 3);
+                    }
                 }
                 if let Some(tfsf) = self.tfsf.as_ref() {
                     for side in &tfsf.curr {
@@ -3440,11 +4183,44 @@ impl GpuFields {
                 if let Some(source) = self.source.as_ref() {
                     passes += source.record(&mut encoder, source.curr.as_ref(), step);
                 }
+                passes += self.record_probe_gather(&mut encoder, step);
             }
             self.queue.submit(std::iter::once(encoder.finish()));
             done += chunk;
         }
         self.passes.set(passes as u64);
+    }
+
+    /// Write the per-step probe parameters for a batch.
+    fn write_probe_params(&self, start_ts: u32, steps: u32) {
+        let Some(probes) = self.probes.as_ref() else {
+            return;
+        };
+        let mut scratch = probes.scratch.borrow_mut();
+        scratch.clear();
+        scratch.resize(steps as usize * probes.slot_size as usize, 0);
+        for step in 0..steps {
+            let base = step as usize * probes.slot_size as usize;
+            scratch[base..base + 4].copy_from_slice(&(start_ts + step).to_le_bytes());
+            scratch[base + 4..base + 8].copy_from_slice(&step.to_le_bytes());
+            scratch[base + 8..base + 12].copy_from_slice(&probes.count.to_le_bytes());
+        }
+        self.queue.write_buffer(&probes.params, 0, &scratch);
+    }
+
+    /// Record the probe gather for one step.
+    fn record_probe_gather(&self, encoder: &mut wgpu::CommandEncoder, step: u32) -> u32 {
+        let Some(probes) = self.probes.as_ref() else {
+            return 0;
+        };
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("openems probe pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&probes.pipe);
+        pass.set_bind_group(0, &probes.bind, &[step * probes.slot_size]);
+        pass.dispatch_workgroups(probes.count.div_ceil(64).max(1), 1, 1);
+        1
     }
 
     /// Number of compute passes recorded by the last [`dispatch_steps`] call.
@@ -3460,6 +4236,68 @@ impl GpuFields {
         self.device
             .limits()
             .max_storage_buffers_per_shader_stage
+    }
+
+    /// Device-side field energy (`CalcFastEnergy`).
+    ///
+    /// One workgroup sums 64 cells into an E and an H partial; the host sums
+    /// the partials in f64 and applies the constants, so the value tracks the
+    /// CPU accumulation to ~1e-7 relative without downloading the fields.
+    pub fn compute_energy(&self, counts: [usize; 3]) -> Option<f64> {
+        let total = counts[0].saturating_sub(1)
+            * counts[1].saturating_sub(1)
+            * counts[2].saturating_sub(1);
+        if total == 0 {
+            return Some(0.0);
+        }
+        let groups = (total as u32).div_ceil(64);
+        if groups > self.energy_groups {
+            return None;
+        }
+        let mut data = Vec::with_capacity(32);
+        for value in [
+            self.dims[0] as u32,
+            self.dims[1] as u32,
+            self.dims[2] as u32,
+            0,
+            counts[0] as u32,
+            counts[1] as u32,
+            counts[2] as u32,
+            0,
+        ] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        self.queue.write_buffer(&self.energy_uniform, 0, &data);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("openems energy"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("openems energy pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.energy_pipe);
+            pass.set_bind_group(0, &self.energy_bind, &[]);
+            pass.dispatch_workgroups(groups, 1, 1);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+        let mut parts = vec![0.0f32; groups as usize * 2];
+        readback_into(
+            &self.device,
+            &self.queue,
+            &self.energy_parts,
+            &self.energy_staging,
+            &mut parts,
+        )?;
+        let mut e_energy = 0.0f64;
+        let mut h_energy = 0.0f64;
+        for pair in parts.chunks_exact(2) {
+            e_energy += pair[0] as f64;
+            h_energy += pair[1] as f64;
+        }
+        Some(crate::constants::EPS0 * e_energy + crate::constants::MU0 * h_energy)
     }
 
     fn dispatch(&self, pipeline: &wgpu::ComputePipeline, bind: &wgpu::BindGroup, groups: u32) {

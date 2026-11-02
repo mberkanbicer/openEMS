@@ -31,6 +31,10 @@ const EXACT_ENDCRIT_TIME: f64 = 60.0;
 /// `docs/migration/GPU_ANALYSIS.md`).
 #[cfg(feature = "gpu")]
 const GPU_AUTO_MIN_CELLS: usize = 50_000;
+
+/// Largest batch when device-side probe sampling is active: the probe matrix
+/// holds one slot per step.
+const GPU_PROBE_BATCH: u32 = 256;
 const WALL_CLOCK_CHECK_INTERVAL: f64 = 4.0;
 
 fn end_criteria_due(
@@ -1539,34 +1543,22 @@ impl OpenEMS {
         }
         #[cfg(feature = "gpu")]
         if self.use_gpu || self.gpu_auto {
-            if engine.is_multi_grid() {
+            // Measured crossover: below ~50k cells the per-dispatch and
+            // per-sync overhead outweighs the kernel speed-up.
+            let cells = engine.num_lines[0] * engine.num_lines[1] * engine.num_lines[2];
+            let enabled = self.use_gpu || cells >= GPU_AUTO_MIN_CELLS;
+            if !enabled {
+                println!(
+                    "[openEMS] GPU auto: {cells} cells is below the {GPU_AUTO_MIN_CELLS}-cell crossover, using the CPU engine"
+                );
+            } else if let Err(reason) = engine.enable_gpu_pair() {
                 if self.use_gpu {
-                    eprintln!(
-                        "[openEMS] Setup failed: the GPU path does not support cylindrical multi-grid"
-                    );
+                    eprintln!("[openEMS] Setup failed: GPU requested but unavailable: {reason}");
                     return false;
                 }
-                println!(
-                    "[openEMS] GPU auto: cylindrical multi-grid is CPU-only, using the CPU engine"
-                );
-            } else {
-                // Measured crossover: below ~50k cells the per-dispatch and
-                // per-sync overhead outweighs the kernel speed-up.
-                let cells = engine.num_lines[0] * engine.num_lines[1] * engine.num_lines[2];
-                let enabled = self.use_gpu || cells >= GPU_AUTO_MIN_CELLS;
-                if !enabled {
-                    println!(
-                        "[openEMS] GPU auto: {cells} cells is below the {GPU_AUTO_MIN_CELLS}-cell crossover, using the CPU engine"
-                    );
-                } else if let Err(reason) = engine.enable_gpu() {
-                    if self.use_gpu {
-                        eprintln!("[openEMS] Setup failed: GPU requested but unavailable: {reason}");
-                        return false;
-                    }
-                    println!("[openEMS] GPU auto: no usable device ({reason}), using the CPU engine");
-                } else if self.verbose_level > 0 || self.gpu_auto {
-                    println!("[openEMS] GPU update path enabled");
-                }
+                println!("[openEMS] GPU auto: no usable device ({reason}), using the CPU engine");
+            } else if self.verbose_level > 0 || self.gpu_auto {
+                println!("[openEMS] GPU update path enabled");
             }
         }
         #[cfg(not(feature = "gpu"))]
@@ -2319,6 +2311,40 @@ impl OpenEMS {
         #[cfg(not(feature = "gpu"))]
         let gpu_active = false;
 
+        // A point-probe-only model can be sampled on the device, which lets the
+        // run loop batch across the probe interval instead of downloading the
+        // field every step.
+        #[cfg(feature = "gpu")]
+        let probe_plan = if gpu_active {
+            processing
+                .as_ref()
+                .and_then(|pa| pa.gpu_probe_plan(&engine_meta))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "gpu"))]
+        let probe_plan: Option<crate::processing::GpuProbePlan> = None;
+        #[cfg(feature = "gpu")]
+        let probes_on_device = match probe_plan.as_ref() {
+            Some(plan) => {
+                let setup = self
+                    .fdtd_eng
+                    .as_mut()
+                    .map(|engine| engine.setup_gpu_probes(&plan.points))
+                    .unwrap_or(false);
+                if setup && std::env::var_os("OPENEMS_DEBUG_GPU").is_some() {
+                    eprintln!(
+                        "[openEMS] GPU probe sampling: {} points on the device",
+                        plan.points.len()
+                    );
+                }
+                setup
+            }
+            None => false,
+        };
+        #[cfg(not(feature = "gpu"))]
+        let probes_on_device = false;
+
         let mut ts = 0u32;
         let mut change: f64 = 1.0;
         let mut max_energy: f64 = 0.0;
@@ -2342,10 +2368,15 @@ impl OpenEMS {
             // excitation's max-energy sample.
             let batch = if gpu_active {
                 let mut next = u32::MAX;
-                if let Some(ref pa) = processing {
-                    if !pa.is_empty() {
-                        next = next.min(pa.steps_until_due(ts));
+                if !probes_on_device {
+                    if let Some(ref pa) = processing {
+                        if !pa.is_empty() {
+                            next = next.min(pa.steps_until_due(ts));
+                        }
                     }
+                } else {
+                    // The probe matrix holds one slot per step of the batch.
+                    next = next.min(GPU_PROBE_BATCH);
                 }
                 if nyquist > 0 {
                     let remainder = ts % nyquist;
@@ -2393,7 +2424,25 @@ impl OpenEMS {
             }
 
             // Invoke Process on all registered processings with field access.
-            if let Some(ref mut pa) = processing {
+            if probes_on_device {
+                // The device gathered the probe values into a compact matrix;
+                // only those values cross the bus.
+                #[cfg(feature = "gpu")]
+                if let (Some(ref mut pa), Some(plan)) = (processing.as_mut(), probe_plan.as_ref())
+                {
+                    if let Some(engine) = self.fdtd_eng.as_ref() {
+                        if let Some(values) = engine.download_gpu_probe_values(batch) {
+                            pa.process_probe_samples(
+                                ts_before + 1,
+                                batch,
+                                &values,
+                                &plan.layout,
+                                &engine_meta,
+                            );
+                        }
+                    }
+                }
+            } else if let Some(ref mut pa) = processing {
                 if !pa.is_empty() && pa.is_due(ts) {
                     // The GPU keeps the fields on the device; refresh the host
                     // arrays only when a probe or dump reads them.
@@ -2428,12 +2477,8 @@ impl OpenEMS {
                         &mut last_checkpoint,
                     );
                     if seed || due {
-                        #[cfg(feature = "gpu")]
-                        if gpu_active {
-                            if let Some(engine) = self.fdtd_eng.as_mut() {
-                                engine.sync_fields();
-                            }
-                        }
+                        // The energy reduction runs on the device, so the
+                        // host arrays stay stale and no download is needed.
                         let energy = self.fdtd_eng.as_ref().unwrap().fast_energy();
                         if energy > max_energy {
                             max_energy = energy;

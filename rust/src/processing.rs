@@ -408,6 +408,24 @@ pub fn mesh_type_code(mesh_type: MeshType) -> i32 {
 /// Base trait for processing objects that sample the running simulation.
 /// Mirrors the C++ `Processing` abstract class.
 ///
+/// A point sample the device can gather without downloading the field.
+#[derive(Clone, Copy, Debug)]
+pub struct GpuProbePoint {
+    /// 0 = voltage (E), 1 = current (H).
+    pub buffer: usize,
+    pub component: usize,
+    pub index: [usize; 3],
+    pub interval: u32,
+}
+
+/// Device sampling plan: the flattened points plus the slice each processing
+/// owns (`layout[processing] = (offset, count)`).
+#[derive(Clone, Debug, Default)]
+pub struct GpuProbePlan {
+    pub points: Vec<GpuProbePoint>,
+    pub layout: Vec<(usize, usize)>,
+}
+
 /// Processing objects are invoked by [`ProcessingArray`] during the FDTD
 /// time-stepping loop. They can sample fields at specific timesteps,
 /// accumulate frequency-domain data, and write output files.
@@ -462,6 +480,14 @@ pub trait Processing {
     fn process_fields(&mut self, num_ts: u32, _interface: &EngineInterface<'_>) -> i32 {
         self.process(num_ts)
     }
+    /// Device-side sampling: the points this processing reads, when the GPU
+    /// can gather them without downloading the whole field.
+    fn gpu_probe_points(&self, _meta: &EngineMeta) -> Option<Vec<GpuProbePoint>> {
+        None
+    }
+    /// Append one device-sampled batch (same accumulation as
+    /// [`Processing::process_fields`]).
+    fn push_gpu_samples(&mut self, _num_ts: u32, _values: &[f32], _meta: &EngineMeta) {}
     /// Process data after simulation has finished.
     fn post_process(&mut self) {}
     /// Enable or disable processing.
@@ -585,6 +611,56 @@ impl ProcessingArray {
             let interval = proc.get_process_interval();
             interval == 0 || num_ts.is_multiple_of(interval)
         })
+    }
+
+    /// Device-side sampling plan, when every registered processing can be
+    /// gathered from the device.
+    ///
+    /// `None` means at least one processing needs the host field arrays, so
+    /// the caller keeps the normal per-step download.
+    pub fn gpu_probe_plan(&self, meta: &EngineMeta) -> Option<GpuProbePlan> {
+        if self.processings.is_empty() {
+            return None;
+        }
+        let mut plan = GpuProbePlan::default();
+        for processing in &self.processings {
+            let points = processing.gpu_probe_points(meta)?;
+            plan.layout.push((plan.points.len(), points.len()));
+            plan.points.extend(points);
+        }
+        Some(plan)
+    }
+
+    /// Replay a batch of device-sampled values into the processings.
+    ///
+    /// `values[step * total_points + point]` is the value sampled after
+    /// timestep `start_ts + step`; a processing whose interval does not divide
+    /// that step is skipped, matching `Processing::process_fields`.
+    pub fn process_probe_samples(
+        &mut self,
+        start_ts: u32,
+        steps: u32,
+        values: &[f32],
+        layout: &[(usize, usize)],
+        meta: &EngineMeta,
+    ) {
+        let total: usize = layout.iter().map(|(_, count)| count).sum();
+        if total == 0 || values.len() < total * steps as usize {
+            return;
+        }
+        for step in 0..steps as usize {
+            let ts = start_ts + step as u32;
+            for (processing, &(offset, count)) in
+                self.processings.iter_mut().zip(layout.iter())
+            {
+                let interval = processing.get_process_interval();
+                if interval == 0 || !ts.is_multiple_of(interval) {
+                    continue;
+                }
+                let start = step * total + offset;
+                processing.push_gpu_samples(ts, &values[start..start + count], meta);
+            }
+        }
     }
 
     /// Whether any processing is registered.
@@ -736,6 +812,20 @@ impl FieldProbe {
         }
     }
 
+    /// Append one sample and its frequency-domain contribution.
+    ///
+    /// Shared by the host path (`process_fields`) and the device path
+    /// (`push_gpu_sample`), so both produce identical time series.
+    pub fn push_sample(&mut self, num_ts: u32, sample: f32, dt: f64) {
+        self.samples.push(sample);
+        let time = num_ts as f64 * dt;
+        for (frequency, accumulator) in self.frequencies.iter().zip(self.dft.iter_mut()) {
+            let argument = -2.0 * std::f64::consts::PI * frequency * time;
+            accumulator.re += sample as f64 * argument.cos();
+            accumulator.im += sample as f64 * argument.sin();
+        }
+    }
+
     pub fn samples(&self) -> &[f32] {
         &self.samples
     }
@@ -884,16 +974,29 @@ impl Processing for FieldProbe {
                 let sample = *interface
                     .volt
                     .get(self.component, index[0], index[1], index[2]);
-                self.samples.push(sample);
-                let time = num_ts as f64 * interface.meta.dt;
-                for (frequency, accumulator) in self.frequencies.iter().zip(self.dft.iter_mut()) {
-                    let argument = -2.0 * std::f64::consts::PI * frequency * time;
-                    accumulator.re += sample as f64 * argument.cos();
-                    accumulator.im += sample as f64 * argument.sin();
-                }
+                self.push_sample(num_ts, sample, interface.meta.dt);
             }
         }
         self.get_next_interval(num_ts)
+    }
+
+    fn gpu_probe_points(&self, meta: &EngineMeta) -> Option<Vec<GpuProbePoint>> {
+        if !self.enabled || self.process_interval == 0 || !self.process_steps.is_empty() {
+            return None;
+        }
+        let index = meta.index_from_coordinates(self.position)?;
+        Some(vec![GpuProbePoint {
+            buffer: 0,
+            component: self.component,
+            index,
+            interval: self.process_interval,
+        }])
+    }
+
+    fn push_gpu_samples(&mut self, num_ts: u32, values: &[f32], meta: &EngineMeta) {
+        if let Some(value) = values.first() {
+            self.push_sample(num_ts, *value, meta.dt);
+        }
     }
 
     fn post_process(&mut self) {

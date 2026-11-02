@@ -1344,4 +1344,71 @@ mod tests {
         assert_eq!(multi.inner().expect("inner").num_ts, 5);
         assert!(multi.inner().expect("inner").volt_ptr.get(0, 1, 1, 1).is_finite());
     }
+
+    /// The GPU multi-grid path must match the CPU path exactly: the interface
+    /// tables stay on the host, so the engine uploads before and downloads
+    /// after each half step.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_multi_grid_matches_the_cpu_multi_grid() {
+        let rho: Vec<f64> = (0..10).map(|v| (v as f64 + 1.0) * 0.1).collect();
+        let alpha: Vec<f64> = (0..9)
+            .map(|v| v as f64 * std::f64::consts::TAU / 8.0)
+            .collect();
+        let z: Vec<f64> = (0..10).map(|v| v as f64 * 0.1).collect();
+        let xml = mesh_xml(&rho, &alpha, &z);
+        let plan = CylinderMultiGridPlan::new(&[0.55]).expect("plan");
+        let build = || {
+            let pair = MultiGridOperatorPair::from_xml(&xml, &plan).expect("pair");
+            let mut multi = MultiGridEngine::from_pair(pair, 1).expect("engine");
+            {
+                let base = multi.base_mut();
+                seed_tem(
+                    &mut base.volt_ptr,
+                    &mut base.curr_ptr,
+                    base.op.as_ref(),
+                    base.num_lines,
+                );
+            }
+            {
+                let inner = multi.inner_mut().expect("inner");
+                seed_tem(
+                    &mut inner.volt_ptr,
+                    &mut inner.curr_ptr,
+                    inner.op.as_ref(),
+                    inner.num_lines,
+                );
+            }
+            multi
+        };
+
+        let mut cpu = build();
+        let mut gpu = build();
+        if let Err(reason) = gpu.engine.enable_gpu_pair() {
+            eprintln!("skipping the GPU multi-grid test: {reason}");
+            return;
+        }
+        cpu.iterate_ts(5);
+        gpu.iterate_ts(5);
+
+        let [nx, ny, nz] = cpu.base().num_lines;
+        let mut max_diff: f32 = 0.0;
+        let mut max_ref: f32 = 0.0;
+        for n in 0..3 {
+            for i in 0..nx {
+                for j in 0..ny {
+                    for k in 0..nz {
+                        let a = *cpu.base().volt_ptr.get(n, i, j, k);
+                        let b = *gpu.base().volt_ptr.get(n, i, j, k);
+                        max_diff = max_diff.max((a - b).abs());
+                        max_ref = max_ref.max(a.abs());
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "GPU multi-grid: {nx}x{ny}x{nz}, 5 steps, max diff {max_diff:.2e} (ref {max_ref:.2e})"
+        );
+        assert!(max_diff < 1.0e-5, "CPU/GPU multi-grid diff {max_diff}");
+    }
 }

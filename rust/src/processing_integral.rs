@@ -31,6 +31,12 @@ pub trait IntegralCalculator: Send {
 
     /// Compute the current value of every integral.
     fn calc(&mut self, num_ts: u32, interface: &EngineInterface<'_>) -> Vec<f64>;
+
+    /// Device sampling: `(index, field type)` when the integral is a single
+    /// point sample of the E or H field (0 = voltage, 1 = current).
+    fn gpu_field_probe(&self, _meta: &EngineMeta) -> Option<([usize; 3], usize)> {
+        None
+    }
 }
 
 /// Time- and frequency-domain integral probe.
@@ -235,6 +241,41 @@ impl ProcessIntegral {
         }
     }
 
+    /// Append the current `results` to the time-domain stream and the running
+    /// DFT. Shared by the host path and the device-sampled path.
+    fn record_sample(&mut self, num_ts: u32, dt: f64) {
+        let time = (num_ts as f64 + if self.dual_time { 0.5 } else { 0.0 }) * dt;
+        if self.process_interval > 0 && num_ts.is_multiple_of(self.process_interval) {
+            self.append_td_row(time);
+        }
+        if !self.fd_samples.is_empty() {
+            if self.fd_interval == 0 {
+                self.update_fd_interval(dt);
+            }
+            if num_ts.is_multiple_of(self.fd_interval.max(1)) {
+                if self.fd_results.is_empty() {
+                    self.fd_results = vec![
+                        vec![ComplexPoint::default(); self.fd_samples.len()];
+                        self.results.len()
+                    ];
+                }
+                let scale = 2.0 * dt * self.fd_interval.max(1) as f64;
+                for (row, value) in self.results.iter().enumerate() {
+                    if let Some(accumulators) = self.fd_results.get_mut(row) {
+                        for (frequency, accumulator) in
+                            self.fd_samples.iter().zip(accumulators.iter_mut())
+                        {
+                            let argument = -2.0 * std::f64::consts::PI * frequency * time;
+                            accumulator.re += value * self.weight * scale * argument.cos();
+                            accumulator.im += value * self.weight * scale * argument.sin();
+                        }
+                    }
+                }
+                self.sample_count += 1;
+            }
+        }
+    }
+
     fn append_td_row(&mut self, time: f64) {
         use std::io::Write;
 
@@ -389,40 +430,52 @@ impl Processing for ProcessIntegral {
             self.write_header();
         }
         self.results = self.calculator.calc(num_ts, interface);
-
-        let time = (num_ts as f64 + if self.dual_time { 0.5 } else { 0.0 }) * interface.meta.dt;
-        if self.process_interval > 0 && num_ts.is_multiple_of(self.process_interval) {
-            self.append_td_row(time);
-        }
-
-        if !self.fd_samples.is_empty() {
-            if self.fd_interval == 0 {
-                self.update_fd_interval(interface.meta.dt);
-            }
-            if num_ts.is_multiple_of(self.fd_interval.max(1)) {
-                if self.fd_results.is_empty() {
-                    self.fd_results = vec![
-                        vec![ComplexPoint::default(); self.fd_samples.len()];
-                        self.results.len()
-                    ];
-                }
-                let scale = 2.0 * interface.meta.dt * self.fd_interval.max(1) as f64;
-                for (row, value) in self.results.iter().enumerate() {
-                    if let Some(accumulators) = self.fd_results.get_mut(row) {
-                        for (frequency, accumulator) in
-                            self.fd_samples.iter().zip(accumulators.iter_mut())
-                        {
-                            let argument = -2.0 * std::f64::consts::PI * frequency * time;
-                            accumulator.re += value * self.weight * scale * argument.cos();
-                            accumulator.im += value * self.weight * scale * argument.sin();
-                        }
-                    }
-                }
-                self.sample_count += 1;
-            }
-        }
-
+        self.record_sample(num_ts, interface.meta.dt);
         self.get_next_interval(num_ts)
+    }
+
+    fn gpu_probe_points(
+        &self,
+        meta: &EngineMeta,
+    ) -> Option<Vec<crate::processing::GpuProbePoint>> {
+        if !self.enabled || self.process_interval == 0 {
+            return None;
+        }
+        let (index, field_type) = self.calculator.gpu_field_probe(meta)?;
+        Some(
+            (0..3)
+                .map(|component| crate::processing::GpuProbePoint {
+                    buffer: field_type,
+                    component,
+                    index,
+                    interval: self.process_interval,
+                })
+                .collect(),
+        )
+    }
+
+    fn push_gpu_samples(&mut self, num_ts: u32, values: &[f32], meta: &EngineMeta) {
+        if values.len() < 3 {
+            return;
+        }
+        let Some((index, field_type)) = self.calculator.gpu_field_probe(meta) else {
+            return;
+        };
+        self.results = (0..3)
+            .map(|component| {
+                let length = if field_type == 0 {
+                    meta.edge_length(component, index)
+                } else {
+                    meta.dual_edge_length(component, index)
+                };
+                if length > 0.0 {
+                    values[component] as f64 / length
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        self.record_sample(num_ts, meta.dt);
     }
 
     fn get_next_interval(&self, num_ts: u32) -> i32 {
@@ -958,6 +1011,13 @@ impl FieldProbeIntegral {
 impl IntegralCalculator for FieldProbeIntegral {
     fn number_of_integrals(&self) -> usize {
         3
+    }
+
+    fn gpu_field_probe(&self, meta: &EngineMeta) -> Option<([usize; 3], usize)> {
+        let index = self
+            .snapped
+            .unwrap_or_else(|| meta.snap_to_mesh(self.position, self.field_type == 1, false));
+        Some((index, self.field_type))
     }
 
     fn integral_name(&self, row: usize) -> String {
