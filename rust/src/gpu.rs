@@ -304,6 +304,59 @@ fn mur_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
     mur_volt[mur_pos_index(ip, ipp, false, mur_dims.axes.y)] = mur_hist_p[t];
     mur_volt[mur_pos_index(ip, ipp, false, mur_dims.axes.z)] = mur_hist_pp[t];
 }
+
+// Device-side lumped RLC: the two host phases (pre voltage rotation and the
+// apply2 series update) over independent edges. Coefficients are packed as
+// [vvd, vv2, vj1, vj2, ib0, b1, b2, ilv, i2v] per edge.
+
+struct LumpedDims {
+    count: vec4<u32>,
+};
+
+@group(0) @binding(0) var<storage, read_write> lump_volt: array<f32>;
+@group(0) @binding(1) var<storage, read> lump_index: array<u32>;
+@group(0) @binding(2) var<storage, read> lump_coeff: array<f32>;
+@group(0) @binding(3) var<storage, read_write> lump_hist: array<f32>;
+@group(0) @binding(4) var<storage, read_write> lump_jn: array<f32>;
+@group(0) @binding(5) var<storage, read_write> lump_il: array<f32>;
+@group(0) @binding(6) var<uniform> lump_dims: LumpedDims;
+
+@compute @workgroup_size(64)
+fn lumped_pre(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    if (t >= lump_dims.count.x) { return; }
+    let b = t * 3u;
+    let h2 = lump_hist[b + 2u];
+    lump_hist[b + 2u] = lump_hist[b + 1u];
+    lump_hist[b + 1u] = lump_hist[b];
+    lump_hist[b] = h2;
+    let c = t * 9u;
+    lump_il[t] = lump_il[t] + lump_coeff[c + 8u] * lump_coeff[c + 7u] * lump_hist[b + 1u];
+}
+
+@compute @workgroup_size(64)
+fn lumped_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    if (t >= lump_dims.count.x) { return; }
+    let b = t * 3u;
+    let j2 = lump_jn[b + 2u];
+    lump_jn[b + 2u] = lump_jn[b + 1u];
+    lump_jn[b + 1u] = lump_jn[b];
+    lump_jn[b] = j2;
+    let c = t * 9u;
+    let index = lump_index[t];
+    let raw = lump_volt[index];
+    lump_hist[b] = raw;
+    let updated = lump_coeff[c] * (raw - lump_il[t]
+        + lump_coeff[c + 1u] * lump_hist[b + 2u]
+        + lump_coeff[c + 2u] * lump_jn[b + 1u]
+        + lump_coeff[c + 3u] * lump_jn[b + 2u]);
+    lump_hist[b] = updated;
+    lump_jn[b] = lump_coeff[c + 4u] * (lump_hist[b] - lump_hist[b + 2u])
+        - (lump_coeff[c + 5u] * lump_coeff[c + 4u]) * lump_jn[b + 1u]
+        - (lump_coeff[c + 6u] * lump_coeff[c + 4u]) * lump_jn[b + 2u];
+    lump_volt[index] = lump_hist[b];
+}
 "#;
 
 fn f32_bytes(values: &[FDTD_FLOAT]) -> Vec<u8> {
@@ -926,6 +979,27 @@ impl MurBinds {
     }
 }
 
+/// Device-side lumped RLC kernels.
+struct LumpedBinds {
+    pre: wgpu::ComputePipeline,
+    apply: wgpu::ComputePipeline,
+    bind: wgpu::BindGroup,
+    count: u32,
+    groups: u32,
+}
+
+impl LumpedBinds {
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, pre: bool) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("openems lumped pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(if pre { &self.pre } else { &self.apply });
+        pass.set_bind_group(0, &self.bind, &[]);
+        pass.dispatch_workgroups(self.groups, 1, 1);
+    }
+}
+
 /// Persistent GPU field/coefficient buffers for `Engine`.
 ///
 /// The engine uploads once, dispatches the E and H kernels per step, and
@@ -952,6 +1026,8 @@ pub struct GpuFields {
     upml: Option<UpmlBinds>,
     /// Device-side Mur ABC kernels, when the model has Mur faces.
     mur: Option<MurBinds>,
+    /// Device-side lumped RLC kernels, when the model has lumped elements.
+    lumped: Option<LumpedBinds>,
     /// Reused little-endian upload scratch, so a host-phase upload does not
     /// allocate a new byte vector per field.
     upload_scratch: std::cell::RefCell<Vec<u8>>,
@@ -1110,6 +1186,7 @@ impl GpuFields {
             source: None,
             upml: None,
             mur: None,
+            lumped: None,
             upload_scratch: std::cell::RefCell::new(Vec::new()),
         })
     }
@@ -1588,6 +1665,163 @@ impl GpuFields {
         self.mur.is_some()
     }
 
+    /// Build the device-side lumped RLC kernels from the host edges.
+    pub fn setup_lumped(&mut self, lumped: &[&crate::extensions::EngineExtLumpedRLC]) -> bool {
+        let count: usize = lumped.iter().map(|extension| extension.num_positions).sum();
+        if count == 0 {
+            return false;
+        }
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("openems lumped kernels"),
+            source: wgpu::ShaderSource::Wgsl(UPDATE_SHADER.into()),
+        });
+        let entries = (0..7u32)
+            .map(|binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: if binding == 6 {
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    }
+                } else {
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage {
+                            read_only: binding == 1 || binding == 2,
+                        },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    }
+                },
+                count: None,
+            })
+            .collect::<Vec<_>>();
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("openems lumped layout"),
+                entries: &entries,
+            });
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("openems lumped pipeline layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = |entry: &str| {
+            self.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(&pipeline_layout),
+                    module: &shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        };
+        let pre = pipeline("lumped_pre");
+        let apply = pipeline("lumped_apply");
+        let dims = self.dims;
+        let (i_stride, j_stride, plane) = (
+            dims[1] * dims[2],
+            dims[2],
+            dims[0] * dims[1] * dims[2],
+        );
+        let mut indices = Vec::with_capacity(count * 4);
+        let mut coefficients = Vec::with_capacity(count * 9);
+        let mut hist = Vec::with_capacity(count * 3);
+        let mut jn = Vec::with_capacity(count * 3);
+        let mut il = Vec::with_capacity(count);
+        for extension in lumped {
+            for pos in 0..extension.num_positions {
+                let [i, j, k] = extension.positions[pos];
+                let coeff = &extension.coeffs[pos];
+                let index = (coeff.direction.min(2) * plane + i * i_stride + j * j_stride + k)
+                    as u32;
+                indices.push(index);
+                coefficients.extend_from_slice(&[
+                    coeff.vvd,
+                    coeff.vv2,
+                    coeff.vj1,
+                    coeff.vj2,
+                    coeff.ib0,
+                    coeff.b1,
+                    coeff.b2,
+                    coeff.ilv,
+                    coeff.i2v,
+                ]);
+                hist.extend_from_slice(&extension.v_vdn[pos]);
+                jn.extend_from_slice(&extension.v_jn[pos]);
+                il.push(extension.v_il[pos]);
+            }
+        }
+        let buffer_u32 = |label: &str, data: &[u32]| {
+            use wgpu::util::DeviceExt;
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: &u32_bytes(data),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let buffer_f32 = |label: &str, data: &[f32]| {
+            use wgpu::util::DeviceExt;
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: &f32_bytes(data),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let index_buf = buffer_u32("openems lumped index", &indices);
+        let coeff_buf = buffer_f32("openems lumped coeff", &coefficients);
+        let hist_buf = buffer_f32("openems lumped hist", &hist);
+        let jn_buf = buffer_f32("openems lumped jn", &jn);
+        let il_buf = buffer_f32("openems lumped il", &il);
+        let uniform = {
+            use wgpu::util::DeviceExt;
+            let mut data = Vec::with_capacity(16);
+            for value in [count as u32, 0, 0, 0] {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("openems lumped dims"),
+                    contents: &data,
+                    usage: wgpu::BufferUsages::UNIFORM,
+                })
+        };
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("openems lumped bind group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.volt.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry { binding: 1, resource: index_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: coeff_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: hist_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: jn_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: il_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: uniform.as_entire_binding() },
+            ],
+        });
+        self.lumped = Some(LumpedBinds {
+            pre,
+            apply,
+            bind,
+            count: count as u32,
+            groups: (count as u32).div_ceil(64).max(1),
+        });
+        true
+    }
+
+    /// Whether device-side lumped RLC kernels are active.
+    pub fn has_lumped(&self) -> bool {
+        self.lumped.is_some()
+    }
+
     /// Apply the device-side voltage source for one step (host path).
     pub fn dispatch_source_volt(&self, ts: u32) {
         self.dispatch_source(true, ts);
@@ -1681,6 +1915,9 @@ impl GpuFields {
                 if let Some(mur) = self.mur.as_ref() {
                     mur.record(&mut encoder, 0);
                 }
+                if let Some(lumped) = self.lumped.as_ref() {
+                    lumped.record(&mut encoder, true);
+                }
                 if let Some(upml) = self.upml.as_ref() {
                     upml.record(&mut encoder, 0);
                 }
@@ -1690,6 +1927,11 @@ impl GpuFields {
                 }
                 if let Some(mur) = self.mur.as_ref() {
                     mur.record(&mut encoder, 1);
+                }
+                if let Some(lumped) = self.lumped.as_ref() {
+                    lumped.record(&mut encoder, false);
+                }
+                if let Some(mur) = self.mur.as_ref() {
                     mur.record(&mut encoder, 2);
                 }
                 if let Some(source) = self.source.as_ref() {

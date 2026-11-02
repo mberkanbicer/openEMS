@@ -213,6 +213,7 @@ impl Engine {
             extension.excitation_terms().is_some()
                 || extension.upml_terms().is_some()
                 || extension.mur_terms().is_some()
+                || extension.lumped_terms().is_some()
         });
         if !all_native {
             if std::env::var_os("OPENEMS_DEBUG_GPU").is_some() {
@@ -275,6 +276,11 @@ impl Engine {
             .iter()
             .filter_map(|extension| extension.mur_terms())
             .collect();
+        let lumped: Vec<&crate::extensions::EngineExtLumpedRLC> = self
+            .extensions
+            .iter()
+            .filter_map(|extension| extension.lumped_terms())
+            .collect();
         let Some(gpu) = self.gpu_fields.as_mut() else {
             return;
         };
@@ -288,15 +294,19 @@ impl Engine {
         if !murs.is_empty() {
             prepared |= gpu.setup_mur(&murs);
         }
+        if !lumped.is_empty() {
+            prepared |= gpu.setup_lumped(&lumped);
+        }
         if !prepared {
             return;
         }
         if std::env::var_os("OPENEMS_DEBUG_GPU").is_some() {
             eprintln!(
-                "[openEMS] GPU batched path: source {}, UPML slabs {}, Mur faces {}",
+                "[openEMS] GPU batched path: source {}, UPML slabs {}, Mur faces {}, lumped edges {}",
                 if gpu.has_source() { "on device" } else { "none" },
                 upmls.len(),
-                murs.iter().map(|mur| mur.faces.len()).sum::<usize>()
+                murs.iter().map(|mur| mur.faces.len()).sum::<usize>(),
+                lumped.iter().map(|extension| extension.num_positions).sum::<usize>()
             );
         }
         for extension in self.extensions.iter_mut() {
@@ -1358,6 +1368,82 @@ mod tests {
         );
         eprintln!(
             "GPU device Mur: {n}^3, {steps} steps, CPU diff {diff:.2e}, batch/step diff {batch_diff:.2e}, GPU {gpu_time:.2?}"
+        );
+    }
+
+    #[cfg(feature = "gpu")]
+    fn lumped_extension(n: usize) -> crate::extensions::EngineExtLumpedRLC {
+        let mut extension = crate::extensions::EngineExtLumpedRLC::new(3);
+        let coefficients = crate::extensions::LumpedRLCCoeffs {
+            direction: 0,
+            vvd: 0.8,
+            vv2: 0.1,
+            vj1: 0.05,
+            vj2: 0.02,
+            ib0: 0.6,
+            b1: 0.3,
+            b2: 0.1,
+            ilv: 0.4,
+            i2v: 1.2,
+        };
+        extension.set_position(0, [2, 3, 4], &coefficients);
+        extension.set_position(1, [n / 2, n / 2, n / 2], &coefficients);
+        extension.set_position(2, [n / 3, 2, n - 3], &coefficients);
+        extension
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_device_lumped_rlc_matches_the_cpu_engine() {
+        let n = 12;
+        let steps = 120;
+        let build = || {
+            let mut engine = Engine::new(Box::new(cavity_operator(n)));
+            engine.add_extension(Box::new(lumped_extension(n)));
+            seed_fields(&mut engine);
+            engine
+        };
+
+        let mut cpu = build();
+        assert!(cpu.iterate_ts(steps));
+
+        let mut gpu = build();
+        if let Err(reason) = gpu.enable_gpu() {
+            eprintln!("skipping the GPU lumped test: {reason}");
+            return;
+        }
+        assert!(
+            gpu.gpu_fields
+                .as_ref()
+                .map(|fields| fields.has_lumped())
+                .unwrap_or(false),
+            "the lumped edges must be uploaded to the device"
+        );
+        assert!(
+            !gpu.needs_host_extension(),
+            "a lumped-only model must use the batched device path"
+        );
+
+        let start = std::time::Instant::now();
+        assert!(gpu.iterate_ts(steps));
+        let gpu_time = start.elapsed();
+        let diff = field_diff(&cpu, &gpu);
+        assert!(diff < 1.0e-5, "CPU/GPU device-lumped field diff {diff}");
+
+        let mut stepped = build();
+        if stepped.enable_gpu().is_err() {
+            return;
+        }
+        for _ in 0..steps {
+            assert!(stepped.iterate_ts(1));
+        }
+        let batch_diff = field_diff(&gpu, &stepped);
+        assert!(
+            batch_diff < 1.0e-6,
+            "batch vs single-step lumped scheduling diff {batch_diff}"
+        );
+        eprintln!(
+            "GPU device lumped: {n}^3, {steps} steps, CPU diff {diff:.2e}, batch/step diff {batch_diff:.2e}, GPU {gpu_time:.2?}"
         );
     }
 

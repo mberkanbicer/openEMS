@@ -56,6 +56,11 @@ pub trait EngineExtension {
         None
     }
 
+    /// Lumped RLC edges for the device-side kernels.
+    fn lumped_terms(&self) -> Option<&crate::extensions::EngineExtLumpedRLC> {
+        None
+    }
+
     /// Mark this extension as fully executed by the device, so its host
     /// phases become no-ops.
     fn mark_gpu_handled(&mut self) {}
@@ -1943,11 +1948,14 @@ pub struct EngineExtLumpedRLC {
     /// Coefficients of every lumped edge.
     pub coeffs: Vec<LumpedRLCCoeffs>,
     /// Voltage history per edge: `[V[n], V[n-1], V[n-2]]`.
-    v_vdn: Vec<[FDTD_FLOAT; 3]>,
+    pub v_vdn: Vec<[FDTD_FLOAT; 3]>,
     /// Current history per edge: `[J[n], J[n-1], J[n-2]]`.
-    v_jn: Vec<[FDTD_FLOAT; 3]>,
+    pub v_jn: Vec<[FDTD_FLOAT; 3]>,
     /// Parallel inductor current per edge.
-    v_il: Vec<FDTD_FLOAT>,
+    pub v_il: Vec<FDTD_FLOAT>,
+    /// The GPU path applies the two lumped phases with device kernels; the
+    /// host phases then do nothing.
+    pub gpu_handled: bool,
 }
 
 impl EngineExtLumpedRLC {
@@ -1959,6 +1967,7 @@ impl EngineExtLumpedRLC {
             v_vdn: vec![[0.0; 3]; num_positions],
             v_jn: vec![[0.0; 3]; num_positions],
             v_il: vec![0.0; num_positions],
+            gpu_handled: false,
         }
     }
 
@@ -1995,8 +2004,20 @@ impl EngineExtension for EngineExtLumpedRLC {
         "lumped_rlc"
     }
 
+    fn lumped_terms(&self) -> Option<&crate::extensions::EngineExtLumpedRLC> {
+        Some(self)
+    }
+
+    fn mark_gpu_handled(&mut self) {
+        self.gpu_handled = true;
+    }
+
+    fn is_gpu_native(&self) -> bool {
+        self.gpu_handled
+    }
+
     fn do_pre_voltage_updates(&mut self, _volt: &mut FieldArray, _curr: &FieldArray) {
-        if self.num_positions == 0 {
+        if self.num_positions == 0 || self.gpu_handled {
             return;
         }
         // Native rotates the three voltage slots once, then advances the
@@ -2014,7 +2035,7 @@ impl EngineExtension for EngineExtLumpedRLC {
     }
 
     fn apply2_voltages(&mut self, volt: &mut FieldArray, _curr: &FieldArray) {
-        if self.num_positions == 0 {
+        if self.num_positions == 0 || self.gpu_handled {
             return;
         }
         for history in self.v_jn.iter_mut() {
