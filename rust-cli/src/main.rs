@@ -72,6 +72,10 @@ struct Args {
     #[arg(long = "gpu", action = ArgAction::SetTrue)]
     gpu: bool,
 
+    /// Pick the GPU only above the measured cell-count crossover (`--gpu-auto`).
+    #[arg(long = "gpu-auto", action = ArgAction::SetTrue)]
+    gpu_auto: bool,
+
     /// Only run preprocessing; do not simulate.
     #[arg(long = "no-simulation")]
     no_simulation: bool,
@@ -124,6 +128,7 @@ fn show_options() {
     println!("                                multithreaded (default: fastest)");
     println!("  --numThreads arg              Force the number of worker threads (0 = automatic)");
     println!("  --gpu                         Use the GPU update kernels (requires the 'gpu' build)");
+    println!("  --gpu-auto                    Use the GPU only above the measured cell-count crossover");
     println!("  --no-simulation               Only run preprocessing; do not simulate");
     println!("  --dump-statistics             Write 'openEMS_run_stats.txt' and 'openEMS_stats.txt'");
     println!("  --exact-endcriteria           Evaluate the end criterion on a fixed schedule");
@@ -204,6 +209,7 @@ fn main() -> ExitCode {
         threads
     });
     sim.set_gpu(args.gpu);
+    sim.set_gpu_auto(args.gpu_auto);
 
     if args.show_probe_discretization > 0 {
         if let Some(array) = sim.processing_array.as_ref() {

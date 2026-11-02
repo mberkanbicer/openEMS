@@ -89,6 +89,15 @@ pub trait EngineExtension {
     fn is_gpu_native(&self) -> bool {
         false
     }
+
+    /// Storage buffers the device implementation binds.
+    ///
+    /// The engine compares this with the adapter limit before uploading an
+    /// extension: a device with fewer buffers keeps the extension on the host
+    /// instead of failing bind-group validation.
+    fn gpu_storage_buffers(&self) -> u32 {
+        0
+    }
 }
 
 #[cfg(test)]
@@ -100,6 +109,33 @@ mod tests {
         assert_eq!(ENG_EXT_PRIO_STEADYSTATE, 2_000_000);
         assert_eq!(ENG_EXT_PRIO_UPML, 1_000_000);
         assert_eq!(ENG_EXT_PRIO_EXCITATION, -1000);
+    }
+
+    /// The device implementations bind this many storage buffers; the engine
+    /// compares the maximum with the adapter limit before uploading anything.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_gpu_storage_buffers_match_the_kernels() {
+        assert_eq!(EngineExtExcitation::new().gpu_storage_buffers(), 8);
+        assert_eq!(EngineExtMurABC::new().gpu_storage_buffers(), 6);
+        assert_eq!(
+            EngineExtUPML::new([0, 0, 0], [2, 2, 2]).gpu_storage_buffers(),
+            11
+        );
+        assert_eq!(EngineExtTFSF::new().gpu_storage_buffers(), 6);
+        assert_eq!(
+            EngineExtDebyeMaterial::new(1, 1).gpu_storage_buffers(),
+            8
+        );
+        assert_eq!(
+            EngineExtLorentzMaterial::new(1, 1).gpu_storage_buffers(),
+            14
+        );
+        assert_eq!(
+            EngineExtConductingSheet::new(1).gpu_storage_buffers(),
+            5
+        );
+        assert_eq!(EngineExtLumpedRLC::new(1).gpu_storage_buffers(), 6);
     }
 }
 
@@ -219,6 +255,10 @@ impl EngineExtension for EngineExtExcitation {
 
     fn get_extension_name(&self) -> &'static str {
         "Excitation"
+    }
+
+    fn gpu_storage_buffers(&self) -> u32 {
+        8
     }
 
     fn excitation_terms(&self) -> Option<&crate::extensions::EngineExtExcitation> {
@@ -392,6 +432,10 @@ impl EngineExtension for EngineExtMurABC {
 
     fn get_extension_name(&self) -> &'static str {
         "Mur ABC"
+    }
+
+    fn gpu_storage_buffers(&self) -> u32 {
+        6
     }
 
     fn mur_terms(&self) -> Option<&crate::extensions::EngineExtMurABC> {
@@ -612,6 +656,10 @@ impl EngineExtension for EngineExtUPML {
 
     fn get_extension_name(&self) -> &'static str {
         "UPML"
+    }
+
+    fn gpu_storage_buffers(&self) -> u32 {
+        11
     }
 
     fn upml_terms(&self) -> Option<&crate::extensions::EngineExtUPML> {
@@ -950,6 +998,10 @@ impl EngineExtension for EngineExtTFSF {
         "TFSF"
     }
 
+    fn gpu_storage_buffers(&self) -> u32 {
+        6
+    }
+
     fn tfsf_terms(&self) -> Option<&crate::extensions::EngineExtTFSF> {
         Some(self)
     }
@@ -1259,6 +1311,10 @@ impl EngineExtension for EngineExtDebyeMaterial {
         "Debye Material"
     }
 
+    fn gpu_storage_buffers(&self) -> u32 {
+        8
+    }
+
     fn debye_terms(&self) -> Option<&crate::extensions::EngineExtDebyeMaterial> {
         Some(self)
     }
@@ -1521,6 +1577,10 @@ impl EngineExtension for EngineExtLorentzMaterial {
 
     fn get_extension_name(&self) -> &'static str {
         "Lorentz Material"
+    }
+
+    fn gpu_storage_buffers(&self) -> u32 {
+        14
     }
 
     fn lorentz_terms(&self) -> Option<&crate::extensions::EngineExtLorentzMaterial> {
@@ -1866,6 +1926,10 @@ impl EngineExtension for EngineExtConductingSheet {
         "Conducting Sheet"
     }
 
+    fn gpu_storage_buffers(&self) -> u32 {
+        5
+    }
+
     fn sheet_terms(&self) -> Option<&crate::extensions::EngineExtConductingSheet> {
         Some(self)
     }
@@ -2119,6 +2183,10 @@ impl EngineExtension for EngineExtLumpedRLC {
 
     fn get_extension_name(&self) -> &'static str {
         "lumped_rlc"
+    }
+
+    fn gpu_storage_buffers(&self) -> u32 {
+        6
     }
 
     fn lumped_terms(&self) -> Option<&crate::extensions::EngineExtLumpedRLC> {

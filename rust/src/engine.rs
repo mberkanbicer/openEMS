@@ -230,6 +230,27 @@ impl Engine {
             }
             return;
         }
+        // A device with a lower storage-buffer limit would fail bind-group
+        // validation, so keep every extension on the host instead of panicking.
+        let required = self
+            .extensions
+            .iter()
+            .map(|extension| extension.gpu_storage_buffers())
+            .max()
+            .unwrap_or(0);
+        let limit = self
+            .gpu_fields
+            .as_ref()
+            .map(|fields| fields.storage_buffer_limit())
+            .unwrap_or(0);
+        if required > limit {
+            if std::env::var_os("OPENEMS_DEBUG_GPU").is_some() {
+                eprintln!(
+                    "[openEMS] GPU host path: extensions need {required} storage buffers, the adapter offers {limit}"
+                );
+            }
+            return;
+        }
         let dims = self.num_lines;
         let i_stride = dims[1] * dims[2];
         let j_stride = dims[2];
@@ -359,6 +380,15 @@ impl Engine {
         self.extensions
             .iter()
             .any(|extension| !extension.is_gpu_native())
+    }
+
+    /// Compute passes recorded by the last GPU batch (performance gate).
+    #[cfg(feature = "gpu")]
+    pub fn gpu_last_batch_passes(&self) -> u64 {
+        self.gpu_fields
+            .as_ref()
+            .map(|fields| fields.last_batch_passes())
+            .unwrap_or(0)
     }
 
     /// Copy the device `volt` result back into the CPU array.
@@ -1272,11 +1302,12 @@ mod tests {
     fn gpu_device_upml_matches_the_cpu_engine() {
         let n = 12;
         let steps = 120;
-        let slab = [4, 4, 4];
-        let start = [2, 2, 2];
+        // Two slabs with different extents, so the merged dispatch exercises
+        // the slab table and the concatenated coefficient arrays.
         let build = || {
             let mut engine = Engine::new(Box::new(cavity_operator(n)));
-            engine.add_extension(Box::new(upml_extension(start, slab)));
+            engine.add_extension(Box::new(upml_extension([2, 2, 2], [4, 4, 4])));
+            engine.add_extension(Box::new(upml_extension([6, 5, 4], [3, 4, 2])));
             seed_fields(&mut engine);
             engine
         };
@@ -1328,30 +1359,28 @@ mod tests {
     fn mur_extension(n: usize) -> crate::extensions::EngineExtMurABC {
         let mut extension = crate::extensions::EngineExtMurABC::new();
         let plane = n * n;
-        // Two faces that overlap on the x/y corner edges (x-min and y-min),
-        // which checks that the per-face pass order matches the host order.
-        extension.add_face(
-            0,
-            0,
-            false,
-            0,
-            1,
-            n,
-            n,
-            vec![0.4; plane],
-            vec![0.6; plane],
-        );
-        extension.add_face(
-            1,
-            1,
-            false,
-            0,
-            1,
-            n,
-            n,
-            vec![0.3; plane],
-            vec![0.7; plane],
-        );
+        // All six faces of the box: every pair of adjacent faces shares a
+        // corner edge, which exercises the colour ordering.
+        for dir in 0..3 {
+            for face in 0..2 {
+                let (line, shift) = if face == 0 {
+                    (0, 1)
+                } else {
+                    (n - 1, n - 2)
+                };
+                extension.add_face(
+                    dir * 2 + face,
+                    dir,
+                    face == 1,
+                    line,
+                    shift,
+                    n,
+                    n,
+                    vec![0.4 + 0.1 * dir as f32; plane],
+                    vec![0.6 - 0.1 * dir as f32; plane],
+                );
+            }
+        }
         extension
     }
 
@@ -1804,6 +1833,48 @@ mod tests {
         );
         eprintln!(
             "GPU device Lorentz: {n}^3, {steps} steps, CPU diff {diff:.2e}, batch/step diff {batch_diff:.2e}, GPU {gpu_time:.2?}"
+        );
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_dispatch_budget_is_constant_in_slab_count() {
+        let n = 16;
+        let build = |slabs: usize| {
+            let mut engine = Engine::new(Box::new(cavity_operator(n)));
+            for slab in 0..slabs {
+                engine.add_extension(Box::new(upml_extension(
+                    [1 + slab * 2, 1, 1],
+                    [2, 4, 4],
+                )));
+            }
+            seed_fields(&mut engine);
+            engine
+        };
+        for slabs in [1usize, 6] {
+            let mut engine = build(slabs);
+            if engine.enable_gpu().is_err() {
+                return;
+            }
+            assert!(engine.iterate_ts(1));
+            let passes = engine.gpu_last_batch_passes();
+            // Four UPML phases (one dispatch each, independent of the slab
+            // count) plus the E and H kernels.
+            assert_eq!(passes, 6, "{slabs} slabs must cost 6 passes, got {passes}");
+        }
+
+        // Six Mur faces colour into three passes per phase, so 9 + E + H.
+        let mut engine = Engine::new(Box::new(cavity_operator(n)));
+        engine.add_extension(Box::new(mur_extension(n)));
+        seed_fields(&mut engine);
+        if engine.enable_gpu().is_err() {
+            return;
+        }
+        assert!(engine.iterate_ts(1));
+        assert_eq!(
+            engine.gpu_last_batch_passes(),
+            11,
+            "six Mur faces must cost 11 passes"
         );
     }
 

@@ -26,6 +26,11 @@ use std::sync::Arc;
 /// the fixed Nyquist schedule (native `EXACT_ENDCRIT_TIME`).
 const EXACT_ENDCRIT_TIME: f64 = 60.0;
 
+/// Measured GPU/CPU crossover: below this many cells the CPU engine is faster
+/// because per-dispatch and per-sync overhead dominates (see
+/// `docs/migration/GPU_ANALYSIS.md`).
+#[cfg(feature = "gpu")]
+const GPU_AUTO_MIN_CELLS: usize = 50_000;
 const WALL_CLOCK_CHECK_INTERVAL: f64 = 4.0;
 
 fn end_criteria_due(
@@ -107,6 +112,8 @@ pub struct OpenEMS {
     pub no_simulation: bool,
     /// Use the GPU update kernels (`--gpu`).
     pub use_gpu: bool,
+    /// Pick the engine from the measured cell-count crossover (`--gpu-auto`).
+    pub gpu_auto: bool,
     /// Write `openEMS_stats.txt` and `openEMS_run_stats.txt`.
     pub dump_statistics: bool,
     /// Evaluate the energy end criterion on the Nyquist cadence instead of
@@ -163,6 +170,7 @@ impl OpenEMS {
             engine: "fastest".to_string(),
             no_simulation: false,
             use_gpu: false,
+            gpu_auto: false,
             dump_statistics: false,
             exact_end_criteria: false,
             debug_material_dump: false,
@@ -573,6 +581,14 @@ impl OpenEMS {
     /// request.
     pub fn set_gpu(&mut self, enabled: bool) {
         self.use_gpu = enabled;
+    }
+
+    /// Request the measured-crossover GPU selection (`--gpu-auto`).
+    ///
+    /// Unlike [`set_gpu`], this never fails a setup: it picks the CPU engine
+    /// below the crossover or when no device is available, and prints why.
+    pub fn set_gpu_auto(&mut self, enabled: bool) {
+        self.gpu_auto = enabled;
     }
 
     /// Select the engine (`fastest`, `basic`, `sse`, `sse-compressed`,
@@ -1522,19 +1538,35 @@ impl OpenEMS {
             );
         }
         #[cfg(feature = "gpu")]
-        if self.use_gpu {
+        if self.use_gpu || self.gpu_auto {
             if engine.is_multi_grid() {
-                eprintln!(
-                    "[openEMS] Setup failed: the GPU path does not support cylindrical multi-grid"
+                if self.use_gpu {
+                    eprintln!(
+                        "[openEMS] Setup failed: the GPU path does not support cylindrical multi-grid"
+                    );
+                    return false;
+                }
+                println!(
+                    "[openEMS] GPU auto: cylindrical multi-grid is CPU-only, using the CPU engine"
                 );
-                return false;
-            }
-            if let Err(reason) = engine.enable_gpu() {
-                eprintln!("[openEMS] Setup failed: GPU requested but unavailable: {reason}");
-                return false;
-            }
-            if self.verbose_level > 0 {
-                println!("[openEMS] GPU update path enabled");
+            } else {
+                // Measured crossover: below ~50k cells the per-dispatch and
+                // per-sync overhead outweighs the kernel speed-up.
+                let cells = engine.num_lines[0] * engine.num_lines[1] * engine.num_lines[2];
+                let enabled = self.use_gpu || cells >= GPU_AUTO_MIN_CELLS;
+                if !enabled {
+                    println!(
+                        "[openEMS] GPU auto: {cells} cells is below the {GPU_AUTO_MIN_CELLS}-cell crossover, using the CPU engine"
+                    );
+                } else if let Err(reason) = engine.enable_gpu() {
+                    if self.use_gpu {
+                        eprintln!("[openEMS] Setup failed: GPU requested but unavailable: {reason}");
+                        return false;
+                    }
+                    println!("[openEMS] GPU auto: no usable device ({reason}), using the CPU engine");
+                } else if self.verbose_level > 0 || self.gpu_auto {
+                    println!("[openEMS] GPU update path enabled");
+                }
             }
         }
         #[cfg(not(feature = "gpu"))]

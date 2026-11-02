@@ -160,8 +160,8 @@ fn apply_source(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 struct UpmlDims {
     global: vec4<u32>,
-    start: vec4<u32>,
-    slab: vec4<u32>,
+    /// `x` = slab count, `y` = total element count over all slabs.
+    counts: vec4<u32>,
 };
 
 @group(0) @binding(0) var<storage, read_write> up_volt: array<f32>;
@@ -174,30 +174,52 @@ struct UpmlDims {
 @group(0) @binding(7) var<storage, read> up_iifn: array<f32>;
 @group(0) @binding(8) var<storage, read_write> up_volt_flux: array<f32>;
 @group(0) @binding(9) var<storage, read_write> up_curr_flux: array<f32>;
-@group(0) @binding(10) var<uniform> up_dims: UpmlDims;
+// Slab table: even entries are `start.xyz`, odd entries are `extent.xyz`.
+@group(0) @binding(10) var<storage, read> up_slabs: array<vec4<u32>>;
+@group(0) @binding(11) var<uniform> up_dims: UpmlDims;
+
+// Locate the slab containing concatenated index `t`; returns
+// `(local index, slab index, 0, 0)`. The table is a prefix scan, which is
+// cheap because a model has at most a handful of PML slabs.
+fn upml_locate(t: u32) -> vec4<u32> {
+    var base = 0u;
+    for (var s = 0u; s < up_dims.counts.x; s = s + 1u) {
+        let ext = up_slabs[s * 2u + 1u].xyz;
+        let n = 3u * ext.x * ext.y * ext.z;
+        if (t < base + n) {
+            return vec4<u32>(t - base, s, 0u, 0u);
+        }
+        base = base + n;
+    }
+    return vec4<u32>(0u, 0u, 0u, 0u);
+}
 
 fn upml_global_index(t: u32) -> u32 {
-    let slab_n = up_dims.slab.x * up_dims.slab.y * up_dims.slab.z;
-    let comp = t / slab_n;
-    let rem = t % slab_n;
-    let nj = up_dims.slab.y;
-    let nk = up_dims.slab.z;
+    let loc = upml_locate(t);
+    let s = loc.y;
+    let local = loc.x;
+    let ext = up_slabs[s * 2u + 1u].xyz;
+    let start = up_slabs[s * 2u].xyz;
+    let slab_n = ext.x * ext.y * ext.z;
+    let comp = local / slab_n;
+    let rem = local % slab_n;
+    let nj = ext.y;
+    let nk = ext.z;
     let i = rem / (nj * nk);
     let rem2 = rem % (nj * nk);
     let j = rem2 / nk;
     let k = rem2 % nk;
     let plane = up_dims.global.x * up_dims.global.y * up_dims.global.z;
     return comp * plane
-        + (i + up_dims.start.x) * up_dims.global.y * up_dims.global.z
-        + (j + up_dims.start.y) * up_dims.global.z
-        + (k + up_dims.start.z);
+        + (i + start.x) * up_dims.global.y * up_dims.global.z
+        + (j + start.y) * up_dims.global.z
+        + (k + start.z);
 }
 
 @compute @workgroup_size(64)
 fn upml_pre_volt(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let slab_n = up_dims.slab.x * up_dims.slab.y * up_dims.slab.z;
     let t = gid.x;
-    if (t >= 3u * slab_n) { return; }
+    if (t >= up_dims.counts.y) { return; }
     let g = upml_global_index(t);
     let help = up_vv[t] * up_volt[g] - up_vvfo[t] * up_volt_flux[t];
     let flux_old = up_volt_flux[t];
@@ -207,9 +229,8 @@ fn upml_pre_volt(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn upml_post_volt(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let slab_n = up_dims.slab.x * up_dims.slab.y * up_dims.slab.z;
     let t = gid.x;
-    if (t >= 3u * slab_n) { return; }
+    if (t >= up_dims.counts.y) { return; }
     let g = upml_global_index(t);
     let help = up_volt_flux[t];
     up_volt_flux[t] = up_volt[g];
@@ -218,9 +239,8 @@ fn upml_post_volt(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn upml_pre_curr(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let slab_n = up_dims.slab.x * up_dims.slab.y * up_dims.slab.z;
     let t = gid.x;
-    if (t >= 3u * slab_n) { return; }
+    if (t >= up_dims.counts.y) { return; }
     let g = upml_global_index(t);
     let help = up_ii[t] * up_curr[g] - up_iifo[t] * up_curr_flux[t];
     let flux_old = up_curr_flux[t];
@@ -230,23 +250,28 @@ fn upml_pre_curr(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn upml_post_curr(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let slab_n = up_dims.slab.x * up_dims.slab.y * up_dims.slab.z;
     let t = gid.x;
-    if (t >= 3u * slab_n) { return; }
+    if (t >= up_dims.counts.y) { return; }
     let g = upml_global_index(t);
     let help = up_curr_flux[t];
     up_curr_flux[t] = up_curr[g];
     up_curr[g] = help + up_iifn[t] * up_curr_flux[t];
 }
 
-// Device-side Mur ABC: the three host phases (pre, post, apply2) over one
-// face. The coefficients and history arrays are face-sized, the uniform
-// carries the global dims, the face line/shift and the axis mapping.
+// Device-side Mur ABC: the three host phases (pre, post, apply2). Every face
+// of a model shares one set of concatenated coefficient/history buffers and a
+// face table; the uniform carries the element range of the current pass.
+//
+// Faces that share a corner edge must run in the host's registration order,
+// so the host colours the faces: a face's colour is one more than the highest
+// colour of an earlier face it overlaps. Faces of one colour never overlap and
+// run in a single dispatch, and a later colour always runs after an earlier
+// one, which reproduces the host order exactly.
 
 struct MurDims {
     global: vec4<u32>,
-    face: vec4<u32>,
-    axes: vec4<u32>,
+    /// `x` = first element, `y` = one past the last element, `z` = face count.
+    range: vec4<u32>,
 };
 
 @group(0) @binding(0) var<storage, read_write> mur_volt: array<f32>;
@@ -254,13 +279,43 @@ struct MurDims {
 @group(0) @binding(2) var<storage, read> mur_coeff_pp: array<f32>;
 @group(0) @binding(3) var<storage, read_write> mur_hist_p: array<f32>;
 @group(0) @binding(4) var<storage, read_write> mur_hist_pp: array<f32>;
-@group(0) @binding(5) var<uniform> mur_dims: MurDims;
+// 12 u32 per face: offset, dims_p, dims_pp, line, shift, dir, n_p, n_pp, group, pad x3
+@group(0) @binding(5) var<storage, read> mur_table: array<u32>;
+@group(0) @binding(6) var<uniform> mur_dims: MurDims;
 
-fn mur_pos_index(ip: u32, ipp: u32, shifted: bool, comp: u32) -> u32 {
+struct MurFace {
+    /// offset, dims_p, dims_pp, line
+    a: vec4<u32>,
+    /// shift, dir, n_p, n_pp
+    b: vec4<u32>,
+};
+
+fn mur_find(t: u32) -> MurFace {
+    for (var f = 0u; f < mur_dims.range.z; f = f + 1u) {
+        let base = f * 12u;
+        let off = mur_table[base];
+        let dp = mur_table[base + 1u];
+        let dpp = mur_table[base + 2u];
+        if (t >= off && t < off + dp * dpp) {
+            return MurFace(
+                vec4<u32>(off, dp, dpp, mur_table[base + 3u]),
+                vec4<u32>(
+                    mur_table[base + 4u],
+                    mur_table[base + 5u],
+                    mur_table[base + 6u],
+                    mur_table[base + 7u],
+                ),
+            );
+        }
+    }
+    return MurFace(vec4<u32>(0u), vec4<u32>(0u));
+}
+
+fn mur_pos_index(face: MurFace, ip: u32, ipp: u32, shifted: bool, comp: u32) -> u32 {
     var pos = vec3<u32>(0u, 0u, 0u);
-    pos[mur_dims.axes.x] = select(mur_dims.face.z, mur_dims.face.w, shifted);
-    pos[mur_dims.axes.y] = ip;
-    pos[mur_dims.axes.z] = ipp;
+    pos[face.b.y] = select(face.a.w, face.b.x, shifted);
+    pos[face.b.z] = ip;
+    pos[face.b.w] = ipp;
     let gy = mur_dims.global.y;
     let gz = mur_dims.global.z;
     let plane = mur_dims.global.x * gy * gz;
@@ -270,39 +325,42 @@ fn mur_pos_index(ip: u32, ipp: u32, shifted: bool, comp: u32) -> u32 {
 @compute @workgroup_size(64)
 fn mur_pre(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t = gid.x;
-    if (t >= mur_dims.face.x * mur_dims.face.y) { return; }
-    let ip = t / mur_dims.face.y;
-    let ipp = t % mur_dims.face.y;
-    let np = mur_dims.axes.y;
-    let npp = mur_dims.axes.z;
-    let p_shift = mur_volt[mur_pos_index(ip, ipp, true, np)];
-    let p_bound = mur_volt[mur_pos_index(ip, ipp, false, np)];
+    if (t < mur_dims.range.x || t >= mur_dims.range.y) { return; }
+    let face = mur_find(t);
+    let ip = (t - face.a.x) / face.a.z;
+    let ipp = (t - face.a.x) % face.a.z;
+    let np = face.b.z;
+    let npp = face.b.w;
+    let p_shift = mur_volt[mur_pos_index(face, ip, ipp, true, np)];
+    let p_bound = mur_volt[mur_pos_index(face, ip, ipp, false, np)];
     mur_hist_p[t] = p_shift - mur_coeff_p[t] * p_bound;
-    let pp_shift = mur_volt[mur_pos_index(ip, ipp, true, npp)];
-    let pp_bound = mur_volt[mur_pos_index(ip, ipp, false, npp)];
+    let pp_shift = mur_volt[mur_pos_index(face, ip, ipp, true, npp)];
+    let pp_bound = mur_volt[mur_pos_index(face, ip, ipp, false, npp)];
     mur_hist_pp[t] = pp_shift - mur_coeff_pp[t] * pp_bound;
 }
 
 @compute @workgroup_size(64)
 fn mur_post(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t = gid.x;
-    if (t >= mur_dims.face.x * mur_dims.face.y) { return; }
-    let ip = t / mur_dims.face.y;
-    let ipp = t % mur_dims.face.y;
+    if (t < mur_dims.range.x || t >= mur_dims.range.y) { return; }
+    let face = mur_find(t);
+    let ip = (t - face.a.x) / face.a.z;
+    let ipp = (t - face.a.x) % face.a.z;
     mur_hist_p[t] = mur_hist_p[t]
-        + mur_coeff_p[t] * mur_volt[mur_pos_index(ip, ipp, true, mur_dims.axes.y)];
+        + mur_coeff_p[t] * mur_volt[mur_pos_index(face, ip, ipp, true, face.b.z)];
     mur_hist_pp[t] = mur_hist_pp[t]
-        + mur_coeff_pp[t] * mur_volt[mur_pos_index(ip, ipp, true, mur_dims.axes.z)];
+        + mur_coeff_pp[t] * mur_volt[mur_pos_index(face, ip, ipp, true, face.b.w)];
 }
 
 @compute @workgroup_size(64)
 fn mur_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t = gid.x;
-    if (t >= mur_dims.face.x * mur_dims.face.y) { return; }
-    let ip = t / mur_dims.face.y;
-    let ipp = t % mur_dims.face.y;
-    mur_volt[mur_pos_index(ip, ipp, false, mur_dims.axes.y)] = mur_hist_p[t];
-    mur_volt[mur_pos_index(ip, ipp, false, mur_dims.axes.z)] = mur_hist_pp[t];
+    if (t < mur_dims.range.x || t >= mur_dims.range.y) { return; }
+    let face = mur_find(t);
+    let ip = (t - face.a.x) / face.a.z;
+    let ipp = (t - face.a.x) % face.a.z;
+    mur_volt[mur_pos_index(face, ip, ipp, false, face.b.z)] = mur_hist_p[t];
+    mur_volt[mur_pos_index(face, ip, ipp, false, face.b.w)] = mur_hist_pp[t];
 }
 
 // Device-side lumped RLC: the two host phases (pre voltage rotation and the
@@ -1278,9 +1336,14 @@ impl SourceBinds {
         queue.write_buffer(&side.params, 0, &scratch);
     }
 
-    fn record(&self, encoder: &mut wgpu::CommandEncoder, side: Option<&SourceSide>, step: u32) {
+    fn record(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        side: Option<&SourceSide>,
+        step: u32,
+    ) -> u32 {
         let Some(side) = side else {
-            return;
+            return 0;
         };
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("openems source pass"),
@@ -1289,73 +1352,79 @@ impl SourceBinds {
         pass.set_pipeline(&side.pipeline);
         pass.set_bind_group(0, &side.bind, &[step * self.slot_size]);
         pass.dispatch_workgroups(side.count.div_ceil(64).max(1), 1, 1);
+        1
     }
 }
 
-/// One device-side UPML slab: its bind group and dispatch size.
-struct UpmlInstance {
-    bind: wgpu::BindGroup,
-    groups: u32,
-}
-
 /// Device-side UPML kernels shared by every PML slab of a model.
+///
+/// All slabs share one bind group: their arrays are concatenated and a slab
+/// table tells the kernel which slab an element belongs to, so a phase costs
+/// one dispatch regardless of the slab count.
 struct UpmlBinds {
     pre_volt: wgpu::ComputePipeline,
     post_volt: wgpu::ComputePipeline,
     pre_curr: wgpu::ComputePipeline,
     post_curr: wgpu::ComputePipeline,
-    instances: Vec<UpmlInstance>,
+    bind: wgpu::BindGroup,
+    groups: u32,
 }
 
 impl UpmlBinds {
-    fn record(&self, encoder: &mut wgpu::CommandEncoder, phase: usize) {
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, phase: usize) -> u32 {
         let pipeline = match phase {
             0 => &self.pre_volt,
             1 => &self.post_volt,
             2 => &self.pre_curr,
             _ => &self.post_curr,
         };
-        for instance in &self.instances {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("openems upml pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &instance.bind, &[]);
-            pass.dispatch_workgroups(instance.groups, 1, 1);
-        }
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("openems upml pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &self.bind, &[]);
+        pass.dispatch_workgroups(self.groups, 1, 1);
+        1
     }
 }
 
 /// Device-side Mur kernels shared by every Mur face of a model.
+///
+/// Faces are coloured so that one colour never overlaps; each colour is one
+/// dispatch over its contiguous element range, and colours run in increasing
+/// order, which reproduces the host's registration order on shared edges.
 struct MurBinds {
     pre: wgpu::ComputePipeline,
     post: wgpu::ComputePipeline,
     apply: wgpu::ComputePipeline,
-    faces: Vec<MurFaceBinds>,
+    bind: wgpu::BindGroup,
+    passes: Vec<MurPass>,
 }
 
-struct MurFaceBinds {
-    bind: wgpu::BindGroup,
+struct MurPass {
+    /// Dynamic uniform offset of this colour's range.
+    offset: u32,
     groups: u32,
 }
 
 impl MurBinds {
-    fn record(&self, encoder: &mut wgpu::CommandEncoder, phase: usize) {
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, phase: usize) -> u32 {
         let pipeline = match phase {
             0 => &self.pre,
             1 => &self.post,
             _ => &self.apply,
         };
-        for face in &self.faces {
+        for pass_info in &self.passes {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("openems mur pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &face.bind, &[]);
-            pass.dispatch_workgroups(face.groups, 1, 1);
+            pass.set_bind_group(0, &self.bind, &[pass_info.offset]);
+            pass.dispatch_workgroups(pass_info.groups, 1, 1);
         }
+        self.passes.len() as u32
     }
 }
 
@@ -1369,7 +1438,7 @@ struct LumpedBinds {
 }
 
 impl LumpedBinds {
-    fn record(&self, encoder: &mut wgpu::CommandEncoder, pre: bool) {
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, pre: bool) -> u32 {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("openems lumped pass"),
             timestamp_writes: None,
@@ -1377,6 +1446,7 @@ impl LumpedBinds {
         pass.set_pipeline(if pre { &self.pre } else { &self.apply });
         pass.set_bind_group(0, &self.bind, &[]);
         pass.dispatch_workgroups(self.groups, 1, 1);
+        1
     }
 }
 
@@ -1389,7 +1459,7 @@ struct SheetBinds {
 }
 
 impl SheetBinds {
-    fn record(&self, encoder: &mut wgpu::CommandEncoder, pre: bool) {
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, pre: bool) -> u32 {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("openems sheet pass"),
             timestamp_writes: None,
@@ -1397,6 +1467,7 @@ impl SheetBinds {
         pass.set_pipeline(if pre { &self.pre } else { &self.apply });
         pass.set_bind_group(0, &self.bind, &[]);
         pass.dispatch_workgroups(self.groups, 1, 1);
+        1
     }
 }
 
@@ -1433,7 +1504,7 @@ impl TfsfBinds {
         queue.write_buffer(&side.params, 0, &scratch);
     }
 
-    fn record(&self, encoder: &mut wgpu::CommandEncoder, side: &TfsfSide, step: u32) {
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, side: &TfsfSide, step: u32) -> u32 {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("openems tfsf pass"),
             timestamp_writes: None,
@@ -1441,6 +1512,7 @@ impl TfsfBinds {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &side.bind, &[step * self.slot_size]);
         pass.dispatch_workgroups(side.groups, 1, 1);
+        1
     }
 }
 
@@ -1458,7 +1530,7 @@ struct DebyeInstance {
 }
 
 impl DebyeBinds {
-    fn record(&self, encoder: &mut wgpu::CommandEncoder, phase: usize) {
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, phase: usize) -> u32 {
         let pipeline = match phase {
             0 => &self.pre,
             1 => &self.post,
@@ -1473,6 +1545,7 @@ impl DebyeBinds {
             pass.set_bind_group(0, &instance.bind, &[]);
             pass.dispatch_workgroups(instance.groups, 1, 1);
         }
+        self.instances.len() as u32
     }
 }
 
@@ -1491,7 +1564,7 @@ struct LorentzInstance {
 }
 
 impl LorentzBinds {
-    fn record(&self, encoder: &mut wgpu::CommandEncoder, phase: usize) {
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, phase: usize) -> u32 {
         let pipeline = match phase {
             0 => &self.pre_volt,
             1 => &self.pre_curr,
@@ -1507,6 +1580,7 @@ impl LorentzBinds {
             pass.set_bind_group(0, &instance.bind, &[]);
             pass.dispatch_workgroups(instance.groups, 1, 1);
         }
+        self.instances.len() as u32
     }
 }
 
@@ -1546,6 +1620,8 @@ pub struct GpuFields {
     debye: Option<DebyeBinds>,
     /// Device-side Lorentz dispersive kernels.
     lorentz: Option<LorentzBinds>,
+    /// Compute passes recorded by the last `dispatch_steps` call.
+    passes: std::cell::Cell<u64>,
     /// Reused little-endian upload scratch, so a host-phase upload does not
     /// allocate a new byte vector per field.
     upload_scratch: std::cell::RefCell<Vec<u8>>,
@@ -1709,6 +1785,7 @@ impl GpuFields {
             tfsf: None,
             debye: None,
             lorentz: None,
+            passes: std::cell::Cell::new(0),
             upload_scratch: std::cell::RefCell::new(Vec::new()),
         })
     }
@@ -1877,11 +1954,11 @@ impl GpuFields {
             label: Some("openems upml kernels"),
             source: wgpu::ShaderSource::Wgsl(UPDATE_SHADER.into()),
         });
-        let entries = (0..11u32)
+        let entries = (0..12u32)
             .map(|binding| wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: wgpu::ShaderStages::COMPUTE,
-                ty: if binding == 10 {
+                ty: if binding == 11 {
                     wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -1890,7 +1967,7 @@ impl GpuFields {
                 } else {
                     wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage {
-                            read_only: binding >= 2 && binding <= 7,
+                            read_only: (binding >= 2 && binding <= 7) || binding == 10,
                         },
                         has_dynamic_offset: false,
                         min_binding_size: None,
@@ -1925,117 +2002,130 @@ impl GpuFields {
         let post_volt = pipeline("upml_post_volt");
         let pre_curr = pipeline("upml_pre_curr");
         let post_curr = pipeline("upml_post_curr");
-        let mut instances = Vec::with_capacity(upmls.len());
+        // Concatenate every slab's arrays in slab order, and record where each
+        // slab starts in the global field plus its own extent.
+        let mut vv = Vec::new();
+        let mut vvfo = Vec::new();
+        let mut vvfn = Vec::new();
+        let mut ii = Vec::new();
+        let mut iifo = Vec::new();
+        let mut iifn = Vec::new();
+        let mut volt_flux = Vec::new();
+        let mut curr_flux = Vec::new();
+        let mut table = Vec::with_capacity(upmls.len() * 8);
+        let mut total = 0usize;
         for upml in upmls {
             let slab = upml.num_lines;
-            let mut values = |arrays: &[crate::array_nijk::FieldArray]| -> Vec<f32> {
-                let mut out =
-                    Vec::with_capacity(3 * slab[0] * slab[1] * slab[2]);
+            let mut append = |dst: &mut Vec<f32>, arrays: &[crate::array_nijk::FieldArray]| {
                 for comp in 0..3 {
                     for i in 0..slab[0] {
                         for j in 0..slab[1] {
                             for k in 0..slab[2] {
-                                out.push(*arrays[comp].get(0, i, j, k));
+                                dst.push(*arrays[comp].get(0, i, j, k));
                             }
                         }
                     }
                 }
-                out
             };
-            let vv = values(&upml.vv);
-            let vvfo = values(&upml.vvfo);
-            let vvfn = values(&upml.vvfn);
-            let ii = values(&upml.ii);
-            let iifo = values(&upml.iifo);
-            let iifn = values(&upml.iifn);
-            let volt_flux = values(&upml.volt_flux);
-            let curr_flux = values(&upml.curr_flux);
-            let buffer = |label: &str, data: &[f32]| {
-                use wgpu::util::DeviceExt;
-                self.device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some(label),
-                        contents: &f32_bytes(data),
-                        usage: wgpu::BufferUsages::STORAGE,
-                    })
-            };
-            let vv_buf = buffer("openems upml vv", &vv);
-            let vvfo_buf = buffer("openems upml vvfo", &vvfo);
-            let vvfn_buf = buffer("openems upml vvfn", &vvfn);
-            let ii_buf = buffer("openems upml ii", &ii);
-            let iifo_buf = buffer("openems upml iifo", &iifo);
-            let iifn_buf = buffer("openems upml iifn", &iifn);
-            let volt_flux_buf = buffer("openems upml volt flux", &volt_flux);
-            let curr_flux_buf = buffer("openems upml curr flux", &curr_flux);
-            let mut dims = Vec::<u8>::with_capacity(48);
-            for value in [
-                self.dims[0] as u32,
-                self.dims[1] as u32,
-                self.dims[2] as u32,
-                0,
-            ] {
-                dims.extend_from_slice(&value.to_le_bytes());
-            }
-            for value in [
+            append(&mut vv, &upml.vv);
+            append(&mut vvfo, &upml.vvfo);
+            append(&mut vvfn, &upml.vvfn);
+            append(&mut ii, &upml.ii);
+            append(&mut iifo, &upml.iifo);
+            append(&mut iifn, &upml.iifn);
+            append(&mut volt_flux, &upml.volt_flux);
+            append(&mut curr_flux, &upml.curr_flux);
+            table.extend_from_slice(&[
                 upml.start_pos[0] as u32,
                 upml.start_pos[1] as u32,
                 upml.start_pos[2] as u32,
                 0,
-            ] {
-                dims.extend_from_slice(&value.to_le_bytes());
-            }
-            for value in [
                 slab[0] as u32,
                 slab[1] as u32,
                 slab[2] as u32,
                 0,
-            ] {
-                dims.extend_from_slice(&value.to_le_bytes());
-            }
-            let uniform = {
-                use wgpu::util::DeviceExt;
-                self.device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("openems upml dims"),
-                        contents: &dims,
-                        usage: wgpu::BufferUsages::UNIFORM,
-                    })
-            };
-            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("openems upml bind group"),
-                layout: &layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.volt.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: self.curr.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: vv_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: vvfo_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: vvfn_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: ii_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 6, resource: iifo_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 7, resource: iifn_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry {
-                        binding: 8,
-                        resource: volt_flux_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 9,
-                        resource: curr_flux_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry { binding: 10, resource: uniform.as_entire_binding() },
-                ],
-            });
-            let particles = (3 * slab[0] * slab[1] * slab[2]) as u32;
-            instances.push(UpmlInstance {
-                bind,
-                groups: particles.div_ceil(64).max(1),
-            });
+            ]);
+            total += 3 * slab[0] * slab[1] * slab[2];
         }
+        let buffer = |label: &str, data: &[f32]| {
+            use wgpu::util::DeviceExt;
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: &f32_bytes(data),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let vv_buf = buffer("openems upml vv", &vv);
+        let vvfo_buf = buffer("openems upml vvfo", &vvfo);
+        let vvfn_buf = buffer("openems upml vvfn", &vvfn);
+        let ii_buf = buffer("openems upml ii", &ii);
+        let iifo_buf = buffer("openems upml iifo", &iifo);
+        let iifn_buf = buffer("openems upml iifn", &iifn);
+        let volt_flux_buf = buffer("openems upml volt flux", &volt_flux);
+        let curr_flux_buf = buffer("openems upml curr flux", &curr_flux);
+        let table_buf = {
+            use wgpu::util::DeviceExt;
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("openems upml slabs"),
+                    contents: &u32_bytes(&table),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let mut dims = Vec::<u8>::with_capacity(32);
+        for value in [
+            self.dims[0] as u32,
+            self.dims[1] as u32,
+            self.dims[2] as u32,
+            0,
+            upmls.len() as u32,
+            total as u32,
+            0,
+            0,
+        ] {
+            dims.extend_from_slice(&value.to_le_bytes());
+        }
+        let uniform = {
+            use wgpu::util::DeviceExt;
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("openems upml dims"),
+                    contents: &dims,
+                    usage: wgpu::BufferUsages::UNIFORM,
+                })
+        };
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("openems upml bind group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.volt.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.curr.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: vv_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: vvfo_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: vvfn_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: ii_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: iifo_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: iifn_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: volt_flux_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: curr_flux_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry { binding: 10, resource: table_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: uniform.as_entire_binding() },
+            ],
+        });
         self.upml = Some(UpmlBinds {
             pre_volt,
             post_volt,
             pre_curr,
             post_curr,
-            instances,
+            bind,
+            groups: (total as u32).div_ceil(64).max(1),
         });
         true
     }
@@ -2054,20 +2144,20 @@ impl GpuFields {
             label: Some("openems mur kernels"),
             source: wgpu::ShaderSource::Wgsl(UPDATE_SHADER.into()),
         });
-        let entries = (0..6u32)
+        let entries = (0..7u32)
             .map(|binding| wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: wgpu::ShaderStages::COMPUTE,
-                ty: if binding == 5 {
+                ty: if binding == 6 {
                     wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                        has_dynamic_offset: true,
+                        min_binding_size: wgpu::BufferSize::new(32),
                     }
                 } else {
                     wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage {
-                            read_only: binding == 1 || binding == 2,
+                            read_only: binding == 1 || binding == 2 || binding == 5,
                         },
                         has_dynamic_offset: false,
                         min_binding_size: None,
@@ -2101,83 +2191,177 @@ impl GpuFields {
         let pre = pipeline("mur_pre");
         let post = pipeline("mur_post");
         let apply = pipeline("mur_apply");
-        let mut faces = Vec::new();
-        for extension in mur {
-            for face in &extension.faces {
-                let buffer = |label: &str, data: &[FDTD_FLOAT]| {
-                    use wgpu::util::DeviceExt;
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some(label),
-                            contents: &f32_bytes(data),
-                            usage: wgpu::BufferUsages::STORAGE,
-                        })
-                };
-                let coeff_p = buffer("openems mur coeff p", &face.coeff_p);
-                let coeff_pp = buffer("openems mur coeff pp", &face.coeff_pp);
-                let hist_p = buffer("openems mur hist p", &face.hist_p);
-                let hist_pp = buffer("openems mur hist pp", &face.hist_pp);
-                let mut dims = Vec::<u8>::with_capacity(48);
-                for value in [
-                    self.dims[0] as u32,
-                    self.dims[1] as u32,
-                    self.dims[2] as u32,
-                    0,
-                ] {
-                    dims.extend_from_slice(&value.to_le_bytes());
-                }
-                for value in [
-                    face.dims_p as u32,
-                    face.dims_pp as u32,
-                    face.line as u32,
-                    face.shift as u32,
-                ] {
-                    dims.extend_from_slice(&value.to_le_bytes());
-                }
-                let n_p = ((face.dir + 1) % 3) as u32;
-                let n_pp = ((face.dir + 2) % 3) as u32;
-                for value in [face.dir as u32, n_p, n_pp, 0] {
-                    dims.extend_from_slice(&value.to_le_bytes());
-                }
-                let uniform = {
-                    use wgpu::util::DeviceExt;
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("openems mur dims"),
-                            contents: &dims,
-                            usage: wgpu::BufferUsages::UNIFORM,
-                        })
-                };
-                let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("openems mur bind group"),
-                    layout: &layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: self.volt.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry { binding: 1, resource: coeff_p.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: coeff_pp.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: hist_p.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 4, resource: hist_pp.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 5, resource: uniform.as_entire_binding() },
-                    ],
-                });
-                let particles = (face.dims_p * face.dims_pp) as u32;
-                faces.push(MurFaceBinds {
-                    bind,
-                    groups: particles.div_ceil(64).max(1),
-                });
-            }
-        }
+        let faces: Vec<&crate::extensions::MurFace> = mur
+            .iter()
+            .flat_map(|extension| extension.faces.iter())
+            .collect();
         if faces.is_empty() {
             return false;
         }
+        // Extent of each face along the absolute axes (its own axis is fixed).
+        let extents: Vec<[usize; 3]> = faces
+            .iter()
+            .map(|face| {
+                let mut extent = [0usize; 3];
+                extent[(face.dir + 1) % 3] = face.dims_p;
+                extent[(face.dir + 2) % 3] = face.dims_pp;
+                extent
+            })
+            .collect();
+        // Two faces conflict when their planes intersect inside both extents;
+        // they then touch the same corner edges and must keep the host order.
+        let conflicts = |a: usize, b: usize| -> bool {
+            let (fa, fb) = (faces[a], faces[b]);
+            if fa.dir == fb.dir {
+                return fa.line == fb.line;
+            }
+            fb.line < extents[a][fb.dir] && fa.line < extents[b][fa.dir]
+        };
+        // Colour = 1 + the highest colour of an earlier conflicting face, so a
+        // later colour never runs before an earlier one on a shared edge and
+        // faces of one colour never overlap.
+        let mut colour = vec![0usize; faces.len()];
+        for i in 0..faces.len() {
+            let mut value = 0usize;
+            for j in 0..i {
+                if conflicts(j, i) {
+                    value = value.max(colour[j] + 1);
+                }
+            }
+            colour[i] = value;
+        }
+        let colour_count = colour.iter().copied().max().map_or(0, |c| c + 1);
+        let mut order: Vec<usize> = (0..faces.len()).collect();
+        order.sort_by_key(|&index| colour[index]);
+        // Concatenate in colour order, so each colour owns a contiguous range.
+        let mut coeff_p = Vec::new();
+        let mut coeff_pp = Vec::new();
+        let mut hist_p = Vec::new();
+        let mut hist_pp = Vec::new();
+        let mut table = Vec::with_capacity(faces.len() * 12);
+        let mut offsets = vec![0usize; faces.len()];
+        for &index in &order {
+            let face = faces[index];
+            offsets[index] = coeff_p.len();
+            coeff_p.extend_from_slice(&face.coeff_p);
+            coeff_pp.extend_from_slice(&face.coeff_pp);
+            hist_p.extend_from_slice(&face.hist_p);
+            hist_pp.extend_from_slice(&face.hist_pp);
+            table.extend_from_slice(&[
+                offsets[index] as u32,
+                face.dims_p as u32,
+                face.dims_pp as u32,
+                face.line as u32,
+                face.shift as u32,
+                face.dir as u32,
+                ((face.dir + 1) % 3) as u32,
+                ((face.dir + 2) % 3) as u32,
+                colour[index] as u32,
+                0,
+                0,
+                0,
+            ]);
+        }
+        // One uniform slot per colour: global dims + element range + face count.
+        let alignment = self
+            .device
+            .limits()
+            .min_uniform_buffer_offset_alignment
+            .max(32);
+        let slot_size = 32u32.div_ceil(alignment) * alignment;
+        let mut uniforms = vec![0u8; colour_count.max(1) * slot_size as usize];
+        let mut passes = Vec::with_capacity(colour_count);
+        for c in 0..colour_count {
+            let members: Vec<usize> = order
+                .iter()
+                .copied()
+                .filter(|&index| colour[index] == c)
+                .collect();
+            let Some(&first) = members.first() else {
+                continue;
+            };
+            let last = *members.last().expect("members is not empty");
+            let start = offsets[first];
+            let end = offsets[last] + faces[last].dims_p * faces[last].dims_pp;
+            let base = c * slot_size as usize;
+            let words = [
+                self.dims[0] as u32,
+                self.dims[1] as u32,
+                self.dims[2] as u32,
+                0,
+                start as u32,
+                end as u32,
+                faces.len() as u32,
+                0,
+            ];
+            for (n, word) in words.iter().enumerate() {
+                uniforms[base + n * 4..base + n * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            }
+            passes.push(MurPass {
+                offset: (c as u32) * slot_size,
+                groups: ((end - start) as u32).div_ceil(64).max(1),
+            });
+        }
+        let buffer = |label: &str, data: &[FDTD_FLOAT]| {
+            use wgpu::util::DeviceExt;
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: &f32_bytes(data),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let coeff_p_buf = buffer("openems mur coeff p", &coeff_p);
+        let coeff_pp_buf = buffer("openems mur coeff pp", &coeff_pp);
+        let hist_p_buf = buffer("openems mur hist p", &hist_p);
+        let hist_pp_buf = buffer("openems mur hist pp", &hist_pp);
+        let table_buf = {
+            use wgpu::util::DeviceExt;
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("openems mur table"),
+                    contents: &u32_bytes(&table),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let uniform_buf = {
+            use wgpu::util::DeviceExt;
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("openems mur dims"),
+                    contents: &uniforms,
+                    usage: wgpu::BufferUsages::UNIFORM,
+                })
+        };
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("openems mur bind group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.volt.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry { binding: 1, resource: coeff_p_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: coeff_pp_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: hist_p_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: hist_pp_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: table_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &uniform_buf,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(32),
+                    }),
+                },
+            ],
+        });
         self.mur = Some(MurBinds {
             pre,
             post,
             apply,
-            faces,
+            bind,
+            passes,
         });
         true
     }
@@ -3136,15 +3320,21 @@ impl GpuFields {
     /// `Apply2Current`).
     pub fn dispatch_steps(&self, steps: u32, start_ts: u32) {
         // Bound the encoder size; a chunk is still thousands of kernel
-        // launches, far fewer submissions than before.
-        const CHUNK: u32 = SOURCE_BATCH;
+        // launches, far fewer submissions than before. The per-step uniforms
+        // are sized for `SOURCE_BATCH`, so the chunk never exceeds it.
+        let chunk_limit = std::env::var("OPENEMS_GPU_CHUNK")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value > 0 && *value <= SOURCE_BATCH)
+            .unwrap_or(SOURCE_BATCH);
         let volt_cells = (self.dims[0] * self.dims[1] * self.dims[2]) as u32;
         let curr_cells = (self.dims[0].saturating_sub(1)
             * self.dims[1].saturating_sub(1)
             * self.dims[2].saturating_sub(1)) as u32;
         let mut done = 0u32;
+        let mut passes = 0u32;
         while done < steps {
-            let chunk = (steps - done).min(CHUNK);
+            let chunk = (steps - done).min(chunk_limit);
             if let Some(source) = self.source.as_ref() {
                 if let Some(side) = source.volt.as_ref() {
                     SourceBinds::write_params(
@@ -3177,81 +3367,99 @@ impl GpuFields {
             });
             for step in 0..chunk {
                 if let Some(mur) = self.mur.as_ref() {
-                    mur.record(&mut encoder, 0);
+                    passes += mur.record(&mut encoder, 0);
                 }
                 if let Some(lumped) = self.lumped.as_ref() {
-                    lumped.record(&mut encoder, true);
+                    passes += lumped.record(&mut encoder, true);
                 }
                 if let Some(sheet) = self.sheet.as_ref() {
-                    sheet.record(&mut encoder, true);
+                    passes += sheet.record(&mut encoder, true);
                 }
                 if let Some(debye) = self.debye.as_ref() {
-                    debye.record(&mut encoder, 0);
+                    passes += debye.record(&mut encoder, 0);
                 }
                 if let Some(lorentz) = self.lorentz.as_ref() {
-                    lorentz.record(&mut encoder, 0);
+                    passes += lorentz.record(&mut encoder, 0);
                 }
                 if let Some(upml) = self.upml.as_ref() {
-                    upml.record(&mut encoder, 0);
+                    passes += upml.record(&mut encoder, 0);
                 }
                 record_dispatch(&mut encoder, &self.pipe_e, &self.bind_e, volt_cells);
+                passes += 1;
                 if let Some(upml) = self.upml.as_ref() {
-                    upml.record(&mut encoder, 1);
+                    passes += upml.record(&mut encoder, 1);
                 }
                 if let Some(debye) = self.debye.as_ref() {
-                    debye.record(&mut encoder, 1);
+                    passes += debye.record(&mut encoder, 1);
                 }
                 if let Some(tfsf) = self.tfsf.as_ref() {
                     for side in &tfsf.volt {
-                        tfsf.record(&mut encoder, side, step);
+                        passes += tfsf.record(&mut encoder, side, step);
                     }
                 }
                 if let Some(mur) = self.mur.as_ref() {
-                    mur.record(&mut encoder, 1);
+                    passes += mur.record(&mut encoder, 1);
                 }
                 if let Some(sheet) = self.sheet.as_ref() {
-                    sheet.record(&mut encoder, false);
+                    passes += sheet.record(&mut encoder, false);
                 }
                 if let Some(debye) = self.debye.as_ref() {
-                    debye.record(&mut encoder, 2);
+                    passes += debye.record(&mut encoder, 2);
                 }
                 if let Some(lorentz) = self.lorentz.as_ref() {
-                    lorentz.record(&mut encoder, 2);
+                    passes += lorentz.record(&mut encoder, 2);
                 }
                 if let Some(lumped) = self.lumped.as_ref() {
-                    lumped.record(&mut encoder, false);
+                    passes += lumped.record(&mut encoder, false);
                 }
                 if let Some(mur) = self.mur.as_ref() {
-                    mur.record(&mut encoder, 2);
+                    passes += mur.record(&mut encoder, 2);
                 }
                 if let Some(source) = self.source.as_ref() {
-                    source.record(&mut encoder, source.volt.as_ref(), step);
+                    passes += source.record(&mut encoder, source.volt.as_ref(), step);
                 }
                 if let Some(upml) = self.upml.as_ref() {
-                    upml.record(&mut encoder, 2);
+                    passes += upml.record(&mut encoder, 2);
                 }
                 if let Some(lorentz) = self.lorentz.as_ref() {
-                    lorentz.record(&mut encoder, 1);
+                    passes += lorentz.record(&mut encoder, 1);
                 }
                 record_dispatch(&mut encoder, &self.pipe_h, &self.bind_h, curr_cells);
+                passes += 1;
                 if let Some(upml) = self.upml.as_ref() {
-                    upml.record(&mut encoder, 3);
+                    passes += upml.record(&mut encoder, 3);
                 }
                 if let Some(tfsf) = self.tfsf.as_ref() {
                     for side in &tfsf.curr {
-                        tfsf.record(&mut encoder, side, step);
+                        passes += tfsf.record(&mut encoder, side, step);
                     }
                 }
                 if let Some(lorentz) = self.lorentz.as_ref() {
-                    lorentz.record(&mut encoder, 3);
+                    passes += lorentz.record(&mut encoder, 3);
                 }
                 if let Some(source) = self.source.as_ref() {
-                    source.record(&mut encoder, source.curr.as_ref(), step);
+                    passes += source.record(&mut encoder, source.curr.as_ref(), step);
                 }
             }
             self.queue.submit(std::iter::once(encoder.finish()));
             done += chunk;
         }
+        self.passes.set(passes as u64);
+    }
+
+    /// Number of compute passes recorded by the last [`dispatch_steps`] call.
+    ///
+    /// The performance gate asserts a budget per model shape, so a duplicated
+    /// phase is caught even when the numerical result is unchanged.
+    pub fn last_batch_passes(&self) -> u64 {
+        self.passes.get()
+    }
+
+    /// Storage buffers per shader stage this device offers.
+    pub fn storage_buffer_limit(&self) -> u32 {
+        self.device
+            .limits()
+            .max_storage_buffers_per_shader_stage
     }
 
     fn dispatch(&self, pipeline: &wgpu::ComputePipeline, bind: &wgpu::BindGroup, groups: u32) {
