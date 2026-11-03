@@ -499,6 +499,15 @@ impl Engine {
         self.gpu_pending = false;
     }
 
+    /// No-op on the CPU-only build: the host arrays are the only state, so the
+    /// shared multi-grid call sites have nothing to synchronise.
+    #[cfg(not(feature = "gpu"))]
+    fn upload_all_gpu(&mut self) {}
+
+    /// No-op on the CPU-only build (see `upload_all_gpu`).
+    #[cfg(not(feature = "gpu"))]
+    fn download_all_gpu(&mut self) {}
+
     /// Enable the GPU on this engine and, for a multi-grid base, its child.
     #[cfg(feature = "gpu")]
     pub fn enable_gpu_pair(&mut self) -> Result<(), String> {
