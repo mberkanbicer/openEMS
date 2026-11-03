@@ -1544,12 +1544,29 @@ impl OpenEMS {
         #[cfg(feature = "gpu")]
         if self.use_gpu || self.gpu_auto {
             // Measured crossover: below ~50k cells the per-dispatch and
-            // per-sync overhead outweighs the kernel speed-up.
+            // per-sync overhead outweighs the kernel speed-up. Models with
+            // more per-step passes need a larger grid to amortise them, so
+            // scale the threshold with the estimated pass count (PML is fused
+            // into E/H and costs nothing extra; an excitation costs two
+            // passes, other extensions about three each).
+            let mut passes = 2usize;
+            for extension in &engine.extensions {
+                passes += match extension.get_extension_name() {
+                    "UPML" => 0,
+                    "Excitation" => 2,
+                    _ => 3,
+                };
+            }
+            let min_cells = match passes {
+                0..=2 => GPU_AUTO_MIN_CELLS,
+                3..=5 => GPU_AUTO_MIN_CELLS * 3 / 2,
+                _ => GPU_AUTO_MIN_CELLS * 3,
+            };
             let cells = engine.num_lines[0] * engine.num_lines[1] * engine.num_lines[2];
-            let enabled = self.use_gpu || cells >= GPU_AUTO_MIN_CELLS;
+            let enabled = self.use_gpu || cells >= min_cells;
             if !enabled {
                 println!(
-                    "[openEMS] GPU auto: {cells} cells is below the {GPU_AUTO_MIN_CELLS}-cell crossover, using the CPU engine"
+                    "[openEMS] GPU auto: {cells} cells is below the {min_cells}-cell crossover ({passes} passes/step), using the CPU engine"
                 );
             } else if let Err(reason) = engine.enable_gpu_pair() {
                 if self.use_gpu {

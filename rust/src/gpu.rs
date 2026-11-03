@@ -336,6 +336,52 @@ fn pml_post_phase(i: u32, j: u32, k: u32) {
     }
 }
 
+// Fused excitation: the source terms are bucketed per cell (CSR), so the
+// thread that owns a cell applies its own terms after the update, in term
+// order. `side` is 0 for the voltage source (applied by the E kernel) and 1
+// for the current source (applied by the H kernel).
+
+struct SrcTerm {
+    cell: u32,
+    component: u32,
+    coeff: f32,
+    delay: u32,
+    period: u32,
+    slot: u32,
+    length: u32,
+    side: u32,
+};
+
+struct SrcParams {
+    ts: u32,
+    stride: u32,
+    count: u32,
+    pad: u32,
+};
+
+@group(0) @binding(18) var<storage, read> fsrc_terms: array<SrcTerm>;
+@group(0) @binding(19) var<storage, read> fsrc_values: array<f32>;
+@group(0) @binding(20) var<storage, read> fsrc_start: array<u32>;
+@group(0) @binding(21) var<storage, read> fsrc_items: array<u32>;
+@group(0) @binding(22) var<uniform> fsrc_params: SrcParams;
+
+fn src_apply(cell: u32, side: u32) {
+    let begin = fsrc_start[cell];
+    let end = fsrc_start[cell + 1u];
+    let plane = dims.nx * dims.ny * dims.nz;
+    for (var it = begin; it < end; it = it + 1u) {
+        let term = fsrc_terms[fsrc_items[it]];
+        if (term.side != side) { continue; }
+        if (fsrc_params.ts < term.delay) { continue; }
+        var pos = fsrc_params.ts - term.delay;
+        if (term.period > 0u) { pos = pos % term.period; }
+        if (pos >= term.length) { continue; }
+        let value = fsrc_values[term.slot * fsrc_params.stride + pos];
+        let index = term.component * plane + cell;
+        field[index] = field[index] + term.coeff * value;
+    }
+}
+
 @compute @workgroup_size(64)
 fn update_e_pml(@builtin(global_invocation_id) gid: vec3<u32>) {
     let total = dims.nx * dims.ny * dims.nz;
@@ -371,6 +417,7 @@ fn update_e_pml(@builtin(global_invocation_id) gid: vec3<u32>) {
     field[ey] = field[ey] * vv[ey] + vi[ey] * (c0_ijk - c0_ijkm1 - c2_ijk + c2_im1jk);
     field[ez] = field[ez] * vv[ez] + vi[ez] * (c1_ijk - c1_im1jk - c0_ijk + c0_ijm1k);
     pml_post_phase(i, j, k);
+    src_apply(i * dims.ny * dims.nz + j * dims.nz + k, 0u);
 }
 
 @compute @workgroup_size(64)
@@ -405,6 +452,7 @@ fn update_h_pml(@builtin(global_invocation_id) gid: vec3<u32>) {
         field[hz] = field[hz] * ii[hz] + iv[hz] * (v1_ijk - v1_ip1jk - v0_ijk + v0_ijp1k);
     }
     pml_post_phase(i, j, k);
+    src_apply(i * dims.ny * dims.nz + j * dims.nz + k, 1u);
 }
 
 // Device-side energy reduction: one workgroup sums 64 cells and writes two
@@ -1843,6 +1891,20 @@ impl LorentzBinds {
     }
 }
 
+/// Fused excitation buffers: per-cell CSR plus the packed term and waveform
+/// data, shared by the fused E/H kernels.
+struct SourceBuffers {
+    terms: wgpu::Buffer,
+    values: wgpu::Buffer,
+    start: wgpu::Buffer,
+    items: wgpu::Buffer,
+    params: wgpu::Buffer,
+    slot_size: u32,
+    stride: u32,
+    count: u32,
+    scratch: std::cell::RefCell<Vec<u8>>,
+}
+
 /// Device-side probe gather: a compact per-step value matrix.
 struct ProbeBinds {
     pipe: wgpu::ComputePipeline,
@@ -1862,6 +1924,9 @@ struct PmlEngine {
     pipe_h: wgpu::ComputePipeline,
     bind_e: wgpu::BindGroup,
     bind_h: wgpu::BindGroup,
+    /// Dynamic-offset stride of the fused source params; 0 when the model has
+    /// no excitation (the dummy buffers make the loop empty).
+    source_slot_size: u32,
 }
 
 /// Persistent GPU field/coefficient buffers for `Engine`.
@@ -1907,6 +1972,8 @@ pub struct GpuFields {
     energy_groups: u32,
     /// Device-side probe gather, when the model only has point probes.
     probes: Option<ProbeBinds>,
+    /// Fused excitation buffers (per-cell CSR), when the source is fused.
+    source_buffers: Option<SourceBuffers>,
     /// Device-side Mur ABC kernels, when the model has Mur faces.
     mur: Option<MurBinds>,
     /// Device-side lumped RLC kernels, when the model has lumped elements.
@@ -2192,6 +2259,7 @@ impl GpuFields {
             energy_staging,
             energy_groups,
             probes: None,
+            source_buffers: None,
             mur: None,
             lumped: None,
             sheet: None,
@@ -2350,7 +2418,126 @@ impl GpuFields {
             slot_size,
             stride,
         });
+        self.build_source_csr(terms, stride, slot_size);
         true
+    }
+
+    /// Bucket the source terms per cell for the fused E/H kernels.
+    ///
+    /// The fused kernels apply their own cell's terms after the update, in
+    /// term order, which is exactly the host `apply2` order without a separate
+    /// dispatch.
+    fn build_source_csr(&mut self, terms: &SourceTerms, stride: u32, slot_size: u32) {
+        let plane = self.dims[0] * self.dims[1] * self.dims[2];
+        let cells = plane;
+        let mut counts = vec![0u32; cells];
+        let mut packed = Vec::with_capacity(terms.volt.len() + terms.curr.len());
+        let mut push = |list: &[crate::gpu::SourceTerm], side: u32, packed: &mut Vec<[u32; 8]>| {
+            for term in list {
+                let cell = (term.index as usize) % plane;
+                let component = (term.index as usize) / plane;
+                if cell >= cells {
+                    continue;
+                }
+                counts[cell] += 1;
+                packed.push([
+                    cell as u32,
+                    component as u32,
+                    term.coeff.to_bits(),
+                    term.delay,
+                    term.period,
+                    term.slot,
+                    term.length,
+                    side,
+                ]);
+            }
+        };
+        push(&terms.volt, 0, &mut packed);
+        push(&terms.curr, 1, &mut packed);
+        if packed.is_empty() {
+            return;
+        }
+        // Prefix sum: start[cell] is the first item of the cell.
+        let mut start = vec![0u32; cells + 1];
+        for cell in 0..cells {
+            start[cell + 1] = start[cell] + counts[cell];
+        }
+        let mut cursor = start.clone();
+        let mut items = vec![0u32; packed.len()];
+        for (index, term) in packed.iter().enumerate() {
+            let cell = term[0] as usize;
+            items[cursor[cell] as usize] = index as u32;
+            cursor[cell] += 1;
+        }
+        let terms_buf = {
+            use wgpu::util::DeviceExt;
+            let bytes: Vec<u8> = packed
+                .iter()
+                .flat_map(|term| term.iter().flat_map(|word| word.to_le_bytes()))
+                .collect();
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("openems fused source terms"),
+                    contents: &bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let start_buf = {
+            use wgpu::util::DeviceExt;
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("openems fused source start"),
+                    contents: &u32_bytes(&start),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let items_buf = {
+            use wgpu::util::DeviceExt;
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("openems fused source items"),
+                    contents: &u32_bytes(&items),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let mut samples = Vec::with_capacity(
+            terms
+                .volt_values
+                .iter()
+                .chain(terms.curr_values.iter())
+                .map(|slot| slot.len())
+                .sum(),
+        );
+        for slot in terms.volt_values.iter().chain(terms.curr_values.iter()) {
+            samples.extend_from_slice(slot);
+            samples.resize(samples.len() + (stride as usize - slot.len()), 0.0);
+        }
+        let values_buf = {
+            use wgpu::util::DeviceExt;
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("openems fused source values"),
+                    contents: &f32_bytes(&samples),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let params = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("openems fused source params"),
+            size: (SOURCE_BATCH * slot_size) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.source_buffers = Some(SourceBuffers {
+            terms: terms_buf,
+            values: values_buf,
+            start: start_buf,
+            items: items_buf,
+            params,
+            slot_size,
+            stride,
+            count: packed.len() as u32,
+            scratch: std::cell::RefCell::new(Vec::new()),
+        });
     }
 
     /// Whether a device-side excitation source is active.
@@ -2627,6 +2814,28 @@ impl GpuFields {
                 count: None,
             });
         }
+        for binding in 18..22u32 {
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            });
+        }
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 22,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: true,
+                min_binding_size: wgpu::BufferSize::new(16),
+            },
+            count: None,
+        });
         entries.push(wgpu::BindGroupLayoutEntry {
             binding: 15,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -2661,6 +2870,51 @@ impl GpuFields {
         };
         let pipe_e = pipe("update_e_pml");
         let pipe_h = pipe("update_h_pml");
+        let (src_terms, src_values, src_start, src_items, src_params, src_slot_size) =
+            if let Some(src) = self.source_buffers.as_ref() {
+                (
+                    src.terms.clone(),
+                    src.values.clone(),
+                    src.start.clone(),
+                    src.items.clone(),
+                    src.params.clone(),
+                    src.slot_size,
+                )
+            } else {
+                let cells = self.dims[0] * self.dims[1] * self.dims[2];
+                let storage = |label: &str, size: u64| {
+                    self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(label),
+                        size,
+                        usage: wgpu::BufferUsages::STORAGE,
+                        mapped_at_creation: false,
+                    })
+                };
+                let start = vec![0u32; cells + 1];
+                let start_buf = {
+                    use wgpu::util::DeviceExt;
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("openems fused source start dummy"),
+                            contents: &u32_bytes(&start),
+                            usage: wgpu::BufferUsages::STORAGE,
+                        })
+                };
+                let params_dummy = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("openems fused source params dummy"),
+                    size: 16,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                (
+                    storage("openems fused source terms dummy", 32),
+                    storage("openems fused source values dummy", 4),
+                    start_buf,
+                    storage("openems fused source items dummy", 4),
+                    params_dummy,
+                    0,
+                )
+            };
         let (bind_e, bind_h) = {
             let make_bind = |field: &wgpu::Buffer,
                              peer: &wgpu::Buffer,
@@ -2725,6 +2979,30 @@ impl GpuFields {
                                 binding: 17,
                                 resource: pre_b.as_entire_binding(),
                             },
+                            wgpu::BindGroupEntry {
+                                binding: 18,
+                                resource: src_terms.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 19,
+                                resource: src_values.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 20,
+                                resource: src_start.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 21,
+                                resource: src_items.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 22,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: &src_params,
+                                    offset: 0,
+                                    size: wgpu::BufferSize::new(16),
+                                }),
+                            },
                         ],
                     })
             };
@@ -2738,6 +3016,7 @@ impl GpuFields {
             pipe_h,
             bind_e,
             bind_h,
+            source_slot_size: src_slot_size,
         });
         true
     }
@@ -4153,9 +4432,17 @@ impl GpuFields {
                 }
             }
             self.write_probe_params(start_ts + done, chunk);
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("openems engine batch"),
-            });
+            self.write_fused_source_params(start_ts + done, chunk);
+            let source_fused = self
+                .pml_engine
+                .as_ref()
+                .map(|pml| pml.source_slot_size > 0)
+                .unwrap_or(false);
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("openems engine batch"),
+                });
             for step in 0..chunk {
                 if let Some(mur) = self.mur.as_ref() {
                     passes += mur.record(&mut encoder, 0);
@@ -4178,7 +4465,13 @@ impl GpuFields {
                     }
                 }
                 if let Some(pml) = self.pml_engine.as_ref() {
-                    record_dispatch(&mut encoder, &pml.pipe_e, &pml.bind_e, volt_cells);
+                    record_dispatch_offset(
+                        &mut encoder,
+                        &pml.pipe_e,
+                        &pml.bind_e,
+                        volt_cells,
+                        step * pml.source_slot_size,
+                    );
                 } else {
                     record_dispatch(&mut encoder, &self.pipe_e, &self.bind_e, volt_cells);
                 }
@@ -4214,8 +4507,10 @@ impl GpuFields {
                 if let Some(mur) = self.mur.as_ref() {
                     passes += mur.record(&mut encoder, 2);
                 }
-                if let Some(source) = self.source.as_ref() {
-                    passes += source.record(&mut encoder, source.volt.as_ref(), step);
+                if !source_fused {
+                    if let Some(source) = self.source.as_ref() {
+                        passes += source.record(&mut encoder, source.volt.as_ref(), step);
+                    }
                 }
                 if self.pml_engine.is_none() {
                     if let Some(upml) = self.upml.as_ref() {
@@ -4226,7 +4521,13 @@ impl GpuFields {
                     passes += lorentz.record(&mut encoder, 1);
                 }
                 if let Some(pml) = self.pml_engine.as_ref() {
-                    record_dispatch(&mut encoder, &pml.pipe_h, &pml.bind_h, volt_cells);
+                    record_dispatch_offset(
+                        &mut encoder,
+                        &pml.pipe_h,
+                        &pml.bind_h,
+                        volt_cells,
+                        step * pml.source_slot_size,
+                    );
                 } else {
                     record_dispatch(&mut encoder, &self.pipe_h, &self.bind_h, curr_cells);
                 }
@@ -4244,8 +4545,10 @@ impl GpuFields {
                 if let Some(lorentz) = self.lorentz.as_ref() {
                     passes += lorentz.record(&mut encoder, 3);
                 }
-                if let Some(source) = self.source.as_ref() {
-                    passes += source.record(&mut encoder, source.curr.as_ref(), step);
+                if !source_fused {
+                    if let Some(source) = self.source.as_ref() {
+                        passes += source.record(&mut encoder, source.curr.as_ref(), step);
+                    }
                 }
                 passes += self.record_probe_gather(&mut encoder, step);
             }
@@ -4255,9 +4558,25 @@ impl GpuFields {
         self.passes.set(passes as u64);
     }
 
+    /// Write the per-step fused-source parameters for a batch.
+    fn write_fused_source_params(&self, start_ts: u32, steps: u32) {
+        let Some(src) = self.source_buffers.as_ref() else {
+            return;
+        };
+        let mut scratch = src.scratch.borrow_mut();
+        scratch.clear();
+        scratch.resize(steps as usize * src.slot_size as usize, 0);
+        for step in 0..steps {
+            let base = step as usize * src.slot_size as usize;
+            scratch[base..base + 4].copy_from_slice(&(start_ts + step).to_le_bytes());
+            scratch[base + 4..base + 8].copy_from_slice(&src.stride.to_le_bytes());
+            scratch[base + 8..base + 12].copy_from_slice(&src.count.to_le_bytes());
+        }
+        self.queue.write_buffer(&src.params, 0, &scratch);
+    }
+
     /// Write the per-step probe parameters for a batch.
-    fn write_probe_params(&self, start_ts: u32, steps: u32) {
-        let Some(probes) = self.probes.as_ref() else {
+    fn write_probe_params(&self, start_ts: u32, steps: u32) {        let Some(probes) = self.probes.as_ref() else {
             return;
         };
         let mut scratch = probes.scratch.borrow_mut();
@@ -4461,6 +4780,22 @@ impl GpuFields {
         }
         self.queue.write_buffer(target, 0, &scratch);
     }
+}
+
+fn record_dispatch_offset(
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    bind: &wgpu::BindGroup,
+    cells: u32,
+    offset: u32,
+) {
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("openems engine pass"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind, &[offset]);
+    pass.dispatch_workgroups(cells.div_ceil(64).max(1), 1, 1);
 }
 
 fn record_dispatch(

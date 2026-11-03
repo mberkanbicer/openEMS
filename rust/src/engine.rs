@@ -2002,6 +2002,63 @@ mod tests {
 
     #[cfg(feature = "gpu")]
     #[test]
+    fn gpu_fused_pml_source_matches_the_cpu_engine() {
+        let n = 12;
+        let steps = 120;
+        let mut signal = crate::excitation::Excitation::gauss(2.0e9, 1.0e9);
+        signal.build(1.0e-12, 4096).expect("signal must build");
+        let build = || {
+            let mut engine = Engine::new(Box::new(cavity_operator(n)));
+            engine.add_extension(Box::new(upml_extension([2, 2, 2], [4, 4, 4])));
+            engine.add_extension(Box::new(upml_extension([6, 5, 4], [3, 4, 2])));
+            let mut excitation = crate::extensions::EngineExtExcitation::new();
+            excitation.add_voltage_excitation(
+                0,
+                [3, 3, 3],
+                0,
+                1.5,
+                std::sync::Arc::new(signal.clone()),
+            );
+            excitation.add_current_excitation(
+                1,
+                [4, 4, 4],
+                0,
+                0.75,
+                std::sync::Arc::new(signal.clone()),
+            );
+            engine.add_extension(Box::new(excitation));
+            seed_fields(&mut engine);
+            engine
+        };
+
+        let mut cpu = build();
+        assert!(cpu.iterate_ts(steps));
+
+        let mut gpu = build();
+        if let Err(reason) = gpu.enable_gpu() {
+            eprintln!("skipping the fused PML+source test: {reason}");
+            return;
+        }
+        assert!(
+            gpu.gpu_fields
+                .as_ref()
+                .map(|fields| fields.has_pml_engine())
+                .unwrap_or(false),
+            "the fused PML engine must be active"
+        );
+        assert!(gpu.iterate_ts(steps));
+        let diff = field_diff(&cpu, &gpu);
+        assert!(diff < 1.0e-5, "CPU/GPU fused PML+source diff {diff}");
+
+        // The fused path must also cost two passes per step (E and H): the
+        // source is applied by the cell thread that owns each edge.
+        assert!(gpu.iterate_ts(1));
+        assert_eq!(gpu.gpu_last_batch_passes(), 2);
+        eprintln!("GPU fused PML+source: {n}^3, {steps} steps, CPU diff {diff:.2e}");
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
     fn gpu_engine_matches_cpu_on_a_cavity() {
         let n = 48;
         let steps = 120;
